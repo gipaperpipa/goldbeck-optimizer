@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <Title>GoldbeckSync</Title>
+    <Description>Live-sync Grasshopper plugin for Goldbeck floor plan optimizer</Description>
+    <Version>1.0.0</Version>
+    <AssemblyTitle>GoldbeckSync</AssemblyTitle>
+    <RootNamespace>GoldbeckSync</RootNamespace>
+    <AssemblyName>GoldbeckSync</AssemblyName>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- Output .gha instead of .dll so Grasshopper loads it -->
+    <TargetExt>.gha</TargetExt>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Grasshopper SDK (includes RhinoCommon) -->
+    <PackageReference Include="Grasshopper" Version="8.*" />
+    <!-- WebSocket client -->
+    <PackageReference Include="WebSocketSharp-netstandard" Version="1.0.1" />
+    <!-- JSON parsing -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.*" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE & tool settings
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Next.js
+.next/
+out/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build
+*.tsbuildinfo
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Context PDFs and renders (too large for GitHub, keep local)
+Context/
+
+# Rhino plugin build output (compiled locally)
+rhino-plugin/GoldbeckSync/bin/
+rhino-plugin/GoldbeckSync/obj/
+*.gha
+*.dll
+*.pdb
+
+# Misc
+nul
