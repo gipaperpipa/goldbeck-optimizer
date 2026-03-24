@@ -15,6 +15,8 @@ dependencies = [
     "httpx>=0.28.0",
     "anthropic>=0.43.0",
     "python-dotenv>=1.0",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.optional-dependencies]
@@ -25,4 +27,4 @@ dev = [
 
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"

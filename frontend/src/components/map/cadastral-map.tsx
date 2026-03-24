@@ -10,6 +10,14 @@ import type { AddressSearchResult, ParcelInfo } from "@/types/api";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
 
+// Status → color mapping for parcels
+const STATUS_COLORS: Record<string, string> = {
+  available: "#6b7280",       // gray
+  under_negotiation: "#f59e0b", // amber
+  acquired: "#22c55e",        // green
+  rejected: "#ef4444",        // red
+};
+
 interface CadastralMapProps {
   onPlotConfirmed: () => void;
 }
@@ -21,7 +29,10 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
   const [currentState, setCurrentState] = useState<string | null>(null);
-  const [wmsAdded, setWmsAdded] = useState(false);
+  const [zoomLevel, setZoomLevel] = useState(6);
+  const [radiusM, setRadiusM] = useState(300);
+  const lastLoadCenter = useRef<string>("");
+  const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const {
     searchResults,
@@ -32,11 +43,81 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     removeParcel,
     clearParcels,
     isLoadingParcel,
+    isLoadingNearby,
+    nearbyParcels,
+    loadParcelsInRadius,
     confirmSelection,
     error,
     setError,
     detectedState,
   } = useCadastral();
+
+  // ── Update nearby parcels on map ────────────────────────
+
+  const updateNearbyLayer = useCallback(
+    (parcels: ParcelInfo[]) => {
+      const map = mapRef.current;
+      if (!map || !isMapReady) return;
+
+      const source = map.getSource("nearby-parcels") as mapboxgl.GeoJSONSource;
+      if (!source) return;
+
+      const features = parcels
+        .filter((p) => p.polygon_wgs84 && p.polygon_wgs84.length >= 3)
+        .map((p) => {
+          const status = p.metadata?.status || "available";
+          const isSelected = selectedParcels.some(
+            (sp) => (sp.id || sp.parcel_id) === (p.id || p.parcel_id)
+          );
+          return {
+            type: "Feature" as const,
+            properties: {
+              id: p.id || p.parcel_id,
+              parcel_id: p.parcel_id || "",
+              flurstueck_nr: p.flurstueck_nr || "",
+              gemarkung: p.gemarkung || "",
+              area_sqm: p.area_sqm || 0,
+              status,
+              is_selected: isSelected ? 1 : 0,
+              color: isSelected ? "#3b82f6" : (STATUS_COLORS[status] || "#6b7280"),
+              project_count: p.project_count || 0,
+            },
+            geometry: {
+              type: "Polygon" as const,
+              coordinates: [
+                [
+                  ...p.polygon_wgs84.map((c) => [c[0], c[1]]),
+                  [p.polygon_wgs84[0][0], p.polygon_wgs84[0][1]],
+                ],
+              ],
+            },
+          };
+        });
+
+      source.setData({ type: "FeatureCollection", features });
+    },
+    [isMapReady, selectedParcels]
+  );
+
+  // ── Trigger nearby parcel loading ───────────────────────
+
+  const triggerNearbyLoad = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || map.getZoom() < 15) return;
+
+    const center = map.getCenter();
+    const key = `${center.lng.toFixed(4)},${center.lat.toFixed(4)},${radiusM}`;
+    if (key === lastLoadCenter.current) return;
+    lastLoadCenter.current = key;
+
+    loadParcelsInRadius(center.lng, center.lat, radiusM);
+  }, [loadParcelsInRadius, radiusM]);
+
+  // ── Update map when nearby parcels change ───────────────
+
+  useEffect(() => {
+    updateNearbyLayer(nearbyParcels);
+  }, [nearbyParcels, updateNearbyLayer]);
 
   // ── Initialize map ────────────────────────────────────────
 
@@ -51,7 +132,7 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     const map = new mapboxgl.Map({
       container: mapContainer.current,
       style: "mapbox://styles/mapbox/light-v11",
-      center: [10.45, 51.16], // Center of Germany
+      center: [10.45, 51.16],
       zoom: 6,
     });
 
@@ -60,146 +141,137 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     map.on("load", () => {
       setIsMapReady(true);
 
-      // Add empty source for selected parcels
+      // ── Nearby parcels (from DB, cache-first) ─────────
+      map.addSource("nearby-parcels", {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+
+      // Parcel fills — color by status
+      map.addLayer({
+        id: "nearby-parcels-fill",
+        type: "fill",
+        source: "nearby-parcels",
+        paint: {
+          "fill-color": ["get", "color"],
+          "fill-opacity": [
+            "case",
+            ["==", ["get", "is_selected"], 1], 0.3,
+            ["!=", ["get", "status"], "available"], 0.15,
+            0.05,
+          ],
+        },
+        minzoom: 15,
+      });
+
+      // Parcel outlines — thicker for selected, color by status
+      map.addLayer({
+        id: "nearby-parcels-outline",
+        type: "line",
+        source: "nearby-parcels",
+        paint: {
+          "line-color": ["get", "color"],
+          "line-width": [
+            "case",
+            ["==", ["get", "is_selected"], 1], 3,
+            1.5,
+          ],
+          "line-opacity": 0.9,
+        },
+        minzoom: 15,
+      });
+
+      // Parcel labels at high zoom
+      map.addLayer({
+        id: "nearby-parcels-labels",
+        type: "symbol",
+        source: "nearby-parcels",
+        minzoom: 18,
+        layout: {
+          "text-field": ["get", "flurstueck_nr"],
+          "text-size": 10,
+          "text-allow-overlap": false,
+        },
+        paint: {
+          "text-color": "#374151",
+          "text-halo-color": "#ffffff",
+          "text-halo-width": 1.5,
+        },
+      });
+
+      // ── Selected parcels (explicit user selection) ─────
       map.addSource("selected-parcels", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
       });
 
-      // Fill for selected parcels (amber for synthetic, blue for real)
       map.addLayer({
         id: "selected-parcels-fill",
         type: "fill",
         source: "selected-parcels",
         paint: {
-          "fill-color": [
-            "case",
-            ["==", ["get", "is_synthetic"], 1], "#f59e0b",
-            "#3b82f6",
-          ],
-          "fill-opacity": 0.25,
+          "fill-color": "#3b82f6",
+          "fill-opacity": 0.3,
         },
       });
 
-      // Outline for real parcels (solid blue)
       map.addLayer({
         id: "selected-parcels-outline",
         type: "line",
         source: "selected-parcels",
-        filter: ["!=", ["get", "is_synthetic"], 1],
         paint: {
           "line-color": "#2563eb",
-          "line-width": 2.5,
-        },
-      });
-
-      // Outline for synthetic parcels (dashed amber)
-      map.addLayer({
-        id: "selected-parcels-outline-synthetic",
-        type: "line",
-        source: "selected-parcels",
-        filter: ["==", ["get", "is_synthetic"], 1],
-        paint: {
-          "line-color": "#d97706",
-          "line-width": 2.5,
-          "line-dasharray": [3, 3],
-        },
-      });
-
-      // Add source for hover parcel
-      map.addSource("hover-parcel", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-
-      map.addLayer({
-        id: "hover-parcel-fill",
-        type: "fill",
-        source: "hover-parcel",
-        paint: {
-          "fill-color": "#f59e0b",
-          "fill-opacity": 0.15,
+          "line-width": 3,
         },
       });
     });
 
-    // Click handler for parcel selection
+    // Click handler — select/deselect parcels
     map.on("click", async (e) => {
-      if (map.getZoom() < 15) {
-        // Too zoomed out for parcel selection
-        return;
-      }
+      if (map.getZoom() < 15) return;
       selectParcelAtPoint(e.lngLat.lng, e.lngLat.lat);
     });
 
-    // Change cursor at appropriate zoom levels
+    // Track zoom reactively
     map.on("zoom", () => {
-      const zoom = map.getZoom();
-      map.getCanvas().style.cursor = zoom >= 15 ? "crosshair" : "";
+      const z = map.getZoom();
+      setZoomLevel(z);
+      map.getCanvas().style.cursor = z >= 15 ? "crosshair" : "";
+    });
+
+    // Load parcels on map move (debounced)
+    map.on("moveend", () => {
+      if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = setTimeout(() => {
+        if (map.getZoom() >= 15) {
+          const center = map.getCenter();
+          const key = `${center.lng.toFixed(4)},${center.lat.toFixed(4)}`;
+          if (key !== lastLoadCenter.current) {
+            lastLoadCenter.current = key;
+            loadParcelsInRadius(center.lng, center.lat, radiusM);
+          }
+        }
+      }, 500);
     });
 
     mapRef.current = map;
 
     return () => {
+      if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
       map.remove();
       mapRef.current = null;
     };
-  }, [selectParcelAtPoint]);
+  }, [selectParcelAtPoint, loadParcelsInRadius, radiusM]);
 
-  // ── Add WMS cadastral overlay when state is detected ────
-
-  const addWmsLayer = useCallback(
-    (state: string) => {
-      const map = mapRef.current;
-      if (!map || !isMapReady) return;
-
-      // Remove old WMS layer if exists
-      if (map.getLayer("cadastral-wms")) {
-        map.removeLayer("cadastral-wms");
-      }
-      if (map.getSource("cadastral-wms")) {
-        map.removeSource("cadastral-wms");
-      }
-
-      // Add WMS as raster tile source (proxied through our backend)
-      const tileUrl =
-        `${API_BASE}/v1/cadastral/wms/tile?state=${encodeURIComponent(state)}` +
-        `&bbox={bbox-epsg-3857}&width=256&height=256&crs=EPSG:3857`;
-
-      map.addSource("cadastral-wms", {
-        type: "raster",
-        tiles: [tileUrl],
-        tileSize: 256,
-      });
-
-      map.addLayer(
-        {
-          id: "cadastral-wms",
-          type: "raster",
-          source: "cadastral-wms",
-          paint: {
-            "raster-opacity": 0.7,
-          },
-          minzoom: 14,
-        },
-        "selected-parcels-fill" // Insert below selected parcels
-      );
-
-      setWmsAdded(true);
-      setCurrentState(state);
-    },
-    [isMapReady]
-  );
-
-  // ── Update WMS when state changes ─────────────────────
+  // ── Update state badge ──────────────────────────────────
 
   useEffect(() => {
-    if (detectedState && detectedState !== currentState && isMapReady) {
-      addWmsLayer(detectedState);
+    if (detectedState && detectedState !== currentState) {
+      setCurrentState(detectedState);
     }
-  }, [detectedState, currentState, isMapReady, addWmsLayer]);
+  }, [detectedState, currentState]);
 
-  // ── Update selected parcels on map ────────────────────
+  // ── Update selected parcels layer ───────────────────────
 
   useEffect(() => {
     const map = mapRef.current;
@@ -215,23 +287,25 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
         properties: {
           parcel_id: p.parcel_id,
           area_sqm: p.area_sqm,
-          is_synthetic: p.parcel_id === "synthetic" ? 1 : 0,
         },
         geometry: {
           type: "Polygon" as const,
           coordinates: [
-            [...p.polygon_wgs84.map((c) => [c[0], c[1]]), [p.polygon_wgs84[0][0], p.polygon_wgs84[0][1]]],
+            [
+              ...p.polygon_wgs84.map((c) => [c[0], c[1]]),
+              [p.polygon_wgs84[0][0], p.polygon_wgs84[0][1]],
+            ],
           ],
         },
       }));
 
-    source.setData({
-      type: "FeatureCollection",
-      features,
-    });
-  }, [selectedParcels, isMapReady]);
+    source.setData({ type: "FeatureCollection", features });
 
-  // ── Address search handler ────────────────────────────
+    // Also refresh nearby layer to update is_selected flags
+    updateNearbyLayer(nearbyParcels);
+  }, [selectedParcels, isMapReady, nearbyParcels, updateNearbyLayer]);
+
+  // ── Address search ──────────────────────────────────────
 
   const handleSearchChange = (value: string) => {
     setSearchQuery(value);
@@ -246,20 +320,23 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     setSearchQuery(result.display_name);
     setShowDropdown(false);
 
-    // Fly to location
     map.flyTo({
       center: [result.lng, result.lat],
       zoom: 17,
       duration: 2000,
     });
 
-    // Detect state and add WMS
     if (result.state) {
-      addWmsLayer(result.state);
+      setCurrentState(result.state);
     }
+
+    // Trigger parcel loading at destination
+    setTimeout(() => {
+      loadParcelsInRadius(result.lng, result.lat, radiusM);
+    }, 2200);
   };
 
-  // ── Confirm selection ─────────────────────────────────
+  // ── Confirm selection ───────────────────────────────────
 
   const handleConfirm = async () => {
     const analysis = await confirmSelection();
@@ -268,11 +345,11 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     }
   };
 
-  // ── Total area calculation ────────────────────────────
+  // ── Total area ──────────────────────────────────────────
 
   const totalArea = selectedParcels.reduce((sum, p) => sum + p.area_sqm, 0);
 
-  // ── Render ────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────
 
   const token = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
@@ -281,7 +358,9 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
       <div className="w-full h-[600px] bg-neutral-100 rounded-lg flex items-center justify-center">
         <div className="text-center text-neutral-500">
           <p className="font-medium">Map requires a Mapbox token</p>
-          <p className="text-sm mt-1">Set NEXT_PUBLIC_MAPBOX_TOKEN in frontend/.env.local</p>
+          <p className="text-sm mt-1">
+            Set NEXT_PUBLIC_MAPBOX_TOKEN in frontend/.env.local
+          </p>
         </div>
       </div>
     );
@@ -289,38 +368,57 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
 
   return (
     <div className="space-y-3">
-      {/* Address Search */}
-      <div className="relative">
-        <Input
-          value={searchQuery}
-          onChange={(e) => handleSearchChange(e.target.value)}
-          onFocus={() => searchResults.length > 0 && setShowDropdown(true)}
-          placeholder="Adresse eingeben... (z.B. Berliner Str. 10, München)"
-          className="w-full"
-        />
-        {isSearching && (
-          <div className="absolute right-3 top-1/2 -translate-y-1/2">
-            <div className="h-4 w-4 border-2 border-neutral-300 border-t-blue-500 rounded-full animate-spin" />
-          </div>
-        )}
+      {/* Address Search + Radius Selector */}
+      <div className="flex gap-2">
+        <div className="relative flex-1">
+          <Input
+            value={searchQuery}
+            onChange={(e) => handleSearchChange(e.target.value)}
+            onFocus={() => searchResults.length > 0 && setShowDropdown(true)}
+            placeholder="Adresse eingeben... (z.B. Berliner Str. 10, M\u00FCnchen)"
+            className="w-full"
+          />
+          {isSearching && (
+            <div className="absolute right-3 top-1/2 -translate-y-1/2">
+              <div className="h-4 w-4 border-2 border-neutral-300 border-t-blue-500 rounded-full animate-spin" />
+            </div>
+          )}
 
-        {/* Dropdown results */}
-        {showDropdown && searchResults.length > 0 && (
-          <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg max-h-60 overflow-y-auto">
-            {searchResults.map((result, i) => (
-              <button
-                key={i}
-                className="w-full text-left px-3 py-2 text-sm hover:bg-neutral-50 border-b last:border-b-0"
-                onClick={() => handleSelectAddress(result)}
-              >
-                <span className="font-medium">{result.display_name.split(",")[0]}</span>
-                <span className="text-neutral-500 text-xs block truncate">
-                  {result.display_name.split(",").slice(1).join(",")}
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
+          {showDropdown && searchResults.length > 0 && (
+            <div className="absolute z-50 w-full mt-1 bg-white border rounded-md shadow-lg max-h-60 overflow-y-auto">
+              {searchResults.map((result, i) => (
+                <button
+                  key={i}
+                  className="w-full text-left px-3 py-2 text-sm hover:bg-neutral-50 border-b last:border-b-0"
+                  onClick={() => handleSelectAddress(result)}
+                >
+                  <span className="font-medium">
+                    {result.display_name.split(",")[0]}
+                  </span>
+                  <span className="text-neutral-500 text-xs block truncate">
+                    {result.display_name.split(",").slice(1).join(",")}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Radius selector */}
+        <select
+          value={radiusM}
+          onChange={(e) => {
+            setRadiusM(Number(e.target.value));
+            lastLoadCenter.current = ""; // Force reload
+          }}
+          className="border rounded-md px-2 py-1.5 text-sm bg-white min-w-[100px]"
+        >
+          <option value={200}>200m</option>
+          <option value={300}>300m</option>
+          <option value={500}>500m</option>
+          <option value={1000}>1 km</option>
+          <option value={2000}>2 km</option>
+        </select>
       </div>
 
       {/* Map */}
@@ -336,21 +434,58 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
         {isLoadingParcel && (
           <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-white/90 px-3 py-1.5 rounded-full shadow text-sm">
             <span className="inline-block h-3 w-3 border-2 border-neutral-300 border-t-blue-500 rounded-full animate-spin mr-2 align-middle" />
-            Flurstück wird geladen...
+            Flurst\u00FCck wird geladen...
+          </div>
+        )}
+
+        {isLoadingNearby && (
+          <div className="absolute top-3 left-3 bg-white/90 px-2 py-1 rounded text-xs text-neutral-600 shadow flex items-center gap-1.5">
+            <span className="inline-block h-2.5 w-2.5 border-2 border-neutral-300 border-t-blue-500 rounded-full animate-spin" />
+            Katasterdaten laden...
           </div>
         )}
 
         {/* Zoom hint */}
-        {isMapReady && mapRef.current && mapRef.current.getZoom() < 15 && (
+        {isMapReady && zoomLevel < 15 && (
           <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/70 text-white text-xs px-3 py-1.5 rounded-full">
-            Näher heranzoomen um Flurstücke auszuwählen
+            N\u00E4her heranzoomen um Flurst\u00FCcke zu sehen (Zoom{" "}
+            {Math.round(zoomLevel)}/15)
           </div>
         )}
 
-        {/* State badge */}
-        {currentState && (
-          <div className="absolute top-3 right-3 bg-white/90 px-2 py-1 rounded text-xs text-neutral-600 shadow">
-            Kataster: {currentState}
+        {/* Parcel count + state badge */}
+        <div className="absolute top-3 right-3 flex flex-col gap-1.5 items-end">
+          {currentState && (
+            <div className="bg-white/90 px-2 py-1 rounded text-xs text-neutral-600 shadow">
+              {currentState}
+            </div>
+          )}
+          {nearbyParcels.length > 0 && (
+            <div className="bg-white/90 px-2 py-1 rounded text-xs text-neutral-600 shadow">
+              {nearbyParcels.length} Flurst\u00FCcke geladen
+            </div>
+          )}
+        </div>
+
+        {/* Legend */}
+        {nearbyParcels.length > 0 && (
+          <div className="absolute bottom-3 right-3 bg-white/90 px-2.5 py-2 rounded shadow text-xs space-y-1">
+            <div className="flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded-sm border-2 border-blue-500 bg-blue-500/30" />
+              Ausgew\u00E4hlt
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded-sm border-2 border-gray-500 bg-gray-500/10" />
+              Verf\u00FCgbar
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded-sm border-2 border-amber-500 bg-amber-500/15" />
+              In Verhandlung
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-3 h-3 rounded-sm border-2 border-green-500 bg-green-500/15" />
+              Erworben
+            </div>
           </div>
         )}
       </div>
@@ -360,7 +495,7 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
         <div className="bg-red-50 border border-red-200 rounded-md px-3 py-2 text-sm text-red-700">
           {error}
           <button className="ml-2 underline" onClick={() => setError(null)}>
-            ×
+            &times;
           </button>
         </div>
       )}
@@ -370,37 +505,51 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
         <div className="bg-blue-50 border border-blue-200 rounded-md p-3">
           <div className="flex items-center justify-between mb-2">
             <h4 className="text-sm font-medium text-blue-900">
-              {selectedParcels.length} Flurstück{selectedParcels.length > 1 ? "e" : ""} ausgewählt
+              {selectedParcels.length} Flurst\u00FCck
+              {selectedParcels.length > 1 ? "e" : ""} ausgew\u00E4hlt
             </h4>
-            <button className="text-xs text-blue-600 hover:underline" onClick={clearParcels}>
+            <button
+              className="text-xs text-blue-600 hover:underline"
+              onClick={clearParcels}
+            >
               Alle entfernen
             </button>
           </div>
 
           <div className="space-y-1">
             {selectedParcels.map((p) => {
-              const isSynthetic = p.parcel_id === "synthetic";
+              const key = p.id || p.parcel_id;
+              const isSynthetic =
+                p.parcel_id === "synthetic" || p.parcel_id === "not_found";
               const isOverpass = p.parcel_id?.startsWith("overpass_");
               return (
-                <div key={p.parcel_id} className="flex items-center justify-between text-xs">
-                  <span className={isSynthetic ? "text-amber-700" : "text-blue-800"}>
-                    {isSynthetic
-                      ? `⚠ Platzhalter — ${p.area_sqm.toFixed(0)} m² (bitte anpassen)`
-                      : (
-                        <>
-                          {p.gemarkung ? `${p.gemarkung} ` : ""}
-                          Flst. {p.flurstueck_nr || p.parcel_id.slice(-8)}
-                          {p.area_sqm > 0 && ` — ${p.area_sqm.toFixed(0)} m²`}
-                          {isOverpass && " (OSM)"}
-                        </>
-                      )
+                <div
+                  key={key}
+                  className="flex items-center justify-between text-xs"
+                >
+                  <span
+                    className={
+                      isSynthetic ? "text-amber-700" : "text-blue-800"
                     }
+                  >
+                    {isSynthetic ? (
+                      `\u26A0 Platzhalter \u2014 ${p.area_sqm.toFixed(0)} m\u00B2 (bitte anpassen)`
+                    ) : (
+                      <>
+                        {p.gemarkung ? `${p.gemarkung} ` : ""}
+                        Flst. {p.flurstueck_nr || p.parcel_id?.slice(-8)}
+                        {p.area_sqm > 0 &&
+                          ` \u2014 ${p.area_sqm.toFixed(0)} m\u00B2`}
+                        {isOverpass && " (OSM)"}
+                        {p.source && !isOverpass && ` [${p.source}]`}
+                      </>
+                    )}
                   </span>
                   <button
                     className="text-red-500 hover:text-red-700 ml-2"
-                    onClick={() => removeParcel(p.parcel_id)}
+                    onClick={() => removeParcel(key)}
                   >
-                    ×
+                    &times;
                   </button>
                 </div>
               );
@@ -409,25 +558,33 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
 
           {selectedParcels.length > 1 && (
             <div className="mt-2 pt-2 border-t border-blue-200 text-xs text-blue-800">
-              Gesamtfläche: <strong>{totalArea.toFixed(0)} m²</strong> (
+              Gesamtfl\u00E4che:{" "}
+              <strong>{totalArea.toFixed(0)} m\u00B2</strong> (
               {(totalArea / 10000).toFixed(2)} ha)
             </div>
           )}
 
-          <Button className="w-full mt-3" onClick={handleConfirm} disabled={isLoadingParcel}>
-            {isLoadingParcel
-              ? "Wird berechnet..."
-              : `Grundstück übernehmen (${totalArea.toFixed(0)} m²)`}
-          </Button>
+          <div className="flex gap-2 mt-3">
+            <Button
+              className="flex-1"
+              onClick={handleConfirm}
+              disabled={isLoadingParcel}
+            >
+              {isLoadingParcel
+                ? "Wird berechnet..."
+                : `Grundst\u00FCck \u00FCbernehmen (${totalArea.toFixed(0)} m\u00B2)`}
+            </Button>
+          </div>
         </div>
       )}
 
       {/* Instructions */}
       {selectedParcels.length === 0 && (
         <p className="text-xs text-neutral-500">
-          Suchen Sie eine Adresse, zoomen Sie auf das Grundstück und klicken Sie auf die
-          Flurstücke, die zum Grundstück gehören. Die Katastergrenzen werden ab Zoomstufe 14
-          eingeblendet.
+          Suchen Sie eine Adresse und zoomen Sie heran. Alle Flurst\u00FCcke im
+          gew\u00E4hlten Radius werden automatisch geladen und in der Datenbank
+          gespeichert. Klicken Sie auf Flurst\u00FCcke, um sie f\u00FCr Ihr
+          Projekt auszuw\u00E4hlen.
         </p>
       )}
     </div>

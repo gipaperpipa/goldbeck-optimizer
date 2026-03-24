@@ -8,18 +8,22 @@ import { useProjectStore } from "@/stores/project-store";
 /**
  * Hook for German cadastral (Kataster) operations:
  * - Address search via Nominatim
+ * - Cache-first parcel loading (DB → WFS → store)
  * - Parcel identification at a click point
  * - Parcel merging into a PlotAnalysis
  */
 export function useCadastral() {
   const [searchResults, setSearchResults] = useState<AddressSearchResult[]>([]);
   const [selectedParcels, setSelectedParcels] = useState<ParcelInfo[]>([]);
+  const [nearbyParcels, setNearbyParcels] = useState<ParcelInfo[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isLoadingParcel, setIsLoadingParcel] = useState(false);
+  const [isLoadingNearby, setIsLoadingNearby] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [detectedState, setDetectedState] = useState<string | null>(null);
   const { setPlotAnalysis } = useProjectStore();
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const nearbyAbortRef = useRef<AbortController | null>(null);
 
   // ── Address search ──────────────────────────────────────
 
@@ -29,7 +33,6 @@ export function useCadastral() {
       return;
     }
 
-    // Debounce: cancel previous timer
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
     }
@@ -67,22 +70,57 @@ export function useCadastral() {
     }
   }, []);
 
-  // ── Parcel selection ────────────────────────────────────
+  // ── Cache-first radius loading ──────────────────────────
+
+  const loadParcelsInRadius = useCallback(async (
+    lng: number,
+    lat: number,
+    radiusM: number = 500,
+  ) => {
+    // Abort previous request
+    if (nearbyAbortRef.current) {
+      nearbyAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    nearbyAbortRef.current = controller;
+
+    setIsLoadingNearby(true);
+    try {
+      const url = `/parcels/in-radius?lng=${lng}&lat=${lat}&radius_m=${radiusM}`;
+      const parcels = await apiClient.get<ParcelInfo[]>(url);
+      if (!controller.signal.aborted) {
+        setNearbyParcels(parcels);
+      }
+      return parcels;
+    } catch (e: unknown) {
+      if (e instanceof DOMException && e.name === "AbortError") return [];
+      console.warn("Failed to load nearby parcels:", e);
+      return [];
+    } finally {
+      if (!controller.signal.aborted) {
+        setIsLoadingNearby(false);
+      }
+    }
+  }, []);
+
+  // ── Cache-first parcel selection (click) ────────────────
 
   const selectParcelAtPoint = useCallback(async (lng: number, lat: number) => {
     setIsLoadingParcel(true);
     setError(null);
     try {
+      // Use new cache-first endpoint
       const parcel = await apiClient.get<ParcelInfo | null>(
-        `/cadastral/parcel/at-point?lng=${lng}&lat=${lat}`
+        `/parcels/at-point?lng=${lng}&lat=${lat}`
       );
       if (parcel && parcel.polygon_wgs84 && parcel.polygon_wgs84.length > 0) {
+        // Use the DB id as the unique key if available
+        const parcelKey = parcel.id || parcel.parcel_id;
         setSelectedParcels((prev) => {
-          // Don't add duplicates
-          const exists = prev.some((p) => p.parcel_id === parcel.parcel_id);
+          const exists = prev.some((p) => (p.id || p.parcel_id) === parcelKey);
           if (exists) {
             // Deselect if already selected
-            return prev.filter((p) => p.parcel_id !== parcel.parcel_id);
+            return prev.filter((p) => (p.id || p.parcel_id) !== parcelKey);
           }
           return [...prev, parcel];
         });
@@ -91,11 +129,11 @@ export function useCadastral() {
         }
         return parcel;
       } else {
-        setError("No parcel found at this location. Try clicking directly on a parcel boundary.");
+        setError("Kein Flurstück gefunden. Versuchen Sie einen anderen Punkt.");
         return null;
       }
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to fetch parcel data";
+      const msg = e instanceof Error ? e.message : "Flurstück konnte nicht geladen werden";
       setError(msg);
       return null;
     } finally {
@@ -106,7 +144,9 @@ export function useCadastral() {
   // ── Remove a parcel from selection ──────────────────────
 
   const removeParcel = useCallback((parcelId: string) => {
-    setSelectedParcels((prev) => prev.filter((p) => p.parcel_id !== parcelId));
+    setSelectedParcels((prev) =>
+      prev.filter((p) => p.parcel_id !== parcelId && p.id !== parcelId)
+    );
   }, []);
 
   // ── Clear all selections ────────────────────────────────
@@ -120,7 +160,7 @@ export function useCadastral() {
 
   const confirmSelection = useCallback(async () => {
     if (selectedParcels.length === 0) {
-      setError("No parcels selected");
+      setError("Keine Flurstücke ausgewählt");
       return null;
     }
 
@@ -133,7 +173,7 @@ export function useCadastral() {
       setPlotAnalysis(analysis);
       return analysis;
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Failed to merge parcels";
+      const msg = e instanceof Error ? e.message : "Zusammenführung fehlgeschlagen";
       setError(msg);
       return null;
     } finally {
@@ -150,6 +190,11 @@ export function useCadastral() {
     // State
     detectedState,
     detectState,
+
+    // Nearby parcels (radius loading)
+    nearbyParcels,
+    loadParcelsInRadius,
+    isLoadingNearby,
 
     // Parcel selection
     selectedParcels,

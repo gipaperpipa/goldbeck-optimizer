@@ -7,9 +7,20 @@ Handles:
 - WMS tile proxying for cadastral map overlay
 - WFS GetFeatureInfo for parcel identification
 - WFS GetFeature for parcel polygon geometry
+- BKG (Bundesamt für Kartographie und Geodäsie) federal WFS
+- Overpass API for OSM landuse/building polygons
+
+Architecture:
+  - Concurrent multi-source queries (Nominatim + BKG + State WFS + Overpass)
+  - In-memory TTL cache for parcel lookups
+  - Graceful degradation with synthetic parcel fallback
+  - Structured logging for debugging failed sources
 """
 
+import asyncio
+import logging
 import math
+import time
 from typing import Optional
 from xml.etree import ElementTree
 
@@ -18,6 +29,68 @@ from pyproj import Transformer
 from shapely.geometry import Polygon
 
 from app.models.plot import CoordinatePoint
+
+logger = logging.getLogger(__name__)
+
+
+# ── In-memory cache with TTL ────────────────────────────────────────────
+
+class ParcelCache:
+    """Simple in-memory cache with TTL for parcel lookups."""
+
+    def __init__(self, ttl_seconds: int = 3600, max_entries: int = 2000):
+        self._cache: dict[str, tuple[float, dict]] = {}
+        self._ttl = ttl_seconds
+        self._max = max_entries
+
+    def _key(self, lng: float, lat: float) -> str:
+        # Round to ~1m precision to group nearby clicks
+        return f"{lng:.5f},{lat:.5f}"
+
+    def get(self, lng: float, lat: float) -> Optional[dict]:
+        key = self._key(lng, lat)
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        ts, data = entry
+        if time.time() - ts > self._ttl:
+            del self._cache[key]
+            return None
+        return data
+
+    def put(self, lng: float, lat: float, data: dict) -> None:
+        if len(self._cache) >= self._max:
+            # Evict oldest 25%
+            sorted_keys = sorted(self._cache, key=lambda k: self._cache[k][0])
+            for k in sorted_keys[: self._max // 4]:
+                del self._cache[k]
+        self._cache[self._key(lng, lat)] = (time.time(), data)
+
+    @property
+    def size(self) -> int:
+        return len(self._cache)
+
+
+_parcel_cache = ParcelCache(ttl_seconds=3600, max_entries=2000)
+
+
+# ── Shared HTTP client (connection pooling) ─────────────────────────────
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Reuse a single AsyncClient for connection pooling."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            headers={
+                "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
+            },
+        )
+    return _http_client
 
 
 # ── German State → Geoportal WMS/WFS endpoints ──────────────────────────
@@ -140,6 +213,18 @@ GERMAN_STATE_SERVICES = {
     },
 }
 
+
+# ── BKG federal-level services (nationwide, single endpoint) ─────────────
+# The BKG provides INSPIRE-compliant WFS for cadastral parcels across Germany.
+# These are more reliable than individual state services for many regions.
+BKG_SERVICES = {
+    "wfs": "https://sgx.geodatenzentrum.de/wfs_inspire_cp",
+    "wfs_typename": "CP:CadastralParcel",
+    "crs": "EPSG:25832",
+    # Fallback BKG basemap WMS (always works, but no parcel polygons)
+    "wms_basemap": "https://sgx.geodatenzentrum.de/wms_basemapde",
+}
+
 # Bounding boxes for German states (approximate, in WGS84 lng/lat)
 # Used to determine which state a coordinate falls in
 GERMAN_STATE_BOUNDS = {
@@ -223,14 +308,11 @@ async def geocode_german_address(query: str, limit: int = 5) -> list[dict]:
         "addressdetails": 1,
         "polygon_geojson": 0,
     }
-    headers = {
-        "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
-    }
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        results = response.json()
+    client = _get_http_client()
+    response = await client.get(url, params=params)
+    response.raise_for_status()
+    results = response.json()
 
     return [
         {
@@ -261,14 +343,10 @@ async def proxy_wms_request(
         raise ValueError(f"No WMS service configured for state: {state}")
 
     wms_url = service["wms"]
-    headers = {
-        "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(wms_url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.content, response.headers.get("content-type", "image/png")
+    client = _get_http_client()
+    response = await client.get(wms_url, params=params)
+    response.raise_for_status()
+    return response.content, response.headers.get("content-type", "image/png")
 
 
 # ── Primary: Nominatim reverse geocoding for parcel polygon ──────────────
@@ -283,24 +361,26 @@ async def _get_parcel_via_nominatim(lng: float, lat: float, state: str) -> Optio
       17 = minor street / path
       16 = major street
     """
-    headers = {
-        "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
-    }
-
     # Try zoom levels from most precise to less precise
     for zoom in [18, 17]:
-        result = await _nominatim_reverse_with_polygon(lng, lat, state, zoom, headers)
+        result = await _nominatim_reverse_with_polygon(lng, lat, state, zoom)
         if result and result.get("polygon_wgs84"):
             # Validate polygon has reasonable parcel size (>10m² and <100000m²)
             area = result.get("area_sqm", 0)
-            if 10 < area < 100000:
-                return result
+            if not (10 < area < 100000):
+                continue
+            # Validate the click point actually falls inside the returned polygon
+            if not _point_in_polygon(lng, lat, result["polygon_wgs84"]):
+                logger.debug(f"Nominatim zoom={zoom}: polygon doesn't contain click point, skipping")
+                continue
+            logger.info(f"Nominatim success for ({lng:.5f}, {lat:.5f}) zoom={zoom}")
+            return result
 
     return None
 
 
 async def _nominatim_reverse_with_polygon(
-    lng: float, lat: float, state: str, zoom: int, headers: dict
+    lng: float, lat: float, state: str, zoom: int
 ) -> Optional[dict]:
     """Single Nominatim reverse geocode attempt at a specific zoom level."""
     url = "https://nominatim.openstreetmap.org/reverse"
@@ -314,10 +394,10 @@ async def _nominatim_reverse_with_polygon(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, params=params, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        client = _get_http_client()
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
 
         geojson = data.get("geojson")
         if not geojson:
@@ -372,7 +452,7 @@ async def _get_parcel_via_wfs(
 ) -> Optional[dict]:
     """
     Query state WFS to get the parcel polygon. Tries JSON first, then GML.
-    This is a fallback — many state WFS services are unreliable or require auth.
+    Uses shared HTTP client for connection pooling.
     """
     service = get_state_service(state)
     if not service:
@@ -381,15 +461,11 @@ async def _get_parcel_via_wfs(
     epsg = service["crs"]
     easting, northing = wgs84_to_utm(lng, lat, epsg)
 
-    # Bbox filter around click point
-    half = 10.0
+    half = 50.0  # 100m×100m search area to catch parcels reliably
     bbox_filter = f"{easting - half},{northing - half},{easting + half},{northing + half},{epsg}"
 
-    headers = {
-        "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
-    }
+    client = _get_http_client()
 
-    # Try multiple output formats
     for output_format in ["application/json", "application/geo+json",
                           "text/xml; subtype=gml/3.2.1", "text/xml"]:
         params = {
@@ -399,27 +475,41 @@ async def _get_parcel_via_wfs(
             "TYPENAMES": service["wfs_typename"],
             "BBOX": bbox_filter,
             "SRSNAME": epsg,
-            "COUNT": 1,
+            "COUNT": 10,  # Fetch multiple to pick the one containing the click
             "OUTPUTFORMAT": output_format,
         }
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(service["wfs"], params=params, headers=headers)
-                if response.status_code != 200:
-                    continue
+            response = await client.get(service["wfs"], params=params)
+            if response.status_code != 200:
+                continue
 
-                content_type = response.headers.get("content-type", "")
-                if "json" in content_type:
-                    data = response.json()
-                    result = _process_geojson_parcel(data, epsg, state)
-                    if result:
-                        return result
-                elif "xml" in content_type or "gml" in content_type:
-                    result = _process_gml_parcel(response.text, epsg, state)
-                    if result:
-                        return result
-        except Exception:
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
+                data = response.json()
+                parcels = _process_geojson_parcels(data, epsg, state)
+                # Pick the parcel that contains the click point
+                for p in parcels:
+                    if p.get("polygon_wgs84") and _point_in_polygon(lng, lat, p["polygon_wgs84"]):
+                        p["properties"]["source"] = f"state_wfs_{state}"
+                        logger.info(f"State WFS ({state}) success for ({lng:.5f}, {lat:.5f})")
+                        return p
+                # If none contain the point, return the first one as fallback
+                if parcels:
+                    parcels[0]["properties"]["source"] = f"state_wfs_{state}"
+                    return parcels[0]
+            elif "xml" in content_type or "gml" in content_type:
+                parcels = _process_gml_parcels(response.text, epsg, state)
+                for p in parcels:
+                    if p.get("polygon_wgs84") and _point_in_polygon(lng, lat, p["polygon_wgs84"]):
+                        p["properties"]["source"] = f"state_wfs_{state}"
+                        logger.info(f"State WFS GML ({state}) success for ({lng:.5f}, {lat:.5f})")
+                        return p
+                if parcels:
+                    parcels[0]["properties"]["source"] = f"state_wfs_{state}"
+                    return parcels[0]
+        except Exception as e:
+            logger.debug(f"State WFS ({state}, {output_format}) failed: {e}")
             continue
 
     return None
@@ -471,41 +561,98 @@ async def get_parcel_info_at_point(
             "FEATURE_COUNT": 1,
         }
 
-        headers = {
-            "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
-        }
-
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(service["wms"], params=params, headers=headers)
-                if response.status_code != 200:
-                    continue
+            client = _get_http_client()
+            response = await client.get(service["wms"], params=params)
+            if response.status_code != 200:
+                continue
 
-                content_type = response.headers.get("content-type", "")
-                if "json" in content_type:
-                    data = response.json()
-                    features = data.get("features", [])
-                    if features:
-                        feat = features[0]
-                        props = feat.get("properties", {})
-                        geom = feat.get("geometry")
-                        return {
-                            "state": state,
-                            "properties": props,
-                            "geometry": geom,
-                            "source": "wms_getfeatureinfo",
-                        }
-                elif "xml" in content_type or "gml" in content_type:
-                    result = _parse_xml_feature_info(response.text, state)
-                    if result:
-                        return result
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
+                data = response.json()
+                features = data.get("features", [])
+                if features:
+                    feat = features[0]
+                    props = feat.get("properties", {})
+                    geom = feat.get("geometry")
+                    return {
+                        "state": state,
+                        "properties": props,
+                        "geometry": geom,
+                        "source": "wms_getfeatureinfo",
+                    }
+            elif "xml" in content_type or "gml" in content_type:
+                result = _parse_xml_feature_info(response.text, state)
+                if result:
+                    return result
         except Exception:
             continue
 
     return None
 
 
-# ── Main entry point: multi-strategy parcel lookup ───────────────────────
+# ── BKG federal WFS query ────────────────────────────────────────────────
+
+async def _get_parcel_via_bkg(lng: float, lat: float, state: str) -> Optional[dict]:
+    """
+    Query the BKG (federal) INSPIRE Cadastral Parcel WFS.
+    Single nationwide endpoint — more reliable than individual state services.
+    """
+    epsg = BKG_SERVICES["crs"]
+    easting, northing = wgs84_to_utm(lng, lat, epsg)
+    half = 50.0  # 100m×100m search area to catch parcels reliably
+    bbox_filter = f"{easting - half},{northing - half},{easting + half},{northing + half},{epsg}"
+
+    client = _get_http_client()
+
+    for output_format in ["application/json", "application/geo+json",
+                          "text/xml; subtype=gml/3.2.1"]:
+        params = {
+            "SERVICE": "WFS",
+            "VERSION": "2.0.0",
+            "REQUEST": "GetFeature",
+            "TYPENAMES": BKG_SERVICES["wfs_typename"],
+            "BBOX": bbox_filter,
+            "SRSNAME": epsg,
+            "COUNT": 10,  # Fetch multiple to pick the one containing the click
+            "OUTPUTFORMAT": output_format,
+        }
+
+        try:
+            response = await client.get(BKG_SERVICES["wfs"], params=params)
+            if response.status_code != 200:
+                continue
+
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
+                data = response.json()
+                parcels = _process_geojson_parcels(data, epsg, state)
+                for p in parcels:
+                    if p.get("polygon_wgs84") and _point_in_polygon(lng, lat, p["polygon_wgs84"]):
+                        p["properties"]["source"] = "bkg_wfs"
+                        logger.info(f"BKG WFS success for ({lng:.5f}, {lat:.5f})")
+                        return p
+                if parcels:
+                    parcels[0]["properties"]["source"] = "bkg_wfs"
+                    return parcels[0]
+            elif "xml" in content_type or "gml" in content_type:
+                parcels = _process_gml_parcels(response.text, epsg, state)
+                for p in parcels:
+                    if p.get("polygon_wgs84") and _point_in_polygon(lng, lat, p["polygon_wgs84"]):
+                        p["properties"]["source"] = "bkg_wfs"
+                        logger.info(f"BKG WFS (GML) success for ({lng:.5f}, {lat:.5f})")
+                        return p
+                if parcels:
+                    parcels[0]["properties"]["source"] = "bkg_wfs"
+                    return parcels[0]
+        except Exception as e:
+            logger.debug(f"BKG WFS failed ({output_format}): {e}")
+            continue
+
+    return None
+
+
+# ── Main entry point: CONCURRENT multi-source parcel lookup ──────────────
 
 async def get_parcel_geometry_at_point(
     lng: float,
@@ -513,35 +660,58 @@ async def get_parcel_geometry_at_point(
     state: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Get parcel polygon at a click point using a cascade of methods:
-    1. Nominatim reverse geocoding (most reliable, uses OSM data)
-    2. State WFS GetFeature (official cadastral data, but often unreliable)
-    3. WMS GetFeatureInfo (may return properties without geometry)
+    Get parcel polygon at a click point using concurrent multi-source queries.
 
-    Returns parcel info with polygon coordinates in WGS84.
+    Fires all sources in parallel and returns the first valid result,
+    prioritized by data quality:
+      1. BKG federal WFS (official ALKIS, nationwide)
+      2. State-specific WFS (official ALKIS, per-state)
+      3. Nominatim reverse geocoding (OSM data, good coverage)
+      4. Overpass API (OSM landuse/building polygons)
+      5. Synthetic rectangular parcel (always succeeds — last resort)
+
+    Results are cached in memory (1h TTL) to avoid redundant requests.
     """
     if not state:
         state = detect_state(lng, lat)
     if not state:
         return None
 
-    # Strategy 1: Nominatim (reliable, good coverage)
-    result = await _get_parcel_via_nominatim(lng, lat, state)
-    if result and result.get("polygon_wgs84"):
-        return result
+    # Check cache first
+    cached = _parcel_cache.get(lng, lat)
+    if cached is not None:
+        logger.info(f"Cache hit for ({lng:.5f}, {lat:.5f})")
+        return cached
 
-    # Strategy 2: State WFS (official, but may fail)
-    result = await _get_parcel_via_wfs(lng, lat, state)
-    if result and result.get("polygon_wgs84"):
-        return result
+    # Fire all sources concurrently
+    results = await asyncio.gather(
+        _get_parcel_via_bkg(lng, lat, state),
+        _get_parcel_via_wfs(lng, lat, state),
+        _get_parcel_via_nominatim(lng, lat, state),
+        _get_parcel_via_overpass(lng, lat, state),
+        return_exceptions=True,
+    )
 
-    # Strategy 3: Overpass API — query OSM for landuse/building polygons
-    result = await _get_parcel_via_overpass(lng, lat, state)
-    if result and result.get("polygon_wgs84"):
-        return result
+    # Priority order: BKG > State WFS > Nominatim > Overpass
+    # Validate each result: polygon must contain the click point
+    source_names = ["BKG", "State WFS", "Nominatim", "Overpass"]
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.warning(f"{source_names[i]} failed for ({lng:.5f}, {lat:.5f}): {result}")
+            continue
+        if result and result.get("polygon_wgs84"):
+            poly = result["polygon_wgs84"]
+            if _point_in_polygon(lng, lat, poly):
+                logger.info(f"Using {source_names[i]} result for ({lng:.5f}, {lat:.5f})")
+                _parcel_cache.put(lng, lat, result)
+                return result
+            else:
+                logger.debug(f"{source_names[i]}: polygon doesn't contain click point, skipping")
 
-    # Strategy 4: Synthetic rectangular parcel as last resort
+    # Last resort: synthetic parcel (always succeeds)
+    logger.warning(f"All sources failed for ({lng:.5f}, {lat:.5f}) — using synthetic parcel")
     result = _generate_synthetic_parcel(lng, lat, state)
+    _parcel_cache.put(lng, lat, result)
     return result
 
 
@@ -553,7 +723,8 @@ async def get_parcels_in_bbox(
     state: Optional[str] = None,
 ) -> list[dict]:
     """
-    Fetch all parcels within a bounding box via state WFS.
+    Fetch all parcels within a bounding box.
+    Tries BKG federal WFS first (nationwide, most reliable), then state WFS as fallback.
     Returns list of parcel dicts with WGS84 polygon coordinates.
     """
     center_lng = (min_lng + max_lng) / 2
@@ -564,6 +735,13 @@ async def get_parcels_in_bbox(
     if not state:
         return []
 
+    # ── Try BKG federal WFS first (most reliable, nationwide) ────────
+    bkg_results = await _get_parcels_in_bbox_bkg(min_lng, min_lat, max_lng, max_lat, state)
+    if bkg_results:
+        logger.info(f"BKG bbox returned {len(bkg_results)} parcels")
+        return bkg_results
+
+    # ── Fallback to state WFS ────────────────────────────────────────
     service = get_state_service(state)
     if not service:
         return []
@@ -574,10 +752,6 @@ async def get_parcels_in_bbox(
 
     bbox_filter = f"{min_e},{min_n},{max_e},{max_n},{epsg}"
 
-    headers = {
-        "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
-    }
-
     for output_format in ["application/json", "application/geo+json",
                           "text/xml; subtype=gml/3.2.1"]:
         params = {
@@ -587,27 +761,75 @@ async def get_parcels_in_bbox(
             "TYPENAMES": service["wfs_typename"],
             "BBOX": bbox_filter,
             "SRSNAME": epsg,
-            "COUNT": 50,
+            "COUNT": 100,
             "OUTPUTFORMAT": output_format,
         }
 
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.get(service["wfs"], params=params, headers=headers)
-                if response.status_code != 200:
-                    continue
+            client = _get_http_client()
+            response = await client.get(service["wfs"], params=params)
+            if response.status_code != 200:
+                continue
 
-                content_type = response.headers.get("content-type", "")
-                if "json" in content_type:
-                    data = response.json()
-                    results = _process_geojson_parcels(data, epsg, state)
-                    if results:
-                        return results
-                elif "xml" in content_type or "gml" in content_type:
-                    results = _process_gml_parcels(response.text, epsg, state)
-                    if results:
-                        return results
-        except Exception:
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
+                data = response.json()
+                results = _process_geojson_parcels(data, epsg, state)
+                if results:
+                    logger.info(f"State WFS bbox ({state}) returned {len(results)} parcels")
+                    return results
+            elif "xml" in content_type or "gml" in content_type:
+                results = _process_gml_parcels(response.text, epsg, state)
+                if results:
+                    logger.info(f"State WFS GML bbox ({state}) returned {len(results)} parcels")
+                    return results
+        except Exception as e:
+            logger.debug(f"State WFS bbox format {output_format} failed: {e}")
+            continue
+
+    return []
+
+
+async def _get_parcels_in_bbox_bkg(
+    min_lng: float, min_lat: float, max_lng: float, max_lat: float, state: str
+) -> list[dict]:
+    """Fetch parcels in bbox via BKG federal INSPIRE WFS."""
+    epsg = BKG_SERVICES["crs"]
+    min_e, min_n = wgs84_to_utm(min_lng, min_lat, epsg)
+    max_e, max_n = wgs84_to_utm(max_lng, max_lat, epsg)
+    bbox_filter = f"{min_e},{min_n},{max_e},{max_n},{epsg}"
+
+    client = _get_http_client()
+
+    for output_format in ["application/json", "application/geo+json",
+                          "text/xml; subtype=gml/3.2.1"]:
+        params = {
+            "SERVICE": "WFS",
+            "VERSION": "2.0.0",
+            "REQUEST": "GetFeature",
+            "TYPENAMES": BKG_SERVICES["wfs_typename"],
+            "BBOX": bbox_filter,
+            "SRSNAME": epsg,
+            "COUNT": 100,
+            "OUTPUTFORMAT": output_format,
+        }
+        try:
+            response = await client.get(BKG_SERVICES["wfs"], params=params, timeout=15.0)
+            if response.status_code != 200:
+                continue
+
+            content_type = response.headers.get("content-type", "")
+            if "json" in content_type:
+                data = response.json()
+                results = _process_geojson_parcels(data, epsg, state)
+                if results:
+                    return results
+            elif "xml" in content_type or "gml" in content_type:
+                results = _process_gml_parcels(response.text, epsg, state)
+                if results:
+                    return results
+        except Exception as e:
+            logger.debug(f"BKG bbox format {output_format} failed: {e}")
             continue
 
     return []
@@ -635,20 +857,16 @@ out body;
 >;
 out skel qt;
 """
-    headers = {
-        "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
-    }
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                "https://overpass-api.de/api/interpreter",
-                data={"data": query},
-                headers=headers,
-            )
-            if response.status_code != 200:
-                return None
-            data = response.json()
+        client = _get_http_client()
+        response = await client.post(
+            "https://overpass-api.de/api/interpreter",
+            data={"data": query},
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json()
 
         elements = data.get("elements", [])
         if not elements:
@@ -840,6 +1058,23 @@ def _convert_geometry_to_wgs84(geom: dict, epsg: str) -> Optional[list[list[floa
         return wgs84
 
     return None
+
+
+def _point_in_polygon(lng: float, lat: float, polygon: list[list[float]]) -> bool:
+    """
+    Ray-casting point-in-polygon test.
+    Returns True if (lng, lat) is inside the polygon defined by WGS84 coords.
+    """
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i][0], polygon[i][1]
+        xj, yj = polygon[j][0], polygon[j][1]
+        if ((yi > lat) != (yj > lat)) and (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
 
 
 def _calculate_polygon_metrics(

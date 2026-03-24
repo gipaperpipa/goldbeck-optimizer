@@ -40,16 +40,107 @@ export interface AddressSearchResult {
 }
 
 export interface ParcelInfo {
+  id?: string;
   parcel_id: string;
+  gemarkung: string;
+  flur_nr?: string;
+  flurstueck_nr: string;
+  area_sqm: number;
+  width_m?: number;
+  depth_m?: number;
+  perimeter_m?: number;
+  polygon_wgs84: number[][];
+  state: string;
+  address_hint?: string;
+  source?: string;
+  centroid_lng?: number;
+  centroid_lat?: number;
+  properties: Record<string, unknown>;
+  metadata?: ParcelMetadata;
+  project_count?: number;
+}
+
+export interface ParcelMetadata {
+  bebauungsplan_nr: string;
+  bebauungsplan_url: string;
+  zoning_type: string;
+  grz: number | null;
+  gfz: number | null;
+  max_height_m: number | null;
+  max_stories: number | null;
+  bauweise: string;
+  status: string;
+  asking_price_eur: number | null;
+  price_per_sqm: number | null;
+  notes: string;
+}
+
+export interface ProjectInfo {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  address: string;
+  target_units: number | null;
+  budget_eur: number | null;
+  parcel_count: number;
+  total_area_sqm?: number;
+  created_at: string;
+  updated_at: string;
+  parcels?: ProjectParcelInfo[];
+  optimization_runs?: OptimizationRunInfo[];
+  timeline?: TimelineEntryInfo[];
+}
+
+export interface ProjectParcelInfo {
+  parcel_id: string;
+  cadastral_ref: string;
   gemarkung: string;
   flurstueck_nr: string;
   area_sqm: number;
-  width_m: number;
-  depth_m: number;
-  perimeter_m: number;
-  polygon_wgs84: number[][];
-  state: string;
-  properties: Record<string, unknown>;
+  role: string;
+  centroid_lng: number;
+  centroid_lat: number;
+  status?: string;
+  zoning_type?: string;
+}
+
+export interface OptimizationRunInfo {
+  id: string;
+  best_fitness: number | null;
+  generations: number | null;
+  duration_seconds: number | null;
+  created_at: string | null;
+}
+
+export interface TimelineEntryInfo {
+  id: string;
+  type: string;
+  title: string;
+  description: string;
+  parcel_id?: string;
+  project_id?: string;
+  contact_id?: string;
+  event_date: string | null;
+  created_at?: string | null;
+}
+
+export interface ContactInfo {
+  id: string;
+  type: string;
+  name: string;
+  company: string;
+  email: string;
+  phone: string;
+  address: string;
+  notes: string;
+}
+
+export interface DbStats {
+  total_parcels: number;
+  total_projects: number;
+  total_contacts: number;
+  total_timeline_entries: number;
 }
 
 // ============================================

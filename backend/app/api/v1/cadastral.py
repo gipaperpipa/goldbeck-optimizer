@@ -10,7 +10,7 @@ Provides:
 """
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.services.cadastral import (
     geocode_german_address,
@@ -53,6 +53,14 @@ class ParcelInfo(BaseModel):
     polygon_wgs84: list[list[float]] = []
     state: str = ""
     properties: dict = {}
+
+    @field_validator("parcel_id", "gemarkung", "flurstueck_nr", mode="before")
+    @classmethod
+    def coerce_to_str(cls, v):
+        """WFS services sometimes return numeric IDs — coerce to string."""
+        if v is None:
+            return ""
+        return str(v)
 
 
 class MergeRequest(BaseModel):
@@ -137,25 +145,38 @@ async def parcel_at_point(
     lng: float = Query(...),
     lat: float = Query(...),
 ):
-    """Get parcel (Flurstück) geometry at a clicked point via WFS."""
+    """
+    Get parcel (Flurstück) geometry at a clicked point.
+
+    Queries multiple sources concurrently (BKG, State WFS, Nominatim, Overpass)
+    and returns the best available result. Falls back to a synthetic rectangular
+    parcel if all sources fail, so the user can always proceed.
+    """
     state = detect_state(lng, lat)
     if not state:
-        raise HTTPException(status_code=404, detail="Coordinates not in Germany")
-
-    # Try WFS first (returns polygon)
-    result = await get_parcel_geometry_at_point(lng, lat, state)
-    if result:
-        return ParcelInfo(**result)
-
-    # Fallback: try WMS GetFeatureInfo (may not return polygon)
-    info = await get_parcel_info_at_point(lng, lat, state)
-    if info:
-        return ParcelInfo(
-            state=info.get("state", state),
-            properties=info.get("properties", {}),
+        raise HTTPException(
+            status_code=404,
+            detail="Coordinates are outside Germany. Please click within German borders."
         )
 
-    return None
+    try:
+        # Multi-source concurrent lookup (always returns a result)
+        result = await get_parcel_geometry_at_point(lng, lat, state)
+        if result:
+            return ParcelInfo(**result)
+
+        # Should not reach here (synthetic fallback always succeeds), but just in case
+        return ParcelInfo(
+            state=state,
+            properties={"note": "No parcel data available for this location."},
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Parcel lookup failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Parcel lookup failed: {str(e)}. Please try again or click a different location."
+        )
 
 
 @router.get("/parcels/in-bbox", response_model=list[ParcelInfo])
