@@ -180,16 +180,53 @@ class GoldbeckGenerator(ConstructionSystem):
         )
 
         floor_plans = [ground_floor]
-        for i in range(1, request.stories):
+        num_regular = request.stories
+        staffelgeschoss_enabled = getattr(request, "enable_staffelgeschoss", False)
+        staffelgeschoss_setback = getattr(request, "staffelgeschoss_setback_m", 2.0)
+        has_staffel = staffelgeschoss_enabled and request.stories >= 2
+
+        if has_staffel:
+            num_regular = request.stories - 1  # last story is Staffelgeschoss
+
+        for i in range(1, num_regular):
             fp = upper_floor.model_copy(deep=True)
             fp.floor_index = i
             floor_plans.append(fp)
+
+        # Staffelgeschoss: generate reduced top floor
+        staffel_apts = []
+        if has_staffel:
+            staffel_fp = self._generate_staffelgeschoss(
+                request, dims, access_type, vp,
+                staffelgeschoss_setback, num_regular,
+            )
+            if staffel_fp is not None:
+                floor_plans.append(staffel_fp)
+                staffel_apts = staffel_fp.apartments
+            else:
+                # Fallback: use regular floor plan for top floor too
+                fp = upper_floor.model_copy(deep=True)
+                fp.floor_index = num_regular
+                floor_plans.append(fp)
+                has_staffel = False  # reset flag
 
         # Apartment summary
         summary: dict[str, int] = {}
         for apt in apartments:
             key = apt.apartment_type.value
             summary[key] = summary.get(key, 0) + 1
+
+        # Total apartments: regular floors + Staffelgeschoss floor
+        regular_total = len(apartments) * num_regular
+        staffel_total = len(staffel_apts) if has_staffel else 0
+        total_apts = regular_total + staffel_total
+
+        # Build summary including Staffelgeschoss
+        full_summary: dict[str, int] = {k: v * num_regular for k, v in summary.items()}
+        if has_staffel:
+            for apt in staffel_apts:
+                key = apt.apartment_type.value
+                full_summary[key] = full_summary.get(key, 0) + 1
 
         return BuildingFloorPlans(
             building_id=request.building_id,
@@ -201,9 +238,152 @@ class GoldbeckGenerator(ConstructionSystem):
             access_type=access_type,
             structural_grid=grid,
             floor_plans=floor_plans,
-            total_apartments=len(apartments) * request.stories,
-            apartment_summary={k: v * request.stories for k, v in summary.items()},
+            total_apartments=total_apts,
+            apartment_summary=full_summary,
         )
+
+    # ========================================================
+    # Staffelgeschoss: Setback top floor generation
+    # ========================================================
+    def _generate_staffelgeschoss(
+        self,
+        request: FloorPlanRequest,
+        base_dims: dict,
+        base_access_type: AccessType,
+        variation_params: dict,
+        setback_m: float,
+        floor_index: int,
+    ) -> Optional[FloorPlan]:
+        """Generate a reduced Staffelgeschoss (setback top floor).
+
+        The top floor is set back by `setback_m` on both gable ends (length reduction)
+        and optionally on the north facade (depth reduction for Ganghaus).
+        The result does NOT count as a Vollgeschoss because its area is
+        less than the threshold fraction of the standard floor area.
+
+        The reduced floor plan is centered within the original building footprint
+        by offsetting wall/room coordinates so it aligns visually.
+        """
+        try:
+            # Compute reduced dimensions
+            length_reduction = setback_m * 2  # setback from both gable ends
+            depth_reduction = setback_m       # setback from one long side (typically north)
+
+            reduced_length = base_dims["length_m"] - length_reduction
+            reduced_depth = base_dims["depth_m"] - depth_reduction
+
+            # Ensure minimum viable building dimensions
+            min_length = C.MIN_BAY_WIDTH * 2 + C.GABLE_END_WALL * 2
+            if reduced_length < min_length:
+                reduced_length = min_length
+            if reduced_depth < C.LAUBENGANG_MIN_DEPTH:
+                # Too small for any meaningful floor plan
+                return None
+
+            # Create a modified request for the reduced floor
+            staffel_request = request.model_copy(deep=True)
+            staffel_request.building_width_m = reduced_length
+            staffel_request.building_depth_m = reduced_depth
+            staffel_request.stories = 1
+            staffel_request.building_id = f"{request.building_id}-staffel"
+
+            # Run phases 1-7 for the reduced floor
+            staffel_dims = self._phase1_snap_to_grid(staffel_request)
+            staffel_access = self._phase2_select_access(staffel_dims, base_access_type)
+
+            vp = variation_params
+            staffel_grid = self._phase3_build_grid(
+                staffel_dims, staffel_access, request.story_height_m,
+                vp.get("bay_strategy", "greedy_large"),
+                vp.get("raster_preferences", None),
+                vp.get("depth_config_index", -1),
+            )
+            staffel_stairs = self._phase4_place_staircases(
+                staffel_grid, staffel_access,
+                vp.get("staircase_count_delta", 0),
+                vp.get("staircase_position_offset", 0.0),
+            )
+            staffel_allocs = self._phase5_allocate_apartments(
+                staffel_grid, staffel_stairs, staffel_request, staffel_access,
+                vp.get("allocation_order", "large_first"),
+            )
+            staffel_apts, staffel_rooms = self._phase6_generate_rooms(
+                staffel_allocs, staffel_grid, staffel_access,
+                request.prefer_barrier_free,
+                vp.get("room_proportions", None),
+                vp.get("service_layout_order", "hall_bath_kitchen"),
+            )
+            staffel_walls, staffel_doors, staffel_windows, staffel_corr_rooms = (
+                self._phase7_generate_elements(
+                    staffel_grid, staffel_apts, staffel_stairs, staffel_access
+                )
+            )
+            staffel_rooms.extend(staffel_corr_rooms)
+
+            # Offset all geometry so the reduced floor is centered in the base footprint
+            offset_x = setback_m  # shift right by setback amount (center in base)
+            offset_y = 0.0  # north setback: no Y offset needed (keep south-aligned)
+
+            def _offset_point(p: Point2D) -> Point2D:
+                return Point2D(x=p.x + offset_x, y=p.y + offset_y)
+
+            # Offset walls
+            for w in staffel_walls:
+                w.start = _offset_point(w.start)
+                w.end = _offset_point(w.end)
+
+            # Offset doors
+            for d in staffel_doors:
+                d.position = _offset_point(d.position)
+
+            # Offset windows
+            for win in staffel_windows:
+                win.position = _offset_point(win.position)
+
+            # Offset rooms
+            for room in staffel_rooms:
+                room.polygon = [_offset_point(p) for p in room.polygon]
+
+            # Offset apartments and their rooms
+            for apt in staffel_apts:
+                for room in apt.rooms:
+                    room.polygon = [_offset_point(p) for p in room.polygon]
+                apt.bathroom.position = _offset_point(apt.bathroom.position)
+
+            # Offset staircases
+            for sc in staffel_stairs:
+                sc.position = _offset_point(sc.position)
+
+            # Update grid to reflect the reduced dimensions but offset origin
+            staffel_grid.origin = Point2D(x=offset_x, y=offset_y)
+            staffel_grid.axis_positions_x = [ax + offset_x for ax in staffel_grid.axis_positions_x]
+            staffel_grid.outer_wall_south_y += offset_y
+            staffel_grid.outer_wall_north_y += offset_y
+            staffel_grid.corridor_y_start_m += offset_y
+
+            gross_area = staffel_dims["length_m"] * staffel_dims["depth_m"]
+            net_area = sum(a.total_area_sqm for a in staffel_apts)
+
+            return FloorPlan(
+                floor_index=floor_index,
+                structural_grid=staffel_grid,
+                walls=staffel_walls,
+                doors=staffel_doors,
+                windows=staffel_windows,
+                apartments=staffel_apts,
+                staircases=staffel_stairs,
+                rooms=staffel_rooms,
+                access_type=staffel_access,
+                gross_area_sqm=round(gross_area, 2),
+                net_area_sqm=round(net_area, 2),
+                num_apartments=len(staffel_apts),
+            )
+
+        except Exception as e:
+            print(f"[Staffelgeschoss] Generation failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return None
 
     # ========================================================
     # Phase 1: Grid Snapping

@@ -187,8 +187,14 @@ export function FloorPlanViewer({
 
         // Check grid intersections
         const grid = floorPlan.structural_grid;
-        for (const gx of grid.axis_positions_x) {
-          for (const gy of grid.axis_positions_y) {
+        const yPositions = grid.axis_positions_y || [
+          grid.outer_wall_south_y || 0,
+          grid.corridor_y_start_m || 0,
+          (grid.corridor_y_start_m || 0) + (grid.corridor_width_m || 0),
+          grid.outer_wall_north_y || grid.building_depth_m,
+        ].filter((v, i, a) => v > 0 && a.indexOf(v) === i);
+        for (const gx of grid.axis_positions_x || []) {
+          for (const gy of yPositions) {
             const dist = Math.hypot(planX - gx, planY - gy);
             if (dist < closestDist) {
               closestSnap = { x: gx, y: gy };
@@ -299,14 +305,16 @@ export function FloorPlanViewer({
       drawWall(ctx, wall, tx, ty, ts);
     }
 
-    // --- 8. Windows (architectural symbols) ---
+    // --- 8. Windows (architectural symbols — oriented along host wall) ---
     for (const win of floorPlan.windows) {
-      drawWindow(ctx, win, tx, ty, ts);
+      const hostWall = findNearestWall2D(win.position, floorPlan.walls);
+      drawWindow(ctx, win, hostWall, tx, ty, ts);
     }
 
-    // --- 9. Doors (architectural swing arcs) ---
+    // --- 9. Doors (architectural swing arcs — oriented along host wall) ---
     for (const door of floorPlan.doors) {
-      drawDoor(ctx, door, tx, ty, ts);
+      const hostWall = findNearestWall2D(door.position, floorPlan.walls);
+      drawDoor(ctx, door, hostWall, tx, ty, ts);
     }
 
     // --- 10. Room labels (professional typography) ---
@@ -401,6 +409,36 @@ export function FloorPlanViewer({
       </div>
     </div>
   );
+}
+
+// --- Nearest wall finder (for orienting windows/doors) ---
+
+function findNearestWall2D(
+  position: Point2D,
+  walls: WallSegment[],
+): WallSegment | null {
+  let best: WallSegment | null = null;
+  let bestDist = Infinity;
+  const px = position.x;
+  const py = position.y;
+
+  for (const wall of walls) {
+    const sx = wall.start.x, sy = wall.start.y;
+    const ex = wall.end.x, ey = wall.end.y;
+    const dx = ex - sx, dy = ey - sy;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq < 0.001) continue;
+
+    const t = Math.max(0, Math.min(1, ((px - sx) * dx + (py - sy) * dy) / lenSq));
+    const projX = sx + t * dx;
+    const projY = sy + t * dy;
+    const dist = Math.hypot(px - projX, py - projY);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = wall;
+    }
+  }
+  return best;
 }
 
 // --- Drawing helpers ---
@@ -507,45 +545,62 @@ function drawWall(
 function drawWindow(
   ctx: CanvasRenderingContext2D,
   win: WindowPlacement,
+  hostWall: WallSegment | null,
   tx: (x: number) => number,
   ty: (y: number) => number,
   ts: (s: number) => number,
 ) {
-  const halfW = win.width_m / 2;
   const x = tx(win.position.x);
   const y = ty(win.position.y);
   const w = ts(win.width_m);
 
-  // Draw architectural window symbol: thin line with arc
+  // Compute screen-space angle from host wall
+  let screenAngle = 0;
+  if (hostWall) {
+    const sx = tx(hostWall.start.x);
+    const sy = ty(hostWall.start.y);
+    const ex = tx(hostWall.end.x);
+    const ey = ty(hostWall.end.y);
+    screenAngle = Math.atan2(ey - sy, ex - sx);
+  }
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(screenAngle);
+
+  // Window opening line (along wall direction)
   ctx.strokeStyle = "#4a9fd8";
   ctx.lineWidth = 2.5;
   ctx.beginPath();
-  ctx.moveTo(x - w / 2, y);
-  ctx.lineTo(x + w / 2, y);
+  ctx.moveTo(-w / 2, 0);
+  ctx.lineTo(w / 2, 0);
   ctx.stroke();
 
-  // Draw glass pane indicator (small arc at center)
+  // Glass pane indicator (arc perpendicular to wall)
   const arcRadius = ts(0.3);
   ctx.strokeStyle = "#2e7db3";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.arc(x, y, arcRadius, 0, Math.PI, false);
+  ctx.arc(0, 0, arcRadius, 0, Math.PI, false);
   ctx.stroke();
 
-  // End ticks
+  // End ticks (perpendicular to wall direction)
   ctx.strokeStyle = "#4a9fd8";
   ctx.lineWidth = 1.5;
   ctx.beginPath();
-  ctx.moveTo(x - w / 2, y - 2.5);
-  ctx.lineTo(x - w / 2, y + 2.5);
-  ctx.moveTo(x + w / 2, y - 2.5);
-  ctx.lineTo(x + w / 2, y + 2.5);
+  ctx.moveTo(-w / 2, -2.5);
+  ctx.lineTo(-w / 2, 2.5);
+  ctx.moveTo(w / 2, -2.5);
+  ctx.lineTo(w / 2, 2.5);
   ctx.stroke();
+
+  ctx.restore();
 }
 
 function drawDoor(
   ctx: CanvasRenderingContext2D,
   door: DoorPlacement,
+  hostWall: WallSegment | null,
   tx: (x: number) => number,
   ty: (y: number) => number,
   ts: (s: number) => number,
@@ -554,26 +609,41 @@ function drawDoor(
   const y = ty(door.position.y);
   const doorW = ts(door.width_m);
 
-  // Draw architectural door symbol: line for door leaf + swing arc
+  // Compute screen-space angle from host wall
+  let screenAngle = 0;
+  if (hostWall) {
+    const sx = tx(hostWall.start.x);
+    const sy = ty(hostWall.start.y);
+    const ex = tx(hostWall.end.x);
+    const ey = ty(hostWall.end.y);
+    screenAngle = Math.atan2(ey - sy, ex - sx);
+  }
+
   const color = door.is_entrance ? "#c96e28" : "#8b6914";
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(screenAngle);
+
+  // Door leaf line (along wall direction)
   ctx.strokeStyle = color;
   ctx.lineWidth = door.is_entrance ? 2 : 1.5;
-
-  // Door leaf (opening line)
   ctx.beginPath();
-  ctx.moveTo(x - doorW / 2, y);
-  ctx.lineTo(x + doorW / 2, y);
+  ctx.moveTo(-doorW / 2, 0);
+  ctx.lineTo(doorW / 2, 0);
   ctx.stroke();
 
-  // 90-degree swing arc (representing door swing direction)
+  // 90-degree swing arc (opens perpendicular to wall)
   const arcRadius = doorW * 0.65;
   ctx.strokeStyle = color;
   ctx.globalAlpha = 0.4;
   ctx.lineWidth = 1.2;
   ctx.beginPath();
-  ctx.arc(x + doorW / 2, y, arcRadius, Math.PI, Math.PI / 2, true);
+  ctx.arc(doorW / 2, 0, arcRadius, Math.PI, Math.PI / 2, true);
   ctx.stroke();
   ctx.globalAlpha = 1;
+
+  ctx.restore();
 }
 
 // --- Utility functions ---
@@ -730,8 +800,16 @@ function drawStructuralGrid(
     ctx.stroke();
   }
 
+  // Compute Y positions from grid data if not provided
+  const yPositions = grid.axis_positions_y || [
+    grid.outer_wall_south_y || 0,
+    grid.corridor_y_start_m || 0,
+    (grid.corridor_y_start_m || 0) + (grid.corridor_width_m || 0),
+    grid.outer_wall_north_y || grid.building_depth_m,
+  ].filter((v: number, i: number, a: number[]) => v >= 0 && a.indexOf(v) === i).sort((a: number, b: number) => a - b);
+
   // Horizontal lines (Y-axis)
-  for (const ay of grid.axis_positions_y || []) {
+  for (const ay of yPositions) {
     ctx.beginPath();
     ctx.moveTo(tx(0), ty(ay));
     ctx.lineTo(tx(grid.building_length_m), ty(ay));
@@ -747,7 +825,7 @@ function drawStructuralGrid(
   ctx.textBaseline = "top";
 
   // X-axis labels (A, B, C, ...)
-  grid.axis_positions_x.forEach((ax: number, i: number) => {
+  (grid.axis_positions_x || []).forEach((ax: number, i: number) => {
     const label = String.fromCharCode(65 + i); // A, B, C, ...
     ctx.fillText(label, tx(ax), ty(0) + 5);
   });
@@ -755,8 +833,8 @@ function drawStructuralGrid(
   // Y-axis labels (1, 2, 3, ...)
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  for (let i = 0; i < (grid.axis_positions_y?.length || 0); i++) {
-    const ay = grid.axis_positions_y[i];
+  for (let i = 0; i < yPositions.length; i++) {
+    const ay = yPositions[i];
     ctx.fillText((i + 1).toString(), tx(0) - 5, ty(ay));
   }
 }
@@ -799,7 +877,7 @@ function drawApartmentOutline(
   ctx.font = "bold 11px -apple-system, BlinkMacSystemFont, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(apt.unit_label || apt.id.slice(0, 3), tx(centerX), ty(centerY) - ts(0.5));
+  ctx.fillText(apt.unit_number || apt.id.slice(0, 3), tx(centerX), ty(centerY) - ts(0.5));
 }
 
 function computeConvexHull(points: Point2D[]): Point2D[] {

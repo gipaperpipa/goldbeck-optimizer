@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   PlotAnalysis,
   RegulationSet,
+  GermanRegulationSet,
   OptimizationResult,
   LayoutOption,
   FinancialAnalysis,
@@ -21,6 +22,10 @@ interface ProjectState {
   // Regulations
   regulations: RegulationSet | null;
   setRegulations: (regs: RegulationSet) => void;
+  regulationMode: "german" | "international";
+  setRegulationMode: (mode: "german" | "international") => void;
+  germanRegulations: GermanRegulationSet | null;
+  setGermanRegulations: (regs: GermanRegulationSet | null) => void;
 
   // Optimization
   optimizationResult: OptimizationResult | null;
@@ -64,6 +69,10 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   regulations: null,
   setRegulations: (regs) => set({ regulations: regs }),
+  regulationMode: "german" as "german" | "international",
+  setRegulationMode: (mode) => set({ regulationMode: mode }),
+  germanRegulations: null,
+  setGermanRegulations: (regs) => set({ germanRegulations: regs }),
 
   optimizationResult: null,
   setOptimizationResult: (result) => {
@@ -160,6 +169,8 @@ export const useProjectStore = create<ProjectState>((set) => ({
       currentStep: 0,
       plotAnalysis: null,
       regulations: null,
+      regulationMode: "german" as "german" | "international",
+      germanRegulations: null,
       optimizationResult: null,
       selectedLayout: null,
       financialAnalysis: null,

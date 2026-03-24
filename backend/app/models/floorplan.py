@@ -236,6 +236,9 @@ class FloorPlanRequest(BaseModel):
     population_size: int = 1
     weights: Optional[FloorPlanWeights] = None
     use_ai_generation: bool = False  # Enable AI-assisted generation with enhanced parameters
+    # Staffelgeschoss (setback top floor — does not count as Vollgeschoss)
+    enable_staffelgeschoss: bool = False
+    staffelgeschoss_setback_m: float = 2.0  # setback from building edge on each side
 
 
 class FloorPlanVariant(BaseModel):
@@ -265,4 +268,5 @@ class FloorPlanResult(BaseModel):
     elapsed_seconds: float = 0.0
     estimated_remaining_seconds: float = 0.0
     fitness_history: list[FitnessHistoryEntry] = []
+    live_preview: Optional[FloorPlanVariant] = None  # Current best during generation
     error: Optional[str] = None

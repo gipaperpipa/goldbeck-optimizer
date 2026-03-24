@@ -25,6 +25,37 @@ export interface PlotAnalysis {
   zoning_hint?: string;
 }
 
+// ============================================
+// Cadastral / Kataster Types
+// ============================================
+
+export interface AddressSearchResult {
+  display_name: string;
+  lat: number;
+  lng: number;
+  type: string;
+  importance: number;
+  bbox?: string[];
+  state: string;
+}
+
+export interface ParcelInfo {
+  parcel_id: string;
+  gemarkung: string;
+  flurstueck_nr: string;
+  area_sqm: number;
+  width_m: number;
+  depth_m: number;
+  perimeter_m: number;
+  polygon_wgs84: number[][];
+  state: string;
+  properties: Record<string, unknown>;
+}
+
+// ============================================
+// Regulation Types
+// ============================================
+
 export interface SetbackRequirements {
   front_m: number;
   rear_m: number;
@@ -63,6 +94,59 @@ export interface RegulationSet {
   max_units_per_acre?: number;
   allow_commercial_ground_floor: boolean;
   max_impervious_surface_pct?: number;
+}
+
+// ============================================
+// German Regulation Types
+// ============================================
+
+export interface GermanSetbackRequirements {
+  factor: number;
+  factor_core: number;
+  min_m: number;
+  front_m: number;
+  rear_m: number;
+  side_left_m: number;
+  side_right_m: number;
+}
+
+export interface GermanParkingRequirements {
+  spaces_per_unit: number;
+  bicycle_spaces_per_unit: number;
+  visitor_fraction: number;
+  near_transit_reduction_pct: number;
+}
+
+export interface GermanRegulationSet {
+  regulation_system: string;
+  bundesland: string;
+  baugebiet_type: string;
+  baugebiet_label: string;
+  grz: number;
+  gfz: number;
+  bmz?: number;
+  max_stories: number;
+  max_height_m: number;
+  story_height_m: number;
+  setbacks: GermanSetbackRequirements;
+  max_lot_coverage_pct: number;
+  min_open_space_pct: number;
+  parking: GermanParkingRequirements;
+  gebaeudeklasse: string;
+  max_escape_distance_m: number;
+  min_staircase_width_m: number;
+  second_staircase_required: boolean;
+  vollgeschoss_min_height_m: number;
+  vollgeschoss_area_fraction: number;
+  staffelgeschoss_exempt: boolean;
+  min_building_separation_m: number;
+  fire_access_width_m: number;
+  allow_commercial_ground_floor: boolean;
+}
+
+export interface GermanRegulationBuildResponse {
+  german: GermanRegulationSet;
+  compatible: RegulationSet;
 }
 
 export interface RegulationLookupResponse {
@@ -440,6 +524,8 @@ export interface FloorPlanRequest {
   population_size?: number;
   weights?: FloorPlanWeights;
   use_ai_generation?: boolean;
+  enable_staffelgeschoss?: boolean;
+  staffelgeschoss_setback_m?: number;
 }
 
 export interface FloorPlanVariant {
@@ -461,5 +547,6 @@ export interface FloorPlanResult {
   elapsed_seconds: number;
   estimated_remaining_seconds: number;
   fitness_history: FitnessHistoryEntry[];
+  live_preview?: FloorPlanVariant;
   error?: string;
 }

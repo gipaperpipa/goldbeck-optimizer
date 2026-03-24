@@ -157,48 +157,76 @@ def _plan_signature(plans: BuildingFloorPlans) -> tuple:
 # Genetic Operators
 # ============================================================
 
-def _mutate(chrom: FloorPlanChromosome, rate: float = 0.25) -> FloorPlanChromosome:
-    """Apply mutations to chromosome fields."""
+def _adaptive_mutation_rate(base_rate: float, generation: int, total_generations: int) -> float:
+    """Decay mutation rate over generations.
+
+    Starts at base_rate, decays exponentially to ~20% of base_rate by the final
+    generation. This allows aggressive exploration early on and fine refinement
+    later — preventing the population average from degrading after the best
+    individual has been found.
+    """
+    if total_generations <= 1:
+        return base_rate
+    progress = generation / total_generations  # 0.0 → 1.0
+    # Exponential decay: base_rate → base_rate * 0.20
+    min_rate = base_rate * 0.20
+    return min_rate + (base_rate - min_rate) * math.exp(-3.5 * progress)
+
+
+def _mutate(
+    chrom: FloorPlanChromosome,
+    rate: float = 0.25,
+    generation: int = 0,
+    total_generations: int = 1,
+) -> FloorPlanChromosome:
+    """Apply mutations to chromosome fields with adaptive rate decay."""
+    # Apply adaptive decay — early generations explore, later ones refine
+    effective_rate = _adaptive_mutation_rate(rate, generation, total_generations)
+
     c = chrom.clone()
     c._plan_sig = None  # invalidate cache
 
+    # Gaussian sigma also decays: less disruptive perturbations in later generations
+    sigma_scale = 0.4 + 0.6 * (1.0 - generation / max(1, total_generations))
+
     # Mutate raster preferences (most important gene)
     for i in range(len(c.raster_preferences)):
-        if random.random() < rate:
+        if random.random() < effective_rate:
             c.raster_preferences[i] = max(0.0, min(1.0,
-                c.raster_preferences[i] + random.gauss(0, 0.2)))
+                c.raster_preferences[i] + random.gauss(0, 0.2 * sigma_scale)))
 
-    # Occasionally do a big raster jump (exploration)
-    if random.random() < rate * 0.5:
+    # Big raster jump — reduced probability, further reduced in later generations
+    big_jump_prob = effective_rate * 0.20  # was 0.50, now 0.20
+    if random.random() < big_jump_prob:
         idx = random.randint(0, len(c.raster_preferences) - 1)
         c.raster_preferences[idx] = random.random()
 
-    if random.random() < rate:
+    if random.random() < effective_rate:
         c.depth_config_index = random.randint(0, len(C.GANGHAUS_DEPTH_CONFIGS) - 1)
-    if random.random() < rate:
+    if random.random() < effective_rate:
         c.access_type_bias = max(0.0, min(1.0,
-            c.access_type_bias + random.gauss(0, 0.2)))
-    if random.random() < rate:
+            c.access_type_bias + random.gauss(0, 0.2 * sigma_scale)))
+    if random.random() < effective_rate:
         c.allocation_order = random.choice(ALLOCATION_ORDERS)
-    if random.random() < rate:
+    if random.random() < effective_rate:
         c.service_layout_order = random.choice(SERVICE_ORDERS)
-    if random.random() < rate:
+    if random.random() < effective_rate:
         c.staircase_count_delta = random.choice([-1, 0, 0, 0, 1])
-    if random.random() < rate:
+    if random.random() < effective_rate:
         c.staircase_position_offset = max(-0.4, min(0.4,
-            c.staircase_position_offset + random.gauss(0, 0.15)))
-    if random.random() < rate:
+            c.staircase_position_offset + random.gauss(0, 0.15 * sigma_scale)))
+    if random.random() < effective_rate:
         c.bathroom_preference = max(0.0, min(1.0,
-            c.bathroom_preference + random.gauss(0, 0.15)))
-    if random.random() < rate:
-        c.dim_offset = max(-3.0, min(3.0, c.dim_offset + random.gauss(0, 0.8)))
-    if random.random() < rate:
-        c.depth_offset = max(-3.0, min(3.0, c.depth_offset + random.gauss(0, 0.8)))
+            c.bathroom_preference + random.gauss(0, 0.15 * sigma_scale)))
+    if random.random() < effective_rate:
+        c.dim_offset = max(-3.0, min(3.0, c.dim_offset + random.gauss(0, 0.8 * sigma_scale)))
+    if random.random() < effective_rate:
+        c.depth_offset = max(-3.0, min(3.0, c.depth_offset + random.gauss(0, 0.8 * sigma_scale)))
 
     for i in range(len(c.room_proportions)):
-        if random.random() < rate:
+        if random.random() < effective_rate:
             c.room_proportions[i] = max(0.20, min(0.65,
-                c.room_proportions[i] + random.gauss(0, 0.08)))
+                c.room_proportions[i] + random.gauss(0, 0.08 * sigma_scale)))
 
     return c
 
@@ -297,6 +325,35 @@ def _evaluate_floor_plan(
         breakdown["construction_regularity"] = max(3.0, min(10.0, 7.5 - cv * 5.0))
     else:
         breakdown["construction_regularity"] = 7.0
+
+    # --- 2b. Circulation efficiency ---
+    # Penalize excessive hallway/corridor area. Hallways, corridors, staircases,
+    # and elevator shafts are non-sellable/non-rentable "dead" area. The target
+    # is <15% of gross floor area; anything above 25% is heavily penalized.
+    circulation_area = 0.0
+    for apt in floor.apartments:
+        for room in apt.rooms:
+            if room.room_type in (RoomType.HALLWAY, RoomType.CORRIDOR):
+                circulation_area += room.area_sqm
+    # Add corridor/staircase common areas (not inside apartments)
+    for room in floor.rooms:
+        if room.room_type in (RoomType.CORRIDOR, RoomType.STAIRCASE, RoomType.ELEVATOR, RoomType.SHAFT):
+            if room.apartment_id is None or room.apartment_id == "":
+                circulation_area += room.area_sqm
+
+    if floor.gross_area_sqm > 0:
+        circ_pct = circulation_area / floor.gross_area_sqm
+        # 0-12% → score 10, 12-18% → 6-10, 18-30% → 0-6
+        if circ_pct <= 0.12:
+            breakdown["circulation_efficiency"] = 10.0
+        elif circ_pct <= 0.18:
+            breakdown["circulation_efficiency"] = 6.0 + (0.18 - circ_pct) / 0.06 * 4.0
+        elif circ_pct <= 0.30:
+            breakdown["circulation_efficiency"] = max(0.0, 6.0 - (circ_pct - 0.18) / 0.12 * 6.0)
+        else:
+            breakdown["circulation_efficiency"] = 0.0
+    else:
+        breakdown["circulation_efficiency"] = 5.0
 
     # --- 3. Room aspect ratios ---
     aspect_scores = []
@@ -538,9 +595,12 @@ def _evaluate_floor_plan(
     breakdown["orientation"] = quality["orientation"]
 
     # === Weighted combination ===
+    # Efficiency now includes circulation penalty — hallways are dead area
     efficiency_score = (
-        breakdown["net_to_gross"] + breakdown["construction_regularity"]
-    ) / 2.0
+        breakdown["net_to_gross"] * 1.0 +
+        breakdown["construction_regularity"] * 0.5 +
+        breakdown["circulation_efficiency"] * 1.5  # heavy weight: minimize hallways
+    ) / 3.0
 
     # Enhanced livability: add connectivity, furniture, daylight quality,
     # kitchen-living, and orientation to the livability group.
@@ -709,6 +769,7 @@ class FloorPlanOptimizer:
 
         # ---- Evaluate initial population ----
         best_raw_fitness = 0.0
+        best_ever_chrom: Optional[FloorPlanChromosome] = None
         for chrom in population:
             plans = generate_variant(request, chrom)
             if plans:
@@ -717,17 +778,35 @@ class FloorPlanOptimizer:
                 )
                 chrom.fitness = chrom.raw_fitness
                 chrom._plan_sig = _plan_signature(plans)
-                best_raw_fitness = max(best_raw_fitness, chrom.raw_fitness)
+                if chrom.raw_fitness > best_raw_fitness:
+                    best_raw_fitness = chrom.raw_fitness
+                    best_ever_chrom = chrom.clone()
             else:
                 chrom.fitness = 0.0
                 chrom.raw_fitness = 0.0
 
         _apply_fitness_sharing(population)
 
+        # Build live preview of best variant
+        def _build_live_preview(chrom: FloorPlanChromosome) -> Optional[FloorPlanVariant]:
+            if chrom is None or chrom.raw_fitness <= 0:
+                return None
+            plans = generate_variant(request, chrom)
+            if not plans:
+                return None
+            _, breakdown = _evaluate_floor_plan(plans, request, weights)
+            return FloorPlanVariant(
+                rank=1,
+                fitness_score=round(chrom.raw_fitness, 2),
+                fitness_breakdown={k: round(v, 2) for k, v in breakdown.items()},
+                building_floor_plans=plans,
+            )
+
         if progress_callback:
             nonzero = [c.raw_fitness for c in population if c.raw_fitness > 0]
             avg_fit = sum(nonzero) / len(nonzero) if nonzero else 0.0
-            progress_callback(0, generations, best_raw_fitness, avg_fit)
+            preview = _build_live_preview(best_ever_chrom) if best_ever_chrom else None
+            progress_callback(0, generations, best_raw_fitness, avg_fit, preview)
 
         # ---- Evolution loop ----
         for gen in range(1, generations + 1):
@@ -743,17 +822,21 @@ class FloorPlanOptimizer:
                     new_pop.append(c.clone())
                     seen_sigs.add(c._plan_sig)
 
-            # Random immigrants for diversity (15% of population)
-            num_immigrants = max(1, pop_size // 7)
+            # Random immigrants for diversity — adaptive: more early, fewer later
+            # Early: ~10% of population; Late: ~3% (was fixed 15%)
+            progress = gen / generations
+            immigrant_frac = 0.10 * (1.0 - progress) + 0.03 * progress
+            num_immigrants = max(1, int(pop_size * immigrant_frac))
             for _ in range(num_immigrants):
                 new_pop.append(FloorPlanChromosome())
 
-            # Fill rest via crossover + mutation
+            # Fill rest via crossover + mutation (with generation-aware adaptive rate)
             while len(new_pop) < pop_size:
                 parent_a = _tournament_select(population)
                 parent_b = _tournament_select(population)
                 child = _crossover(parent_a, parent_b)
-                child = _mutate(child, rate=mutation_rate)
+                child = _mutate(child, rate=mutation_rate,
+                                generation=gen, total_generations=generations)
                 new_pop.append(child)
 
             # Evaluate new individuals
@@ -771,10 +854,16 @@ class FloorPlanOptimizer:
                     chrom.fitness = raw_fitness
                     chrom.fitness_breakdown = breakdown
                     chrom._plan_sig = _plan_signature(plans)
-                    best_raw_fitness = max(best_raw_fitness, raw_fitness)
+                    if raw_fitness > best_raw_fitness:
+                        best_raw_fitness = raw_fitness
                 else:
                     chrom.fitness = 0.0
                     chrom.raw_fitness = 0.0
+
+            # Track overall best chromosome
+            for chrom in new_pop:
+                if chrom.raw_fitness > (best_ever_chrom.raw_fitness if best_ever_chrom else 0):
+                    best_ever_chrom = chrom.clone()
 
             _apply_fitness_sharing(new_pop)
             population = new_pop
@@ -782,7 +871,11 @@ class FloorPlanOptimizer:
             if progress_callback:
                 nonzero = [c.raw_fitness for c in population if c.raw_fitness > 0]
                 avg_fit = sum(nonzero) / len(nonzero) if nonzero else 0.0
-                progress_callback(gen, generations, best_raw_fitness, avg_fit)
+                # Send live preview every 10 generations (expensive to rebuild)
+                preview = None
+                if gen % 10 == 0 or gen == generations:
+                    preview = _build_live_preview(best_ever_chrom) if best_ever_chrom else None
+                progress_callback(gen, generations, best_raw_fitness, avg_fit, preview)
 
         # ---- Extract top diverse variants ----
         # Re-evaluate with raw fitness for final ranking

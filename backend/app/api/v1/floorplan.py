@@ -58,7 +58,7 @@ def _run_generation(job_id: str, request: FloorPlanRequest):
             except Exception:
                 pass  # Don't let WS errors break the optimizer
 
-        def progress_callback(gen: int, total: int, best_fit: float, avg_fit: float = 0.0):
+        def progress_callback(gen: int, total: int, best_fit: float, avg_fit: float = 0.0, live_preview=None):
             elapsed = time.time() - start_time
             _jobs[job_id].current_generation = gen
             _jobs[job_id].total_generations = total
@@ -74,6 +74,10 @@ def _run_generation(job_id: str, request: FloorPlanRequest):
                 _jobs[job_id].estimated_remaining_seconds = round(
                     avg_per_gen * remaining, 1
                 )
+
+            # Update live preview if provided
+            if live_preview is not None:
+                _jobs[job_id].live_preview = live_preview
 
             # Broadcast progress to Grasshopper clients
             if sync_manager.client_count > 0:

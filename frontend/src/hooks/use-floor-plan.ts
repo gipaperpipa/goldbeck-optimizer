@@ -19,6 +19,7 @@ interface FloorPlanProgress {
   elapsedSeconds: number;
   estimatedRemainingSeconds: number;
   fitnessHistory: FitnessHistoryEntry[];
+  livePreview: any | null; // FloorPlanVariant with building_floor_plans
 }
 
 export function useFloorPlan() {
@@ -80,6 +81,7 @@ export function useFloorPlan() {
       populationSize: number = 1,
       weights?: FloorPlanWeights,
       useAiGeneration: boolean = false,
+      enableStaffelgeschoss: boolean = false,
     ) => {
       setIsLoading(true);
       setError(null);
@@ -101,6 +103,8 @@ export function useFloorPlan() {
           construction_system: "goldbeck",
           story_height_m: storyHeight,
           prefer_barrier_free: true,
+          enable_staffelgeschoss: enableStaffelgeschoss,
+          staffelgeschoss_setback_m: 2.0,
           generations,
           population_size: populationSize,
           weights,
@@ -145,7 +149,13 @@ export function useFloorPlan() {
               elapsedSeconds: result.elapsed_seconds,
               estimatedRemainingSeconds: result.estimated_remaining_seconds,
               fitnessHistory: result.fitness_history ?? [],
+              livePreview: result.live_preview ?? null,
             });
+
+            // If live preview available, show it immediately in the viewer
+            if (result.live_preview?.building_floor_plans) {
+              setFloorPlan(building.id, result.live_preview.building_floor_plans);
+            }
 
             if (result.status === "completed") {
               if (result.building_floor_plans) {

@@ -510,10 +510,16 @@ class LayoutOptimizer:
             for b in buildings_data
         ]
 
-        # Validate all fit
+        # Validate all fit within buildable area
         for poly in bldg_polys:
             if not self.geometry.fits_within(poly, buildable):
                 return None
+
+        # Validate no buildings overlap each other
+        for i in range(len(bldg_polys)):
+            for j in range(i + 1, len(bldg_polys)):
+                if self.geometry.check_overlap(bldg_polys[i], bldg_polys[j]):
+                    return None
 
         building_footprints: list[BuildingFootprint] = []
         regs = request.regulations

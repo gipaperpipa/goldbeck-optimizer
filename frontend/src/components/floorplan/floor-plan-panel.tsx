@@ -66,6 +66,7 @@ export function FloorPlanPanel() {
   const [generations, setGenerations] = useState(50);
   const [populationSize, setPopulationSize] = useState(20);
   const [useAiGeneration, setUseAiGeneration] = useState(false);
+  const [enableStaffelgeschoss, setEnableStaffelgeschoss] = useState(false);
   const [weights, setWeights] = useState<FloorPlanWeights>({
     efficiency: 0.25,
     livability: 0.25,
@@ -126,7 +127,7 @@ export function FloorPlanPanel() {
     setSelectedApt(null);
     setSelectedFloorIndex(0);
     setSelectedVariantIndex(0);
-    generate(currentBuilding, storyHeight, generations, populationSize, weights, useAiGeneration);
+    generate(currentBuilding, storyHeight, generations, populationSize, weights, useAiGeneration, enableStaffelgeschoss);
   };
 
   const handleVariantSelect = (index: number) => {
@@ -245,6 +246,22 @@ export function FloorPlanPanel() {
             </div>
           </div>
 
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2 px-3 py-1.5 rounded border border-sky-200 bg-sky-50 hover:bg-sky-100 transition-colors cursor-pointer" style={{ opacity: isLoading ? 0.5 : 1, pointerEvents: isLoading ? "none" : "auto" }}>
+              <input
+                type="checkbox"
+                checked={enableStaffelgeschoss}
+                onChange={(e) => setEnableStaffelgeschoss(e.target.checked)}
+                disabled={isLoading}
+                className="w-4 h-4 rounded"
+              />
+              <span className="text-xs font-medium text-sky-900">Staffelgeschoss</span>
+            </label>
+            {enableStaffelgeschoss && (
+              <span className="text-[10px] text-sky-700">Top floor setback (2m) — not counted as Vollgeschoss</span>
+            )}
+          </div>
+
           <div className="flex items-center gap-4 text-xs text-neutral-500">
             <div className="flex items-center gap-1">
               <Zap className="w-3 h-3" />
@@ -312,7 +329,15 @@ export function FloorPlanPanel() {
               <span>
                 Generation {progress.currentGeneration} / {progress.totalGenerations}
               </span>
-              <span>Best fitness: {progress.bestFitness.toFixed(1)}</span>
+              <div className="flex items-center gap-2">
+                {progress.livePreview && (
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-semibold uppercase">
+                    <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse" />
+                    Live Preview
+                  </span>
+                )}
+                <span>Best fitness: {progress.bestFitness.toFixed(1)}</span>
+              </div>
             </div>
             <div className="w-full bg-neutral-200 rounded-full h-2.5 overflow-hidden">
               <div

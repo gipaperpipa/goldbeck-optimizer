@@ -2,8 +2,9 @@
 
 import { useState, useCallback } from "react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { MapContainer } from "@/components/map/map-container";
+import { CadastralMap } from "@/components/map/cadastral-map";
 import { ManualPlotInput } from "@/components/plot/manual-plot-input";
 import { PlotSummary } from "@/components/plot/plot-summary";
 import { usePlotAnalysis } from "@/hooks/use-plot-analysis";
@@ -15,7 +16,7 @@ interface PlotInputStepProps {
 }
 
 export function PlotInputStep({ onNext }: PlotInputStepProps) {
-  const [tab, setTab] = useState("manual");
+  const [tab, setTab] = useState("cadastral");
   const { analyze, isLoading } = usePlotAnalysis();
   const plotAnalysis = useProjectStore((s) => s.plotAnalysis);
 
@@ -37,14 +38,22 @@ export function PlotInputStep({ onNext }: PlotInputStepProps) {
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>Define Your Plot</CardTitle>
+          <CardTitle>Grundstück definieren</CardTitle>
+          <CardDescription>
+            Wählen Sie ein Flurstück aus der Katasterkarte oder geben Sie die Maße manuell ein.
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <Tabs value={tab} onValueChange={setTab}>
             <TabsList className="mb-4">
-              <TabsTrigger value="manual">Manual Entry</TabsTrigger>
-              <TabsTrigger value="map">Draw on Map</TabsTrigger>
+              <TabsTrigger value="cadastral">Katasterkarte</TabsTrigger>
+              <TabsTrigger value="manual">Manuelle Eingabe</TabsTrigger>
+              <TabsTrigger value="map">Auf Karte zeichnen</TabsTrigger>
             </TabsList>
+
+            <TabsContent value="cadastral">
+              <CadastralMap onPlotConfirmed={onNext} />
+            </TabsContent>
 
             <TabsContent value="manual">
               <ManualPlotInput onComplete={onNext} />

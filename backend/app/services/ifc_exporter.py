@@ -179,10 +179,12 @@ DATA;"""
                             owner, body_ctx, sp, is_window=False,
                         )
 
-            # ── Slab ────────────────────────────────────────────
+            # ── Slab (uses per-floor grid for Staffelgeschoss) ──
+            slab_w = getattr(fp.structural_grid, 'building_length_m', None) or floor_plans.building_width_m
+            slab_d = getattr(fp.structural_grid, 'building_depth_m', None) or floor_plans.building_depth_m
             slab_id = self._create_slab(
-                floor_plans.building_width_m,
-                floor_plans.building_depth_m,
+                slab_w,
+                slab_d,
                 0.24,
                 owner, body_ctx, sp,
             )

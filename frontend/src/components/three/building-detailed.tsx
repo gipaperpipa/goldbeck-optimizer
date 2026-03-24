@@ -136,7 +136,7 @@ function Wall3D({
       -wall.start.y,
     );
 
-    return { geometry: geom, position: pos, rotation: -angle };
+    return { geometry: geom, position: pos, rotation: angle };
   }, [wall, wallHeight, yOffset, doors, windows]);
 
   const color = WALL_COLORS[wall.wall_type] || "#d6d3d1";
@@ -371,15 +371,21 @@ export function BuildingDetailed({
           }
         });
 
+        // Per-floor slab dimensions (supports Staffelgeschoss setback floors)
+        const floorW = fp.structural_grid?.building_length_m || floorPlans.building_width_m;
+        const floorD = fp.structural_grid?.building_depth_m || floorPlans.building_depth_m;
+        const gridOriginX = fp.structural_grid?.origin?.x || 0;
+        const gridOriginY = fp.structural_grid?.origin?.y || 0;
+
         return (
           <group key={fp.floor_index}>
-            {/* Slab */}
+            {/* Slab — sized to per-floor grid (Staffelgeschoss has smaller slab) */}
             <Slab3D
-              width={floorPlans.building_width_m}
-              depth={floorPlans.building_depth_m}
+              width={floorW}
+              depth={floorD}
               yOffset={yOffset}
-              originX={-floorPlans.building_width_m / 2}
-              originZ={-floorPlans.building_depth_m / 2}
+              originX={gridOriginX - floorPlans.building_width_m / 2}
+              originZ={gridOriginY - floorPlans.building_depth_m / 2}
             />
 
             {/* Walls with openings */}
