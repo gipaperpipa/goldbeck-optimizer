@@ -5,18 +5,9 @@ const nextConfig: NextConfig = {
   images: {
     unoptimized: true,
   },
-  // Suppress build warnings for packages that use Node.js APIs
-  webpack: (config, { isServer }) => {
-    if (!isServer) {
-      config.resolve.fallback = {
-        ...config.resolve.fallback,
-        fs: false,
-        net: false,
-        tls: false,
-      };
-    }
-    return config;
-  },
+  // Empty turbopack config to silence the webpack→turbopack migration error
+  // Next.js 16 uses Turbopack by default; the webpack fallbacks are no longer needed
+  turbopack: {},
 };
 
 export default nextConfig;
