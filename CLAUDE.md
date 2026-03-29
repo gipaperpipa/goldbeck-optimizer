@@ -41,10 +41,10 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 4. **If the next session sees status = `IN PROGRESS`:** The previous session was cut off. Read the request, check what was partially done (git diff, file state), and resume.
 
 ## Last Request
-**Status:** DONE
-**Date:** 2026-03-24
-**Request:** Set up two-tier memory system (CLAUDE.md + memory/) so context persists across sessions. Write-before-work protocol so interrupted sessions are recoverable.
-**Progress:** Memory system fully set up. CLAUDE.md restructured with session protocol. Glossary, project history, people, and tech context files created. Hourly sync task disabled in favor of write-before-work approach.
+**Status:** IN PROGRESS
+**Date:** 2026-03-29
+**Request:** Deploy the app so people and AI can test it. Adrian has a Vercel account. Need deployment strategy for both frontend (Next.js) and backend (FastAPI/Python).
+**Progress:** Assessing project structure and deployment requirements...
 
 ## Current State
 **Last updated:** 2026-03-24
