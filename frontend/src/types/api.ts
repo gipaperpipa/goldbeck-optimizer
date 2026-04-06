@@ -559,6 +559,7 @@ export interface StructuralGrid {
   corridor_y_start_m: number;
   story_height_m: number;
   axis_positions_x: number[];
+  axis_positions_y?: number[];
   outer_wall_south_y: number;
   outer_wall_north_y: number;
   gallery_side?: string | null;  // "north" or "south" — Laubengang only
