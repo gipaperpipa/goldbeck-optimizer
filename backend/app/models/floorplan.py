@@ -179,11 +179,21 @@ class FloorPlan(BaseModel):
 
 
 class BuildingFloorPlans(BaseModel):
-    """All floor plans for a single building."""
+    """All floor plans for a single building.
+
+    NOTE on naming: ``building_width_m`` corresponds to the generator's
+    ``length_m`` (long facade), and ``building_depth_m`` corresponds to
+    the generator's ``depth_m`` (short dimension / perpendicular to the
+    long facade).  This mismatch is intentional — the API uses the
+    architect-facing terms (width = longest extent on-screen) while the
+    generator uses structural terms (length = direction of bays).
+    Renaming would break the API contract so the mapping is documented
+    here and in CLAUDE.md instead.
+    """
     building_id: str
     construction_system: str = "goldbeck"
-    building_width_m: float     # along long facade (length)
-    building_depth_m: float     # perpendicular to long facade
+    building_width_m: float     # along long facade (= generator length_m)
+    building_depth_m: float     # perpendicular to long facade (= generator depth_m)
     num_stories: int
     story_height_m: float
     access_type: AccessType
@@ -232,8 +242,8 @@ class FloorPlanRequest(BaseModel):
     prefer_barrier_free: bool = True
     access_type_override: Optional[AccessType] = None
     # Generational optimizer settings
-    generations: int = 1
-    population_size: int = 1
+    generations: int = Field(default=1, ge=1, le=500, description="Number of GA generations")
+    population_size: int = Field(default=1, ge=1, le=200, description="Individuals per generation")
     weights: Optional[FloorPlanWeights] = None
     use_ai_generation: bool = False  # Enable AI-assisted generation with enhanced parameters
     # Staffelgeschoss (setback top floor — does not count as Vollgeschoss)
@@ -247,6 +257,7 @@ class FloorPlanVariant(BaseModel):
     fitness_score: float
     fitness_breakdown: Optional[dict[str, float]] = None
     building_floor_plans: BuildingFloorPlans
+    validation: Optional[dict] = None  # Building code validation results
 
 
 class FitnessHistoryEntry(BaseModel):

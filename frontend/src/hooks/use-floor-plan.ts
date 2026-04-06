@@ -30,6 +30,8 @@ export function useFloorPlan() {
   // Persisted fitness history that survives isLoading=false
   const [completedFitnessHistory, setCompletedFitnessHistory] = useState<FitnessHistoryEntry[]>([]);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Track active job so stale polls from a previous generation are ignored
+  const activeJobRef = useRef<string | null>(null);
   const { setFloorPlan, setFloorPlanVariants, clearFloorPlans } = useProjectStore();
 
   const stopPolling = useCallback(() => {
@@ -37,6 +39,7 @@ export function useFloorPlan() {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
+    activeJobRef.current = null;
   }, []);
 
   const estimate = useCallback(
@@ -135,11 +138,21 @@ export function useFloorPlan() {
 
         // Poll for result with progress
         const jobId = initial.job_id;
+        activeJobRef.current = jobId;
         intervalRef.current = setInterval(async () => {
+          // If a newer generation was started, stop this stale poll
+          if (activeJobRef.current !== jobId) {
+            return;
+          }
           try {
             const result = await apiClient.get<FloorPlanResult>(
               `/floorplan/${jobId}`
             );
+
+            // Double-check: another generation may have started while we awaited
+            if (activeJobRef.current !== jobId) {
+              return;
+            }
 
             setProgress({
               progressPct: result.progress_pct,

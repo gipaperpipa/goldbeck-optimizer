@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import {
   Card,
@@ -20,6 +21,8 @@ import {
   Plus,
 } from "lucide-react";
 import { useProjects } from "@/hooks/use-projects";
+
+const PROJECTS_PER_PAGE = 12;
 
 const STATUS_LABELS: Record<string, string> = {
   prospecting: "Akquise",
@@ -43,6 +46,13 @@ const STATUS_COLORS: Record<string, string> = {
 
 export default function HomePage() {
   const { projects, stats, isLoading } = useProjects();
+  const [currentPage, setCurrentPage] = useState(1);
+
+  const totalPages = Math.max(1, Math.ceil(projects.length / PROJECTS_PER_PAGE));
+  const paginatedProjects = projects.slice(
+    (currentPage - 1) * PROJECTS_PER_PAGE,
+    currentPage * PROJECTS_PER_PAGE,
+  );
 
   return (
     <div className="min-h-screen bg-neutral-50">
@@ -126,7 +136,7 @@ export default function HomePage() {
 
           {!isLoading && projects.length > 0 && (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {projects.map((project) => (
+              {paginatedProjects.map((project) => (
                 <Link key={project.id} href={`/project/${project.id}`}>
                   <Card className="hover:shadow-md transition-shadow cursor-pointer h-full">
                     <CardHeader className="pb-2">
@@ -171,6 +181,29 @@ export default function HomePage() {
                 </Link>
               ))}
             </div>
+            {totalPages > 1 && (
+              <div className="flex items-center justify-center gap-2 mt-6">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={currentPage <= 1}
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                >
+                  Zurück
+                </Button>
+                <span className="text-sm text-neutral-500">
+                  Seite {currentPage} von {totalPages}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={currentPage >= totalPages}
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                >
+                  Weiter
+                </Button>
+              </div>
+            )}
           )}
         </div>
 

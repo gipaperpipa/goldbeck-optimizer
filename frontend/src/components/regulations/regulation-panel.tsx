@@ -9,8 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { useProjectStore } from "@/stores/project-store";
 import { useRegulationLookup } from "@/hooks/use-regulation-lookup";
 import type { RegulationSet, GermanRegulationSet } from "@/types/api";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+import { API_BASE } from "@/lib/api-client";
 
 // ============================================================
 // International Presets (US-centric)
@@ -127,9 +126,10 @@ export function RegulationPanel({ onNext }: RegulationPanelProps) {
 
   const updateIntlField = (path: string, value: number | string) => {
     setIntlRegs((prev) => {
-      const next = JSON.parse(JSON.stringify(prev));
+      const next = structuredClone(prev);
       const parts = path.split(".");
-      let obj = next;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let obj: any = next;
       for (let i = 0; i < parts.length - 1; i++) obj = obj[parts[i]];
       obj[parts[parts.length - 1]] = value;
       return next;

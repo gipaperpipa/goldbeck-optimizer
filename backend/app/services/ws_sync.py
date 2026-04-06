@@ -16,6 +16,7 @@ from typing import Optional
 from weakref import WeakSet
 
 from fastapi import WebSocket, WebSocketDisconnect
+from app.services.floorplan import goldbeck_constants as C
 
 logger = logging.getLogger("ws_sync")
 
@@ -121,22 +122,41 @@ class SyncManager:
             await self._send(ws, {"type": "pong"})
 
         elif msg_type == "parameter_override":
-            # Store override and notify optimizer on next generation
-            logger.info(f"GH parameter override: {data.get('payload', {})}")
-            # TODO: Feed back to optimizer
-            await self._broadcast({
-                "type": "parameter_override_ack",
-                "payload": data.get("payload", {}),
-            })
+            payload = data.get("payload", {})
+            logger.info(f"GH parameter override: {payload}")
+            # Validate overrides against Goldbeck constraints
+            violations = self._validate_parameter_override(payload)
+            if violations:
+                await self._send(ws, {
+                    "type": "parameter_override_rejected",
+                    "payload": {"violations": violations, "original": payload},
+                })
+            else:
+                await self._broadcast({
+                    "type": "parameter_override_ack",
+                    "payload": payload,
+                })
 
         elif msg_type == "request_variant":
             # Client wants a specific variant — handled by API layer
             logger.info(f"GH requested variant: {data.get('payload', {})}")
 
         elif msg_type == "geometry_edit":
-            # Manual geometry edits from Grasshopper
-            logger.info(f"GH geometry edit received: {data.get('payload', {}).get('room_id', 'unknown')}")
-            # TODO: Validate edit against Goldbeck constraints and feed back
+            payload = data.get("payload", {})
+            room_id = payload.get("room_id", "unknown")
+            logger.info(f"GH geometry edit received: {room_id}")
+            # Validate edit against Goldbeck constraints
+            violations = self._validate_geometry_edit(payload)
+            if violations:
+                await self._send(ws, {
+                    "type": "geometry_edit_rejected",
+                    "payload": {"room_id": room_id, "violations": violations},
+                })
+            else:
+                await self._send(ws, {
+                    "type": "geometry_edit_ack",
+                    "payload": {"room_id": room_id},
+                })
 
         elif msg_type == "request_full_state":
             # Client is asking for the current state (e.g., after reconnect)
@@ -148,6 +168,70 @@ class SyncManager:
 
         else:
             logger.warning(f"Unknown message type from GH: {msg_type}")
+
+    # --- Validation ---
+
+    @staticmethod
+    def _validate_parameter_override(payload: dict) -> list[str]:
+        """Validate parameter overrides against Goldbeck system constraints."""
+        violations = []
+        if "bay_width_m" in payload:
+            bw = payload["bay_width_m"]
+            if bw not in C.STANDARD_RASTERS:
+                violations.append(
+                    f"Bay width {bw}m not in Goldbeck grid. "
+                    f"Allowed: {C.STANDARD_RASTERS}"
+                )
+        if "story_height_m" in payload:
+            sh = payload["story_height_m"]
+            valid_heights = (
+                C.STORY_HEIGHT_STANDARD_A, C.STORY_HEIGHT_STANDARD_B,
+                C.STORY_HEIGHT_ELEVATED_GF, C.STORY_HEIGHT_ELEVATED_GF_B,
+            )
+            if sh not in valid_heights:
+                violations.append(
+                    f"Story height {sh}m not valid. Allowed: {valid_heights}"
+                )
+        if "building_depth_m" in payload:
+            depth = payload["building_depth_m"]
+            if depth < 6.0 or depth > 16.0:
+                violations.append(f"Building depth {depth}m out of range (6.0–16.0m)")
+        return violations
+
+    @staticmethod
+    def _validate_geometry_edit(payload: dict) -> list[str]:
+        """Validate a manual geometry edit against Goldbeck constraints."""
+        violations = []
+        grid = C.GRID_UNIT  # 0.625m
+        # Check wall positions snap to 62.5cm grid (Schottwand)
+        if "wall_position_m" in payload:
+            pos = payload["wall_position_m"]
+            remainder = round(pos % grid, 4)
+            if remainder > 0.001 and abs(remainder - grid) > 0.001:
+                violations.append(
+                    f"Wall position {pos}m doesn't snap to {grid}m grid"
+                )
+        # Check room width is a multiple of grid module
+        if "room_width_m" in payload:
+            rw = payload["room_width_m"]
+            remainder = round(rw % grid, 4)
+            if remainder > 0.001 and abs(remainder - grid) > 0.001:
+                violations.append(
+                    f"Room width {rw}m not a multiple of {grid}m grid"
+                )
+        # Check minimum room area
+        if "room_area_sqm" in payload:
+            area = payload["room_area_sqm"]
+            room_type = payload.get("room_type", "")
+            min_area = {
+                "bedroom": 8.0, "living": 14.0, "kitchen": 6.0,
+                "bathroom": 3.5, "hallway": 2.0,
+            }.get(room_type, 4.0)
+            if area < min_area:
+                violations.append(
+                    f"Room area {area}m² below minimum {min_area}m² for {room_type or 'room'}"
+                )
+        return violations
 
     # --- Internal ---
 
@@ -162,7 +246,8 @@ class SyncManager:
         for ws in self._active_connections:
             try:
                 await ws.send_text(data)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"WS send failed, marking client disconnected: {e}")
                 disconnected.append(ws)
 
         for ws in disconnected:
@@ -172,7 +257,8 @@ class SyncManager:
         """Send a message to a single client."""
         try:
             await ws.send_text(json.dumps(message))
-        except Exception:
+        except Exception as e:
+            logger.debug(f"WS direct send failed: {e}")
             self._active_connections.discard(ws)
 
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
-import { apiClient } from "@/lib/api-client";
+import { apiClient, API_BASE } from "@/lib/api-client";
 import type {
   ProjectInfo,
   TimelineEntryInfo,
@@ -61,7 +61,7 @@ export function useProjects() {
       setError(null);
       try {
         const res = await fetch(
-          `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api"}/v1/projects/${projectId}`,
+          `${API_BASE}/v1/projects/${projectId}`,
           {
             method: "PUT",
             headers: { "Content-Type": "application/json" },

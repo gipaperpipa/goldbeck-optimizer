@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, lazy, Suspense } from "react";
 import Link from "next/link";
 import { Building2, ChevronLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -9,11 +9,13 @@ import { PlotInputStep } from "@/components/plot/plot-input-step";
 import { RegulationPanel } from "@/components/regulations/regulation-panel";
 import { OptimizationPreferences } from "@/components/optimization/optimization-preferences";
 import { LayoutComparison } from "@/components/optimization/layout-comparison";
-import { Scene3D } from "@/components/three/scene";
 import { ShadowAnalysisPanel } from "@/components/shadow/shadow-analysis-panel";
 import { FinancialDashboard } from "@/components/financial/financial-dashboard";
 import { FloorPlanPanel } from "@/components/floorplan/floor-plan-panel";
 import { useProjectStore } from "@/stores/project-store";
+
+// M30: Lazy-load Three.js scene to avoid loading ~500KB on initial page
+const Scene3D = lazy(() => import("@/components/three/scene").then(m => ({ default: m.Scene3D })));
 
 const STEPS = [
   { id: 0, label: "Plot Input" },
@@ -55,6 +57,8 @@ export default function NewProjectPage() {
                   if (s.id <= step) setStep(s.id);
                 }}
                 disabled={s.id > step}
+                aria-label={`Schritt ${s.id + 1}: ${s.label}${s.id < step ? " (abgeschlossen)" : s.id === step ? " (aktuell)" : ""}`}
+                aria-current={s.id === step ? "step" : undefined}
                 className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
                   s.id === step
                     ? "bg-neutral-900 text-white"
@@ -107,7 +111,9 @@ export default function NewProjectPage() {
             </TabsContent>
 
             <TabsContent value="3d-view">
-              <Scene3D layout={selectedLayout} plot={plotAnalysis} floorPlansMap={floorPlans} />
+              <Suspense fallback={<div className="w-full h-[min(600px,70vh)] bg-neutral-100 rounded-lg flex items-center justify-center text-neutral-400">3D-Ansicht wird geladen...</div>}>
+                <Scene3D layout={selectedLayout} plot={plotAnalysis} floorPlansMap={floorPlans} />
+              </Suspense>
               {!selectedLayout && (
                 <p className="text-center text-neutral-500 mt-4">
                   Select a layout from the Layouts tab first

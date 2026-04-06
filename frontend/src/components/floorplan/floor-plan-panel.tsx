@@ -207,9 +207,9 @@ export function FloorPlanPanel() {
             <input
               type="number"
               min={1}
-              max={100000}
+              max={500}
               value={generations}
-              onChange={(e) => setGenerations(Math.max(1, parseInt(e.target.value) || 1))}
+              onChange={(e) => setGenerations(Math.min(500, Math.max(1, parseInt(e.target.value) || 1)))}
               className="border rounded px-3 py-1.5 text-sm w-28 bg-white"
               disabled={isLoading}
             />
@@ -219,9 +219,9 @@ export function FloorPlanPanel() {
             <input
               type="number"
               min={2}
-              max={100000}
+              max={200}
               value={populationSize}
-              onChange={(e) => setPopulationSize(Math.max(2, parseInt(e.target.value) || 2))}
+              onChange={(e) => setPopulationSize(Math.min(200, Math.max(2, parseInt(e.target.value) || 2)))}
               className="border rounded px-3 py-1.5 text-sm w-28 bg-white"
               disabled={isLoading}
             />
@@ -313,6 +313,7 @@ export function FloorPlanPanel() {
                   onChange={(e) => handleWeightChange(key, parseInt(e.target.value))}
                   className={`flex-1 h-1.5 rounded-lg cursor-pointer ${color}`}
                   disabled={isLoading}
+                  aria-label={`${label} Gewichtung`}
                 />
                 <span className="text-xs font-mono text-neutral-500 w-8 text-right">
                   {Math.round(weights[key] * 100)}%
@@ -441,7 +442,7 @@ export function FloorPlanPanel() {
                   : "bg-neutral-100 text-neutral-600 hover:bg-neutral-200"
               }`}
             >
-              {fp.floor_index === 0 ? "Ground" : `Floor ${fp.floor_index}`}
+              {fp.floor_index === 0 ? "EG" : `${fp.floor_index}. OG`}
             </button>
           ))}
         </div>

@@ -10,7 +10,15 @@ import { SectionBoxControls } from "./section-box";
 import { Button } from "@/components/ui/button";
 import { Download } from "lucide-react";
 import type { LayoutOption, PlotAnalysis, BuildingFloorPlans } from "@/types/api";
+import { API_BASE } from "@/lib/api-client";
 
+/** Props for the 3D building scene (Three.js / R3F).
+ * @property layout - The selected optimizer layout with building positions.
+ * @property plot - Plot boundary polygon for ground-plane rendering.
+ * @property sunPosition - Azimuth/altitude in degrees for directional light.
+ * @property floorPlansMap - Per-building floor plans keyed by building_id,
+ *   used to render detailed walls/windows/doors in the 3D view.
+ */
 interface Scene3DProps {
   layout: LayoutOption | null;
   plot?: PlotAnalysis | null;
@@ -22,6 +30,7 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   const [showLabels, setShowLabels] = useState(true);
   const [sectionY, setSectionY] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
   const handleExportIfc = useCallback(async (buildingId: string) => {
     if (!layout || !floorPlansMap?.[buildingId]) return;
@@ -29,10 +38,10 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
     if (!building) return;
 
     setExporting(true);
+    setExportStatus(null);
     try {
-      const base = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
       const response = await fetch(
-        `${base}/v1/export/ifc`,
+        `${API_BASE}/v1/export/ifc`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -42,7 +51,10 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
           }),
         }
       );
-      if (!response.ok) throw new Error("Export failed");
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({ detail: response.statusText }));
+        throw new Error(detail.detail || `Export failed (${response.status})`);
+      }
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -50,8 +62,12 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
       a.download = `building_${buildingId}.ifc`;
       a.click();
       URL.revokeObjectURL(url);
+      setExportStatus({ type: "success", message: `IFC-Export erfolgreich: building_${buildingId}.ifc` });
+      setTimeout(() => setExportStatus(null), 4000);
     } catch (err) {
-      console.error("IFC export error:", err);
+      const msg = err instanceof Error ? err.message : "Unbekannter Fehler";
+      setExportStatus({ type: "error", message: `IFC-Export fehlgeschlagen: ${msg}` });
+      setTimeout(() => setExportStatus(null), 6000);
     } finally {
       setExporting(false);
     }
@@ -59,7 +75,7 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
 
   if (!layout) {
     return (
-      <div className="w-full h-[600px] bg-neutral-100 rounded-lg flex items-center justify-center">
+      <div className="w-full h-[min(600px,70vh)] bg-neutral-100 rounded-lg flex items-center justify-center">
         <p className="text-neutral-500">Select a layout to view in 3D</p>
       </div>
     );
@@ -80,7 +96,7 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   const hasDetailedData = floorPlansMap && Object.keys(floorPlansMap).length > 0;
 
   return (
-    <div className="relative w-full h-[600px] rounded-lg overflow-hidden border">
+    <div className="relative w-full h-[min(600px,70vh)] rounded-lg overflow-hidden border">
       {/* Top controls */}
       <div className="absolute top-3 left-3 z-10 flex gap-2">
         <Button
@@ -107,6 +123,17 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
           ) : null
         )}
       </div>
+
+      {/* Export status toast */}
+      {exportStatus && (
+        <div className={`absolute top-14 left-3 z-20 px-3 py-2 rounded-md text-sm font-medium shadow-md ${
+          exportStatus.type === "success"
+            ? "bg-green-100 text-green-800 border border-green-200"
+            : "bg-red-100 text-red-800 border border-red-200"
+        }`}>
+          {exportStatus.message}
+        </div>
+      )}
 
       {/* Section box controls — always shown when buildings exist */}
       <div className="absolute top-3 right-3 z-10">

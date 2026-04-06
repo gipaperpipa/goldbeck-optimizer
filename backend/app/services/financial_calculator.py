@@ -1,3 +1,5 @@
+import logging
+
 from app.models.financial import (
     FinancialAnalysisRequest,
     FinancialAnalysis,
@@ -6,6 +8,8 @@ from app.models.financial import (
     AnnualCashflow,
 )
 from app.services.floorplan import goldbeck_constants as C
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_CONSTRUCTION_COSTS = {
@@ -43,6 +47,11 @@ DEFAULT_REVENUE = {
 class FinancialCalculator:
     def analyze(self, request: FinancialAnalysisRequest) -> FinancialAnalysis:
         layout = request.layout
+        # Guard against invalid layout data that would cause division by zero
+        if layout.total_units <= 0:
+            logger.warning("Financial analysis requested with 0 units — results will be zero")
+        if layout.total_residential_sqm <= 0:
+            logger.warning("Financial analysis requested with 0 residential sqm")
         costs = {**DEFAULT_CONSTRUCTION_COSTS, **(request.construction_costs or {})}
         soft_rates = {**DEFAULT_SOFT_COST_RATES, **(request.soft_cost_rates or {})}
         rev = {**DEFAULT_REVENUE, **(request.revenue_assumptions or {})}

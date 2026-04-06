@@ -17,7 +17,10 @@ Supports variation_params for optimizer-driven layout diversity:
 
 import math
 import uuid
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from app.models.floorplan import (
     AccessType, ApartmentType, BathroomType, StaircaseType,
@@ -90,7 +93,25 @@ class GoldbeckGenerator(ConstructionSystem):
         request: FloorPlanRequest,
         variation_params: Optional[dict] = None,
     ) -> BuildingFloorPlans:
-        """Main entry point: generate complete floor plans for a building."""
+        """Generate complete floor plans for a building via the 7-phase pipeline.
+
+        Phases:
+            1. Snap dimensions to the Goldbeck 62.5 cm grid
+            2. Select access type (Ganghaus / Laubengang / Spaenner)
+            3. Build the structural grid (bay widths, zone depths)
+            4. Place staircases at grid-legal positions
+            5. Allocate apartment slots per zone
+            6. Generate rooms inside each apartment (service strip → living)
+            7. Generate architectural elements (walls, doors, windows)
+
+        Args:
+            request: Building dimensions, stories, unit mix, and overrides.
+            variation_params: Optimizer knobs — bay strategy, allocation order,
+                room proportions, staircase tweaks, etc.
+
+        Returns:
+            BuildingFloorPlans with one FloorPlan per storey, plus summary.
+        """
         vp = variation_params or {}
         bay_strategy = vp.get("bay_strategy", "greedy_large")
         raster_preferences = vp.get("raster_preferences", None)
@@ -380,9 +401,7 @@ class GoldbeckGenerator(ConstructionSystem):
             )
 
         except Exception as e:
-            print(f"[Staffelgeschoss] Generation failed: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"[Staffelgeschoss] Generation failed: {e}", exc_info=True)
             return None
 
     # ========================================================

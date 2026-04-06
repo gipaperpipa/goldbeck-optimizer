@@ -100,6 +100,10 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
   const handleRun = async () => {
     const request = buildRequest();
     if (!request) return;
+    // L15: Request notification permission for long-running jobs
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
     await startOptimization(request);
   };
 
@@ -191,6 +195,7 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
                 value={[unitMix[key] * 100]}
                 onValueChange={([v]) => setUnitMix({ ...unitMix, [key]: v / 100 })}
                 min={0} max={100} step={5}
+                aria-label={`${label} Anteil`}
               />
               <span className="w-12 text-right text-sm">{(unitMix[key] * 100).toFixed(0)}%</span>
             </div>
@@ -207,6 +212,7 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
                 value={[weights[key] * 100]}
                 onValueChange={([v]) => setWeights({ ...weights, [key]: v / 100 })}
                 min={0} max={100} step={5}
+                aria-label={`${label} Gewichtung`}
               />
               <span className="w-12 text-right text-sm">{(weights[key] * 100).toFixed(0)}%</span>
             </div>
@@ -216,7 +222,7 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
         {/* Max Buildings */}
         <div className="flex items-center gap-4">
           <Label className="w-24 text-xs">Max Buildings</Label>
-          <Slider value={[maxBuildings]} onValueChange={([v]) => setMaxBuildings(v)} min={1} max={10} step={1} />
+          <Slider value={[maxBuildings]} onValueChange={([v]) => setMaxBuildings(v)} min={1} max={10} step={1} aria-label="Max Buildings" />
           <span className="w-12 text-right text-sm">{maxBuildings}</span>
         </div>
 
@@ -229,8 +235,9 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
               <Input
                 type="number"
                 min={1}
+                max={500}
                 value={generations}
-                onChange={(e) => setGenerations(Math.max(1, parseInt(e.target.value) || 1))}
+                onChange={(e) => setGenerations(Math.min(500, Math.max(1, parseInt(e.target.value) || 1)))}
                 className="mt-1"
               />
             </div>
@@ -239,8 +246,9 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
               <Input
                 type="number"
                 min={2}
+                max={200}
                 value={populationSize}
-                onChange={(e) => setPopulationSize(Math.max(2, parseInt(e.target.value) || 2))}
+                onChange={(e) => setPopulationSize(Math.min(200, Math.max(2, parseInt(e.target.value) || 2)))}
                 className="mt-1"
               />
             </div>
@@ -307,8 +315,9 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
                   <Input
                     type="number"
                     min={1}
+                    max={500}
                     value={fpGenerations}
-                    onChange={(e) => setFpGenerations(Math.max(1, parseInt(e.target.value) || 1))}
+                    onChange={(e) => setFpGenerations(Math.min(500, Math.max(1, parseInt(e.target.value) || 1)))}
                     className="mt-1"
                   />
                 </div>
@@ -317,8 +326,9 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
                   <Input
                     type="number"
                     min={2}
+                    max={200}
                     value={fpPopulationSize}
-                    onChange={(e) => setFpPopulationSize(Math.max(2, parseInt(e.target.value) || 2))}
+                    onChange={(e) => setFpPopulationSize(Math.min(200, Math.max(2, parseInt(e.target.value) || 2)))}
                     className="mt-1"
                   />
                 </div>
@@ -333,6 +343,7 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
                       value={[fpWeights[key] * 100]}
                       onValueChange={([v]) => handleFpWeightChange(key, v)}
                       min={0} max={100} step={5}
+                      aria-label={`${label} Gewichtung`}
                     />
                     <span className="w-10 text-right text-xs">{(fpWeights[key] * 100).toFixed(0)}%</span>
                   </div>

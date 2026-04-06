@@ -41,32 +41,47 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 4. **If the next session sees status = `IN PROGRESS`:** The previous session was cut off. Read the request, check what was partially done (git diff, file state), and resume.
 
 ## Last Request
-**Status:** IN PROGRESS
-**Date:** 2026-03-29
-**Request:** Deploy the app so people and AI can test it. Adrian has a Vercel account. Need deployment strategy for both frontend (Next.js) and backend (FastAPI/Python).
-**Progress:** Assessing project structure and deployment requirements...
+**Status:** DONE
+**Date:** 2026-04-06
+**Request:** Production-readiness fixes for deployment (Step 4 of professional reliability plan)
+**Progress:** Fixed debug default (safe for prod), Railway start command (venv activation), Dockerfile (PORT env + data dir), DB path configurability (DATABASE_URL/DB_DIR env vars), updated DEPLOY.md with notes on ephemeral storage and new env vars.
 
 ## Current State
-**Last updated:** 2026-03-24
+**Last updated:** 2026-04-06
 
 ### Recently completed
-- Fixed `grid.axis_positions_y is not iterable` crash in FloorPlanViewer
-- Made GRZ/GFZ editable input fields (was hardcoded/guessed)
-- Fixed overlapping building layouts (now discarded by optimizer)
-- Added real-time generation visualization (live best layout during optimization)
-- Fixed 2D floor plan viewer: windows/doors now orient along host wall, fixed unit_number label
-- Fixed 3D viewer: wall rotation sign bug (angle not -angle in Three.js)
-- Implemented Staffelgeschoss in generator (full 7-phase pipeline with reduced dimensions)
-- Improved cadastral parcel coverage: 4-strategy cascade (Nominatim multi-zoom → WFS → Overpass API → synthetic rectangle)
-- Added cadastral service with all 16 German state WMS/WFS endpoints
-- Cadastral hook updated to cache-first with radius loading (linter/user modified)
-- Set up two-tier memory system with write-before-work session protocol
+- **Production-readiness fixes** (deployment prep):
+  - `config.py`: debug defaults to `false` (was hardcoded `true`)
+  - `railway.toml`: start command activates venv (was missing)
+  - `Dockerfile`: uses `$PORT` env var, creates `data/` dir
+  - `database/engine.py`: supports `DATABASE_URL` and `DB_DIR` env vars
+  - `DEPLOY.md`: added ephemeral storage notes, new env vars table
+- **Validation suite** (`services/floorplan/validation.py`): 11 building code checks
+  1. DIN 18011 room sizes (area + minimum short-side dimension)
+  2. Room aspect ratios (max 1:3 for habitable rooms)
+  3. Door widths (entrance ≥ 0.90m, interior ≥ 0.80m, BF ≥ 0.90m)
+  4. Fire egress (worst-point distance to staircase, not centroid)
+  5. DIN 5034 window-to-floor ratio (≥ 12.5% for habitable rooms)
+  6. Daylight access (habitable rooms must touch exterior wall)
+  7. Apartment entrance integrity (exactly 1 entrance door + hallway)
+  8. Structural grid compliance (bay widths in valid Goldbeck rasters)
+  9. Apartment area compliance (within Goldbeck spec ranges)
+  10. Bathroom stacking (vertical alignment across floors)
+  11. Service strip connectivity (hallway ↔ bathroom adjacency)
+- **Validation API**: `POST /api/v1/floorplan/validate` endpoint
+- **Auto-validation**: every optimizer variant now includes validation results
+- **Test harness**: `scripts/run_validation.py` with 7 building scenarios
+- **Optimizer convergence overhaul** (6 fixes — see session history)
+- **Diagnostic scripts**: `diagnose_optimizer.py` + `run_validation.py`
+- Full 100-issue audit completed (AUDIT.md)
 
 ### Known issues / next up
 - Git push failed from sandbox (403) — needs push from local machine
-- Fitness still flatlines in early generations (adaptive mutation may be insufficient)
+- Optimizer changes need real-world testing (run on actual parcel + compare before/after)
+- Validation needs to be run locally to find systematic generator issues
 - Rhino plugin code exists but is NOT YET COMPILED (needs VS2022 + .NET 4.8 + Rhino 8 SDK)
 - Financial model conversation started on Machine B but no details shared yet
+- Next priorities: deploy for testing, test against real parcels, fix any validation failures
 
 ## Preferences
 - Continue without asking questions when resuming from a session summary

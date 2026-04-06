@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.optimization import LayoutOption
 
@@ -57,12 +57,12 @@ class FinancialAnalysis(BaseModel):
 
 class FinancialAnalysisRequest(BaseModel):
     layout: LayoutOption
-    plot_area_sqm: float
-    land_cost: float = 2_000_000.0
+    plot_area_sqm: float = Field(gt=0, description="Plot area in m²")
+    land_cost: float = Field(default=2_000_000.0, ge=0, description="Land acquisition cost")
     construction_costs: dict[str, float] | None = None
     soft_cost_rates: dict[str, float] | None = None
     revenue_assumptions: dict[str, float] | None = None
-    analysis_period_years: int = 10
-    financing_ltc_pct: float = 65.0
-    interest_rate_pct: float = 6.5
-    exit_cap_rate_pct: float = 5.5
+    analysis_period_years: int = Field(default=10, ge=1, le=50, description="Projection horizon in years")
+    financing_ltc_pct: float = Field(default=65.0, ge=0, le=100, description="Loan-to-cost percentage")
+    interest_rate_pct: float = Field(default=6.5, ge=0, le=30, description="Annual interest rate percentage")
+    exit_cap_rate_pct: float = Field(default=5.5, gt=0, le=20, description="Exit cap rate percentage (must be >0)")

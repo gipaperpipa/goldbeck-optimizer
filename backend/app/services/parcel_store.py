@@ -81,15 +81,15 @@ def _parcel_to_dict(p: Parcel) -> dict:
     if p.geometry_geojson:
         try:
             polygon_wgs84 = _geojson_to_polygon_wgs84(p.geometry_geojson)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to parse GeoJSON for parcel {p.id}: {e}")
 
     props = {}
     if p.raw_properties:
         try:
             props = json.loads(p.raw_properties)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to parse raw_properties for parcel {p.id}: {e}")
 
     result = {
         "id": p.id,
@@ -166,8 +166,8 @@ async def store_parcel_from_wfs(session: AsyncSession, wfs_result: dict) -> Opti
                 poly = shape(json.loads(geojson_str))
                 # Very rough: degrees² → m² (only for small polygons in Germany)
                 area = poly.area * (111320 ** 2) * math.cos(math.radians(clat))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Area computation from geometry failed: {e}")
 
     props = wfs_result.get("properties", {})
 
@@ -323,7 +323,8 @@ async def get_or_fetch_parcel_at_point(lng: float, lat: float, state: Optional[s
                 geom = shape(json.loads(p.geometry_geojson))
                 if geom.contains(click_point):
                     return _parcel_to_dict(p)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Geometry check failed for parcel {p.id}: {e}")
                 continue
 
     # Not in DB — fetch from WFS

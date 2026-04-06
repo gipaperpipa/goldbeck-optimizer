@@ -11,6 +11,13 @@ import type {
   FloorPlanRoom,
 } from "@/types/api";
 
+/** Props for the 2D canvas floor plan renderer.
+ * @property floorPlan - Single-storey floor plan data (rooms, walls, doors, windows).
+ * @property width - Canvas width in px (default: container width).
+ * @property height - Canvas height in px (default: container height).
+ * @property selectedApartmentId - Highlights the apartment with this ID.
+ * @property onApartmentSelect - Fires when user clicks an apartment (null = deselect).
+ */
 interface FloorPlanViewerProps {
   floorPlan: FloorPlan;
   width?: number;
@@ -19,19 +26,23 @@ interface FloorPlanViewerProps {
   onApartmentSelect?: (apt: FloorPlanApartment | null) => void;
 }
 
-// Professional architectural color palette
+/**
+ * Professional architectural color palette for floor plan rooms.
+ * Colors follow DIN 1356 conventions: warm tones for living spaces,
+ * cool tones for wet rooms, neutral for circulation/service areas.
+ */
 const ROOM_COLORS: Record<string, string> = {
-  living: "#e8dcc8",      // Warm beige
-  bedroom: "#d4e4d0",     // Soft sage green
-  kitchen: "#dbe4c8",     // Light taupe
-  bathroom: "#d9e4f0",    // Soft blue-gray
-  hallway: "#f0ebe5",     // Light neutral
-  storage: "#d9d0c8",     // Warm gray
-  balcony: "#f5f5e8",     // Very light cream
-  corridor: "#e8e5e0",    // Light gray
-  staircase: "#d4d0c8",   // Medium taupe
-  elevator: "#d4d0c8",    // Medium taupe
-  shaft: "#c4c0b8",       // Neutral gray
+  living: "#e8dcc8",      // Warm beige — primary living space
+  bedroom: "#d4e4d0",     // Soft sage green — sleeping/private rooms
+  kitchen: "#dbe4c8",     // Light olive — food preparation
+  bathroom: "#d9e4f0",    // Soft blue-gray — wet rooms
+  hallway: "#f0ebe5",     // Light neutral — internal circulation
+  storage: "#d9d0c8",     // Warm gray — Abstellraum
+  balcony: "#f5f5e8",     // Very light cream — outdoor space
+  corridor: "#e8e5e0",    // Light gray — common circulation (Ganghaus/Laubengang)
+  staircase: "#d4d0c8",   // Medium taupe — vertical circulation
+  elevator: "#d4d0c8",    // Medium taupe — vertical circulation
+  shaft: "#c4c0b8",       // Neutral gray — TGA shafts
 };
 
 const ROOM_BORDER_COLORS: Record<string, string> = {
@@ -47,7 +58,11 @@ const ROOM_BORDER_COLORS: Record<string, string> = {
   shaft: "#6b6661",
 };
 
-// Snap radius for measurements (in plan coordinates)
+/**
+ * Snap radius for the measurement tool, in plan coordinates (meters).
+ * 0.3m (~30cm) is roughly one Goldbeck grid half-unit (GRID_UNIT = 0.625m / 2).
+ * This gives a comfortable snap zone without being too "grabby" at typical zoom.
+ */
 const SNAP_RADIUS = 0.3;
 
 export function FloorPlanViewer({
@@ -62,6 +77,7 @@ export function FloorPlanViewer({
   const [measureMode, setMeasureMode] = useState(false);
   const [measurePoints, setMeasurePoints] = useState<Point2D[]>([]);
   const [snapPoint, setSnapPoint] = useState<Point2D | null>(null);
+  const rafRef = useRef<number | null>(null);
 
   // Precompute transform
   const getTransform = useCallback(() => {
@@ -139,15 +155,20 @@ export function FloorPlanViewer({
     [floorPlan, onApartmentSelect, getTransform, measureMode, measurePoints, snapPoint]
   );
 
-  // Handle mouse move for hover and snap detection
+  // Handle mouse move for hover and snap detection (rAF-throttled)
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
+      if (rafRef.current !== null) return;
+      const clientX = e.clientX;
+      const clientY = e.clientY;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        const canvas = canvasRef.current;
+        if (!canvas) return;
 
-      const rect = canvas.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
-      const my = e.clientY - rect.top;
+        const rect = canvas.getBoundingClientRect();
+        const mx = clientX - rect.left;
+        const my = clientY - rect.top;
       const { invTx, invTy } = getTransform();
 
       const planX = invTx(mx);
@@ -233,22 +254,34 @@ export function FloorPlanViewer({
         if (hoveredAptId !== null) setHoveredAptId(null);
         canvas.style.cursor = "default";
       }
+      }); // end rAF callback
     },
     [floorPlan, hoveredAptId, getTransform, measureMode]
   );
 
-  // Handle Escape key to exit measure mode
+  // Keyboard shortcuts (L10)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && measureMode) {
-        setMeasureMode(false);
+      if (e.key === "Escape") {
+        if (measureMode) {
+          setMeasureMode(false);
+          setMeasurePoints([]);
+        } else if (onApartmentSelect) {
+          onApartmentSelect(null); // Deselect apartment
+        }
+      }
+      if (e.key === "m" || e.key === "M") {
+        setMeasureMode((prev) => !prev);
+        setMeasurePoints([]);
+      }
+      if (e.key === "c" || e.key === "C") {
         setMeasurePoints([]);
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [measureMode]);
+  }, [measureMode, onApartmentSelect]);
 
   // Main draw effect
   useEffect(() => {
@@ -347,7 +380,7 @@ export function FloorPlanViewer({
     ctx.font = "bold 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     ctx.textAlign = "left";
     ctx.fillText(
-      `Floor ${floorPlan.floor_index} \u2022 ${floorPlan.num_apartments} apartments \u2022 ${
+      `${floorPlan.floor_index === 0 ? "EG" : `${floorPlan.floor_index}. OG`} \u2022 ${floorPlan.num_apartments} Wohnungen \u2022 ${
         floorPlan.access_type === "ganghaus"
           ? "Central Corridor"
           : floorPlan.access_type === "laubengang"
@@ -382,6 +415,9 @@ export function FloorPlanViewer({
         ref={canvasRef}
         style={{ width, height }}
         className="border rounded-lg bg-white cursor-default"
+        tabIndex={0}
+        role="img"
+        aria-label={`Grundriss ${floorPlan.floor_index === 0 ? "EG" : `${floorPlan.floor_index}. OG`} — ${floorPlan.apartments.length} Wohnungen`}
         onClick={handleClick}
         onMouseMove={handleMouseMove}
       />
@@ -396,6 +432,26 @@ export function FloorPlanViewer({
           title="Measure tool (Esc to exit)"
         >
           {measureMode ? "Measuring..." : "Measure"}
+        </button>
+        <button
+          onClick={() => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const link = document.createElement("a");
+            link.download = `grundriss_${floorPlan.floor_index === 0 ? "EG" : `${floorPlan.floor_index}OG`}.png`;
+            link.href = canvas.toDataURL("image/png");
+            link.click();
+          }}
+          className="px-3 py-1.5 rounded text-sm font-medium bg-gray-200 text-gray-800 hover:bg-gray-300 transition-colors"
+          title="Grundriss als PNG exportieren"
+        >
+          PNG
+        </button>
+        <button
+          className="w-7 h-7 rounded-full bg-gray-200 text-gray-600 hover:bg-gray-300 text-xs font-bold transition-colors"
+          title="M = Messen, C = Löschen, Esc = Abwählen"
+        >
+          ?
         </button>
         {measurePoints.length > 0 && (
           <button

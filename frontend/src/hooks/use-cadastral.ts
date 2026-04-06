@@ -72,6 +72,11 @@ export function useCadastral() {
 
   // ── Cache-first radius loading ──────────────────────────
 
+  /**
+   * Load parcels within a radius of a map center point.
+   * @param radiusM Search radius in meters. Default 500m covers a typical
+   *   Bebauungsplan area (~25ha) while keeping WFS response times under 2s.
+   */
   const loadParcelsInRadius = useCallback(async (
     lng: number,
     lat: number,

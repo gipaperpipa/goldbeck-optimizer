@@ -4,11 +4,14 @@ Parcel API endpoints — cache-first parcel loading, metadata, contacts.
 Replaces the old cadastral parcel endpoints with DB-backed versions.
 """
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, field_validator
 from typing import Optional
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ── Request / Response Models ─────────────────────────────────────
@@ -104,8 +107,7 @@ async def parcel_at_point(
         result = await get_or_fetch_parcel_at_point(lng, lat, state)
         return result
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"Parcel lookup failed: {e}", exc_info=True)
+        logger.error(f"Parcel lookup failed: {e}", exc_info=True)
         raise HTTPException(500, f"Parcel lookup failed: {e}")
 
 

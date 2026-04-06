@@ -1,0 +1,161 @@
+GOLDBECK OPTIMIZER - CODE AUDIT QUICK REFERENCE
+================================================
+
+CRITICAL ISSUES (Fix before deployment)
+======================================
+
+1. RACE CONDITION: Job state (lines 21, 31-124 in floorplan.py)
+   - Background thread writes to _jobs[job_id] while HTTP thread reads
+   - FIX: Add threading.Lock() around all _jobs accesses
+
+2. EVENT LOOP BUG: Missing asyncio.set_event_loop() (lines 44-49 floorplan.py)
+   - WebSocket broadcasts fail silently to Grasshopper
+   - FIX: After asyncio.new_event_loop(), call set_event_loop(loop)
+
+3. DEPRECATED DATETIME: datetime.utcnow() (lines 64, 82 in ifc_exporter.py)
+   - Breaks on Python 3.12+
+   - FIX: Replace with datetime.now(timezone.utc)
+
+4. HARDCODED US COORDS: Denver default (lines 25, 37 in plot.py)
+   - German app defaults to USA location
+   - FIX: Fail explicitly or use German default
+
+5. MEMORY LEAK: Unbounded job cache (lines 21, 18 in floorplan.py, optimize.py)
+   - _jobs and jobs dicts grow forever → OOM crash
+   - FIX: Implement TTL cleanup, max 2000 jobs
+
+6. ARRAY BOUNDS: Unsafe variants[0] (lines 92-93 in floorplan.py)
+   - Crashes if optimizer returns empty list
+   - FIX: Check len(variants) > 0 before access
+
+HIGH-SEVERITY ISSUES (Fix this week)
+====================================
+
+7. BROAD EXCEPTION HANDLING: except Exception: pass (30+ occurrences)
+   - All errors silently swallowed
+   - FIX: Add logger.error(..., exc_info=True) to every catch
+
+8. WS BROADCAST FAILURES: Silent fire-and-forget (lines 52-59, 106-107 floorplan.py)
+   - Grasshopper plugin never gets progress
+   - FIX: Log all broadcast errors
+
+9. GLOBAL HTTP CLIENT: No thread safety (lines 82-93 cadastral.py)
+   - Multiple clients created simultaneously
+   - FIX: Use asyncio.Lock() or context manager
+
+10. JSON PARSE ERRORS: Silent failure (lines 78-92 parcel_store.py)
+    - Corrupted parcels show zero area
+    - FIX: Log parse errors, set defaults carefully
+
+11. NO RATE LIMITING: WFS endpoints exposed (cadastral.py, parcels.py)
+    - Can DDoS external services
+    - FIX: Add slowapi limiter, 10/min per IP
+
+12. NO TRANSACTION ISOLATION: SQLite default (database/engine.py)
+    - Concurrent writes cause data corruption
+    - FIX: Use session.begin() for explicit transactions
+
+MEDIUM-SEVERITY ISSUES (Fix this month)
+=======================================
+
+13. NO INPUT VALIDATION: Population, generations, dimensions
+    - User could request unreasonable values → crash
+    - FIX: Add Pydantic field validators with bounds
+
+14. NO LOGGING: Critical services (goldbeck_generator.py, optimizer.py, financial_calculator.py, shadow_calculator.py)
+    - Debugging impossible
+    - FIX: Add logging.getLogger() and logger.info() calls
+
+15. INACCURATE GEOMETRY CONSTANTS: (geometry_engine.py:16-17)
+    - ~1% error in all distance/area calculations
+    - FIX: Use 111,320m per degree + latitude-dependent lng
+
+16. GENETIC ALGORITHM: Not adaptive (optimizer.py)
+    - Fitness flatlines early (documented issue)
+    - FIX: Implement progress-dependent mutation rates
+
+17. WS STATE NOT PERSISTED: (ws_sync.py:43-47)
+    - Grasshopper client reconnect loses progress
+    - FIX: Keep circular buffer of 100 progress messages
+
+18. IFC MISSING DOOR OPENINGS: (ifc_exporter.py)
+    - Exported model looks like solid boxes
+    - FIX: Implement void cutting with IfcOpeningElement
+
+FILES WITH MOST ISSUES
+=======================
+
+1. backend/app/api/v1/floorplan.py — 6 issues (races, bounds, events)
+2. backend/app/api/v1/optimize.py — 3 issues (races, exceptions)
+3. backend/app/services/cadastral.py — 4 issues (HTTP client, timeout, logging)
+4. backend/app/services/parcel_store.py — 5 issues (JSON errors, validation)
+5. backend/app/api/v1/plot.py — 1 critical (hardcoded coords)
+6. backend/app/services/ifc_exporter.py — 2 issues (datetime, doors)
+7. backend/app/database/engine.py — 2 issues (transactions, timeout)
+
+DEPLOYMENT CHECKLIST
+====================
+
+Before going to production, MUST fix:
+  ☐ Job state race condition (add Lock)
+  ☐ Event loop asyncio.set_event_loop()
+  ☐ datetime.utcnow() → timezone.utc
+  ☐ Hardcoded Denver coords
+  ☐ Job cache TTL cleanup
+  ☐ Array bounds checks
+  ☐ Exception logging (at least critical paths)
+  ☐ Input validation (population, generations)
+  ☐ Database transaction isolation
+  ☐ Rate limiting on WFS endpoints
+
+LOAD TEST SCENARIOS
+===================
+
+Test these before deployment:
+  - 50 concurrent floor plan generations
+  - 100 concurrent parcel lookups
+  - Grasshopper client reconnect during optimization
+  - Very large building (100m x 100m)
+  - Very small building (6m x 6m)
+  - Invalid parcel geometries (self-intersecting, non-convex)
+  - Long-running optimization (1000 generations, 200 pop size)
+  - Out-of-Germany coordinates
+  - WFS service timeout / network failure
+
+STATIC ANALYSIS TO RUN
+======================
+
+  pylint backend/app --disable=C0103,R0913
+  mypy backend/app --strict
+  bandit -r backend/app -s B101,B601  # Skip asserts, string format
+  isort backend/app --check
+  black backend/app --check
+
+PRIORITY ORDER FOR FIXES
+=========================
+
+1. Race condition + locking (1-2 hours)
+2. Event loop fix (15 mins)
+3. datetime.utcnow() (15 mins)
+4. Hardcoded coords (15 mins)
+5. Job cleanup TTL (1 hour)
+6. Array bounds (30 mins)
+7. Exception logging (4 hours, spread across files)
+8. Input validation (2 hours)
+9. WS state persistence (1 hour)
+10. Rate limiting (1 hour)
+
+Total: ~12 hours to fix all critical + high priority items
+
+ARCHITECTURE IMPROVEMENTS (Post-deployment)
+===========================================
+
+  - Migrate job store to Redis for multi-process scaling
+  - Add Prometheus metrics for observability
+  - Implement structured logging (Python logging + ELK stack)
+  - Add background job worker (Celery/RQ) for optimization
+  - Move constants to environment variables
+  - Add database connection pooling
+  - Implement request signing for rate limiting
+  - Add PGVector for similar parcel search
+  - Cache WFS responses in Redis (5min TTL)

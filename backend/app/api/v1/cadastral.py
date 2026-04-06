@@ -9,6 +9,8 @@ Provides:
 - Multi-parcel merge (combine selected parcels into one plot)
 """
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, field_validator
 
@@ -27,6 +29,7 @@ from app.services.geometry_engine import GeometryEngine
 from app.models.plot import PlotAnalysis, CoordinatePoint
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 geometry = GeometryEngine()
 
 
@@ -163,7 +166,20 @@ async def parcel_at_point(
         # Multi-source concurrent lookup (always returns a result)
         result = await get_parcel_geometry_at_point(lng, lat, state)
         if result:
-            return ParcelInfo(**result)
+            info = ParcelInfo(**result)
+            # Surface a warning when all real sources failed
+            if result.get("parcel_id") == "synthetic":
+                source_note = result.get("properties", {}).get("source", "")
+                if source_note == "synthetic_rectangle":
+                    info.properties = {
+                        **(info.properties or {}),
+                        "warning": (
+                            f"Keine Katasterdaten für {state} verfügbar. "
+                            "Platzhalter-Flurstück erstellt — bitte manuell anpassen."
+                        ),
+                    }
+                    logger.info(f"Returning synthetic parcel for ({lng:.5f}, {lat:.5f}) in {state}")
+            return info
 
         # Should not reach here (synthetic fallback always succeeds), but just in case
         return ParcelInfo(
@@ -171,8 +187,7 @@ async def parcel_at_point(
             properties={"note": "No parcel data available for this location."},
         )
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"Parcel lookup failed: {e}", exc_info=True)
+        logger.error(f"Parcel lookup failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Parcel lookup failed: {str(e)}. Please try again or click a different location."

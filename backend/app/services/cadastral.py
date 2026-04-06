@@ -29,6 +29,7 @@ from pyproj import Transformer
 from shapely.geometry import Polygon
 
 from app.models.plot import CoordinatePoint
+from app.utils.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +311,7 @@ async def geocode_german_address(query: str, limit: int = 5) -> list[dict]:
     }
 
     client = _get_http_client()
+    await rate_limiter.acquire("nominatim")
     response = await client.get(url, params=params)
     response.raise_for_status()
     results = response.json()
@@ -344,6 +346,7 @@ async def proxy_wms_request(
 
     wms_url = service["wms"]
     client = _get_http_client()
+    await rate_limiter.acquire("wfs")
     response = await client.get(wms_url, params=params)
     response.raise_for_status()
     return response.content, response.headers.get("content-type", "image/png")
@@ -395,6 +398,7 @@ async def _nominatim_reverse_with_polygon(
 
     try:
         client = _get_http_client()
+        await rate_limiter.acquire("nominatim")
         response = await client.get(url, params=params)
         response.raise_for_status()
         data = response.json()
@@ -441,7 +445,8 @@ async def _nominatim_reverse_with_polygon(
                 **{k: v for k, v in address.items()},
             },
         }
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Nominatim reverse geocode failed: {e}")
         return None
 
 
@@ -480,6 +485,7 @@ async def _get_parcel_via_wfs(
         }
 
         try:
+            await rate_limiter.acquire("wfs")
             response = await client.get(service["wfs"], params=params)
             if response.status_code != 200:
                 continue
@@ -563,6 +569,7 @@ async def get_parcel_info_at_point(
 
         try:
             client = _get_http_client()
+            await rate_limiter.acquire("wfs")
             response = await client.get(service["wms"], params=params)
             if response.status_code != 200:
                 continue
@@ -585,7 +592,8 @@ async def get_parcel_info_at_point(
                 result = _parse_xml_feature_info(response.text, state)
                 if result:
                     return result
-        except Exception:
+        except Exception as e:
+            logger.debug(f"WMS GetFeatureInfo attempt failed: {e}")
             continue
 
     return None
@@ -619,6 +627,7 @@ async def _get_parcel_via_bkg(lng: float, lat: float, state: str) -> Optional[di
         }
 
         try:
+            await rate_limiter.acquire("bkg")
             response = await client.get(BKG_SERVICES["wfs"], params=params)
             if response.status_code != 200:
                 continue
@@ -767,6 +776,7 @@ async def get_parcels_in_bbox(
 
         try:
             client = _get_http_client()
+            await rate_limiter.acquire("wfs")
             response = await client.get(service["wfs"], params=params)
             if response.status_code != 200:
                 continue
@@ -814,6 +824,7 @@ async def _get_parcels_in_bbox_bkg(
             "OUTPUTFORMAT": output_format,
         }
         try:
+            await rate_limiter.acquire("bkg")
             response = await client.get(BKG_SERVICES["wfs"], params=params, timeout=15.0)
             if response.status_code != 200:
                 continue
@@ -860,6 +871,7 @@ out skel qt;
 
     try:
         client = _get_http_client()
+        await rate_limiter.acquire("overpass")
         response = await client.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": query},
@@ -924,7 +936,8 @@ out skel qt;
                 **best_tags,
             },
         }
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Overpass API parcel lookup failed: {e}")
         return None
 
 
@@ -1135,8 +1148,8 @@ def _parse_xml_feature_info(xml_text: str, state: str) -> Optional[dict]:
                     "properties": props,
                     "source": "wms_getfeatureinfo_xml",
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"XML FeatureInfo parsing failed: {e}")
     return None
 
 
@@ -1184,8 +1197,8 @@ def _process_gml_parcels(xml_text: str, epsg: str, state: str) -> list[dict]:
                             "polygon_wgs84": coords,
                             "properties": props,
                         })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"GML parcel processing failed: {e}")
 
     return results
 

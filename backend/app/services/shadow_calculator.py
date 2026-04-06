@@ -1,8 +1,11 @@
 import math
+import logging
 from datetime import datetime, timezone
 
 from pysolar.solar import get_altitude, get_azimuth
 from shapely.geometry import Polygon
+
+logger = logging.getLogger(__name__)
 
 from app.models.shadow import ShadowRequest, ShadowResult, ShadowSnapshot
 
@@ -113,7 +116,7 @@ class ShadowCalculator:
             hull = MultiPoint(all_points).convex_hull
             if hull.geom_type == "Polygon":
                 return list(hull.exterior.coords[:-1])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Convex hull computation failed, using raw shadow corners: {e}")
 
         return shadow_corners

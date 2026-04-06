@@ -15,14 +15,14 @@ import {
 export function FinancialDashboard() {
   const { selectedLayout, plotAnalysis, financialAnalysis } = useProjectStore();
   const { analyze, isLoading } = useFinancialAnalysis();
-  const [landCost, setLandCost] = useState("2000000");
+  const [landCost, setLandCost] = useState(2000000);
 
   const handleAnalyze = async () => {
     if (!selectedLayout || !plotAnalysis) return;
     await analyze({
       layout: selectedLayout,
       plot_area_sqm: plotAnalysis.area_sqm,
-      land_cost: Number(landCost),
+      land_cost: landCost,
     });
   };
 
@@ -45,7 +45,7 @@ export function FinancialDashboard() {
               <Input
                 type="number"
                 value={landCost}
-                onChange={(e) => setLandCost(e.target.value)}
+                onChange={(e) => setLandCost(Number(e.target.value) || 0)}
                 placeholder="2,000,000"
               />
             </div>

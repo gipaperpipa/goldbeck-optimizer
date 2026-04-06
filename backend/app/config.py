@@ -1,11 +1,35 @@
+import logging
 import os
+import sys
 
 from pydantic_settings import BaseSettings
 
 
+def configure_logging(debug: bool = True) -> None:
+    """Set up structured logging for the application.
+
+    In production (debug=False), logs are JSON-formatted for easy ingestion
+    by log aggregators (Datadog, CloudWatch, etc.).
+    In development (debug=True), logs use a human-readable format.
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    fmt = (
+        "%(asctime)s %(levelname)s %(name)s %(message)s"
+        if debug
+        else '{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}'
+    )
+    logging.basicConfig(
+        level=level,
+        format=fmt,
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+
+
 class Settings(BaseSettings):
     app_name: str = "Land Layout Optimizer API"
-    debug: bool = True
+    debug: bool = os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes")
     cors_origins: list[str] = [
         "http://localhost:3000",
         "http://localhost:3001",

@@ -48,6 +48,9 @@
 | `ANTHROPIC_API_KEY` | Yes | For AI-assisted generation |
 | `FRONTEND_URL` | Yes | Vercel URL for CORS |
 | `MAPBOX_TOKEN` | No | For geocoding features |
+| `DEBUG` | No | `true` for dev, defaults to `false` (production-safe) |
+| `DATABASE_URL` | No | Override default SQLite path |
+| `DB_DIR` | No | Directory for SQLite file (default: `./data/`) |
 | `PORT` | Auto | Set by Railway automatically |
 
 ### Frontend (Vercel)
@@ -55,6 +58,13 @@
 |----------|----------|-------------|
 | `NEXT_PUBLIC_API_URL` | Yes | Railway backend URL + `/api` |
 | `NEXT_PUBLIC_MAPBOX_TOKEN` | Yes | Mapbox GL access token |
+
+## Important Notes
+
+- **SQLite on Railway**: Railway's filesystem is ephemeral — data in `./data/goldbeck.db` will be lost on redeploy. For persistent storage, attach a Railway volume to `/data` and set `DB_DIR=/data`. For now this is fine since the DB only caches parcel data.
+- **Debug mode**: Defaults to `false` (production). Set `DEBUG=true` in Railway only for troubleshooting. This controls log format (JSON vs human-readable) and log level (INFO vs DEBUG).
+- **Rate limiting**: 120 requests/minute per IP. Health check and docs endpoints are exempt.
+- **Request size limit**: 10 MB max body size.
 
 ## Custom Domain (Optional)
 

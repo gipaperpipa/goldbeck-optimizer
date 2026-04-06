@@ -7,8 +7,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useCadastral } from "@/hooks/use-cadastral";
 import type { AddressSearchResult, ParcelInfo } from "@/types/api";
+import { API_BASE } from "@/lib/api-client";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+/**
+ * Minimum zoom level for cadastral interactions (parcel click, radius load).
+ * At zoom < 15, parcels are too small to identify and WFS bounding boxes
+ * would return too many results.
+ */
+const MIN_CADASTRAL_ZOOM = 15;
 
 // Status → color mapping for parcels
 const STATUS_COLORS: Record<string, string> = {
@@ -18,6 +24,10 @@ const STATUS_COLORS: Record<string, string> = {
   rejected: "#ef4444",        // red
 };
 
+/** Props for the Mapbox GL cadastral map with parcel selection.
+ * @property onPlotConfirmed - Called after the user confirms parcel selection
+ *   and the merge API returns a PlotAnalysis.
+ */
 interface CadastralMapProps {
   onPlotConfirmed: () => void;
 }
@@ -25,6 +35,7 @@ interface CadastralMapProps {
 export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
   const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
+  const mountedRef = useRef(true);
   const [isMapReady, setIsMapReady] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
@@ -33,6 +44,7 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
   const [radiusM, setRadiusM] = useState(300);
   const lastLoadCenter = useRef<string>("");
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clickDebounceRef = useRef(false);
 
   const {
     searchResults,
@@ -103,7 +115,7 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
 
   const triggerNearbyLoad = useCallback(() => {
     const map = mapRef.current;
-    if (!map || map.getZoom() < 15) return;
+    if (!map || map.getZoom() < MIN_CADASTRAL_ZOOM) return;
 
     const center = map.getCenter();
     const key = `${center.lng.toFixed(4)},${center.lat.toFixed(4)},${radiusM}`;
@@ -226,9 +238,12 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
       });
     });
 
-    // Click handler — select/deselect parcels
+    // Click handler — select/deselect parcels (debounced to prevent rapid duplicates)
     map.on("click", async (e) => {
-      if (map.getZoom() < 15) return;
+      if (map.getZoom() < MIN_CADASTRAL_ZOOM) return;
+      if (clickDebounceRef.current) return;
+      clickDebounceRef.current = true;
+      setTimeout(() => { clickDebounceRef.current = false; }, 300);
       selectParcelAtPoint(e.lngLat.lng, e.lngLat.lat);
     });
 
@@ -236,14 +251,14 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     map.on("zoom", () => {
       const z = map.getZoom();
       setZoomLevel(z);
-      map.getCanvas().style.cursor = z >= 15 ? "crosshair" : "";
+      map.getCanvas().style.cursor = z >= MIN_CADASTRAL_ZOOM ? "crosshair" : "";
     });
 
     // Load parcels on map move (debounced)
     map.on("moveend", () => {
       if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
       loadTimeoutRef.current = setTimeout(() => {
-        if (map.getZoom() >= 15) {
+        if (map.getZoom() >= MIN_CADASTRAL_ZOOM) {
           const center = map.getCenter();
           const key = `${center.lng.toFixed(4)},${center.lat.toFixed(4)}`;
           if (key !== lastLoadCenter.current) {
@@ -257,6 +272,7 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     mapRef.current = map;
 
     return () => {
+      mountedRef.current = false;
       if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
       map.remove();
       mapRef.current = null;
@@ -330,9 +346,11 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
       setCurrentState(result.state);
     }
 
-    // Trigger parcel loading at destination
+    // Trigger parcel loading at destination (guard against unmount)
     setTimeout(() => {
-      loadParcelsInRadius(result.lng, result.lat, radiusM);
+      if (mountedRef.current) {
+        loadParcelsInRadius(result.lng, result.lat, radiusM);
+      }
     }, 2200);
   };
 

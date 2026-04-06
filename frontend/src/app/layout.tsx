@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
+import { ErrorBoundary } from "@/components/ui/error-boundary";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Land Layout Optimizer",
-  description: "Analyze plots and optimize residential building layouts",
+  title: "Goldbeck Optimizer",
+  description: "Grundriss-Optimierung für das Goldbeck-Fertigteilsystem",
 };
 
 export default function RootLayout({
@@ -12,9 +13,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="de">
       <body className="antialiased bg-neutral-50 min-h-screen">
-        {children}
+        <ErrorBoundary>{children}</ErrorBoundary>
       </body>
     </html>
   );

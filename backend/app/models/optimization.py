@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.building import BuildingFootprint
 from app.models.floorplan import BuildingFloorPlans, FloorPlanVariant, FloorPlanWeights
@@ -24,8 +24,8 @@ class OptimizationWeights(BaseModel):
 
 class FloorPlanSettings(BaseModel):
     """Settings for floor plan generation when running combined mode."""
-    generations: int = 20
-    population_size: int = 20
+    generations: int = Field(default=20, ge=1, le=500, description="Floor-plan GA generations")
+    population_size: int = Field(default=20, ge=1, le=200, description="Floor-plan individuals per generation")
     story_height_m: float = 2.90
     weights: FloorPlanWeights = FloorPlanWeights()
 
@@ -41,8 +41,8 @@ class OptimizationRequest(BaseModel):
     allow_podium_parking: bool = True
     allow_surface_parking: bool = True
     allow_structured_parking: bool = False
-    population_size: int
-    generations: int
+    population_size: int = Field(ge=2, le=200, description="Individuals per generation")
+    generations: int = Field(ge=1, le=500, description="Number of GA generations")
     # Combined mode: generate floor plans for top layouts
     include_floor_plans: bool = False
     floor_plan_settings: FloorPlanSettings = FloorPlanSettings()

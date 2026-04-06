@@ -14,7 +14,10 @@ premature convergence to a single layout type.
 
 import math
 import random
+import logging
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from app.models.floorplan import (
     FloorPlanRequest, BuildingFloorPlans, FloorPlanVariant,
@@ -321,8 +324,8 @@ def _evaluate_floor_plan(
         mean_bay = sum(bays) / len(bays)
         std_dev = (sum((b - mean_bay) ** 2 for b in bays) / len(bays)) ** 0.5
         cv = std_dev / mean_bay if mean_bay > 0 else 0
-        # All valid Goldbeck rasters score well; only penalize extreme variation
-        breakdown["construction_regularity"] = max(3.0, min(10.0, 7.5 - cv * 5.0))
+        # All valid Goldbeck rasters score well; moderate penalty for extreme variation
+        breakdown["construction_regularity"] = max(0.0, min(10.0, 8.0 - cv * 8.0))
     else:
         breakdown["construction_regularity"] = 7.0
 
@@ -554,8 +557,15 @@ def _evaluate_floor_plan(
     width_deviation = abs(actual_width - requested_width) / max(requested_width, 1.0)
     depth_deviation = abs(actual_depth - requested_depth) / max(requested_depth, 1.0)
     avg_deviation = (width_deviation + depth_deviation) / 2
-    # Score: 10.0 if exact match, drops with deviation
-    breakdown["dimension_conformance"] = max(0.0, 10.0 - avg_deviation * 40.0)
+    # Score: 10.0 if exact match, gentle decay for small deviations (≤5%),
+    # steeper penalty above 10%. This allows the optimizer to explore ±1-2
+    # grid units without being crushed, while still penalizing large changes.
+    if avg_deviation <= 0.05:
+        breakdown["dimension_conformance"] = 10.0 - avg_deviation * 20.0  # 10→9 for 5%
+    elif avg_deviation <= 0.15:
+        breakdown["dimension_conformance"] = 9.0 - (avg_deviation - 0.05) * 50.0  # 9→4 for 15%
+    else:
+        breakdown["dimension_conformance"] = max(0.0, 4.0 - (avg_deviation - 0.15) * 20.0)
 
     # --- 12. Apartment access compliance ---
     # Validates architectural rules:
@@ -602,20 +612,23 @@ def _evaluate_floor_plan(
         breakdown["circulation_efficiency"] * 1.5  # heavy weight: minimize hallways
     ) / 3.0
 
-    # Enhanced livability: add connectivity, furniture, daylight quality,
-    # kitchen-living, and orientation to the livability group.
-    # The new criteria are weighted more heavily since they represent
-    # the architectural improvements that matter most.
-    livability_score = (
-        breakdown["room_aspect_ratios"] * 0.8 +
-        breakdown["natural_light"] * 0.5 +
-        breakdown["noise_separation"] * 0.7 +
-        breakdown["connectivity"] * 1.2 +
-        breakdown["furniture"] * 1.0 +
-        breakdown["daylight_quality"] * 1.0 +
-        breakdown["kitchen_living"] * 1.0 +
-        breakdown["orientation"] * 0.8
-    ) / 7.0  # Normalize to 0-10 range
+    # Enhanced livability: 8 criteria with relative weights.
+    # Normalized by sum of weights so each point of improvement
+    # in any criterion contributes proportionally to the group score.
+    _liv_w = {
+        "room_aspect_ratios": 0.8,
+        "natural_light": 0.5,
+        "noise_separation": 0.7,
+        "connectivity": 1.2,
+        "furniture": 1.0,
+        "daylight_quality": 1.0,
+        "kitchen_living": 1.0,
+        "orientation": 0.8,
+    }
+    _liv_sum = sum(_liv_w.values())  # 7.0
+    livability_score = sum(
+        breakdown[k] * w for k, w in _liv_w.items()
+    ) / _liv_sum
 
     revenue_score = (
         breakdown["unit_mix_match"] + breakdown["room_size_compliance"] +
@@ -656,12 +669,13 @@ def generate_variant(
     else:
         modified.story_height_m = C.STORY_HEIGHT_STANDARD_A
 
-    # Vary internal dimensions within grid tolerance for apartment layout diversity,
-    # but NEVER exceed the original building footprint from layout optimization.
-    # Offsets can only shrink the building inward (negative only), not grow it.
-    dim_offset_m = min(0.0, chromosome.dim_offset * C.GRID_UNIT)
+    # Vary internal dimensions within ±2 grid units for apartment layout diversity.
+    # Allows the optimizer to explore slightly larger AND smaller footprints —
+    # the dimension_conformance criterion still penalizes large deviations,
+    # but small adjustments (±1.25m) can significantly improve bay layouts.
+    dim_offset_m = chromosome.dim_offset * C.GRID_UNIT
     modified.building_width_m = max(9.0, request.building_width_m + dim_offset_m)
-    depth_offset_m = min(0.0, chromosome.depth_offset * C.GRID_UNIT)
+    depth_offset_m = chromosome.depth_offset * C.GRID_UNIT
     modified.building_depth_m = max(8.0, request.building_depth_m + depth_offset_m)
 
     # Vary access type for borderline depths
@@ -688,7 +702,8 @@ def generate_variant(
     try:
         result = system.generate_floor_plans(modified, variation_params=variation_params)
         return result
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Floor plan generation failed for chromosome: {e}")
         return None
 
 
@@ -696,10 +711,15 @@ def generate_variant(
 # Optimizer with Diversity Preservation
 # ============================================================
 
-def _apply_fitness_sharing(population: list[FloorPlanChromosome], sigma: float = 0.3):
+def _apply_fitness_sharing(population: list[FloorPlanChromosome], sigma: float = 0.15):
     """
     Fitness sharing: reduce fitness of individuals with the same plan signature.
     Prevents any one layout type from dominating the population.
+
+    Uses a mild sigma (0.15 instead of 0.3) so that good solutions aren't
+    over-penalized in small populations.  Two identical individuals get
+    penalized by ~10% instead of ~23%, preserving selection pressure on
+    high-fitness niches while still encouraging diversity.
     """
     groups: dict[Optional[tuple], list[FloorPlanChromosome]] = {}
     for c in population:
@@ -707,7 +727,9 @@ def _apply_fitness_sharing(population: list[FloorPlanChromosome], sigma: float =
 
     for group in groups.values():
         niche_size = len(group)
-        if niche_size > 1:
+        if niche_size > 2:
+            # Only penalize when 3+ individuals share a signature —
+            # pairs are fine (elitism needs at least 2)
             for c in group:
                 c.fitness = c.fitness / (niche_size ** sigma)
 
@@ -720,6 +742,23 @@ class FloorPlanOptimizer:
         request: FloorPlanRequest,
         progress_callback: Optional[Callable[[int, int, float, float], None]] = None,
     ) -> list[FloorPlanVariant]:
+        """Run the genetic algorithm to find optimal floor plan layouts.
+
+        The GA evolves a population of FloorPlanChromosomes through selection,
+        crossover, and mutation.  Each chromosome encodes bay preferences,
+        access-type bias, room proportions, and staircase placement — the
+        generator turns these into concrete floor plans which are then scored
+        by a 17-criterion fitness function.
+
+        Args:
+            request: Building dimensions, unit mix targets, and GA parameters
+                (population_size, generations, weights).
+            progress_callback: Called each generation with
+                (gen, total_gens, best_fitness, avg_fitness).
+
+        Returns:
+            Top-K unique FloorPlanVariants sorted by descending fitness.
+        """
         pop_size = max(6, request.population_size)
         generations = max(1, request.generations)
         mutation_rate = 0.25  # Default mutation rate
@@ -809,8 +848,31 @@ class FloorPlanOptimizer:
             progress_callback(0, generations, best_raw_fitness, avg_fit, preview)
 
         # ---- Evolution loop ----
+        stagnation_counter = 0
+        last_best = best_raw_fitness
+
         for gen in range(1, generations + 1):
             population.sort(key=lambda c: c.fitness, reverse=True)
+
+            # --- Stagnation detection and partial restart ---
+            # If best fitness hasn't improved in N generations, inject a large
+            # batch of random chromosomes to escape the local optimum.
+            if best_raw_fitness <= last_best + 0.05:
+                stagnation_counter += 1
+            else:
+                stagnation_counter = 0
+                last_best = best_raw_fitness
+
+            stagnation_threshold = max(5, generations // 6)
+            is_stagnant = stagnation_counter >= stagnation_threshold
+
+            if is_stagnant:
+                logger.info(
+                    "Stagnation detected at gen %d (no improvement in %d gens, "
+                    "best=%.2f). Injecting diverse population.",
+                    gen, stagnation_counter, best_raw_fitness,
+                )
+                stagnation_counter = 0
 
             # Elitism: keep top individuals, preferring diverse signatures
             new_pop: list[FloorPlanChromosome] = []
@@ -822,29 +884,36 @@ class FloorPlanOptimizer:
                     new_pop.append(c.clone())
                     seen_sigs.add(c._plan_sig)
 
-            # Random immigrants for diversity — adaptive: more early, fewer later
-            # Early: ~10% of population; Late: ~3% (was fixed 15%)
+            # Random immigrants for diversity — adaptive, with stagnation burst
             progress = gen / generations
-            immigrant_frac = 0.10 * (1.0 - progress) + 0.03 * progress
+            if is_stagnant:
+                # On stagnation: replace 40% of population with fresh blood
+                immigrant_frac = 0.40
+            else:
+                # Normal: early ~10%, late ~3%
+                immigrant_frac = 0.10 * (1.0 - progress) + 0.03 * progress
             num_immigrants = max(1, int(pop_size * immigrant_frac))
             for _ in range(num_immigrants):
                 new_pop.append(FloorPlanChromosome())
 
             # Fill rest via crossover + mutation (with generation-aware adaptive rate)
+            # Boost mutation rate when stagnant to explore more aggressively
+            effective_mutation_rate = min(0.60, mutation_rate * 1.8) if is_stagnant else mutation_rate
             while len(new_pop) < pop_size:
                 parent_a = _tournament_select(population)
                 parent_b = _tournament_select(population)
                 child = _crossover(parent_a, parent_b)
-                child = _mutate(child, rate=mutation_rate,
+                child = _mutate(child, rate=effective_mutation_rate,
                                 generation=gen, total_generations=generations)
                 new_pop.append(child)
 
             # Evaluate new individuals
-            best_raw_fitness = 0.0
+            # Track best-in-generation separately; best_ever is preserved across gens
+            best_gen_fitness = 0.0
             for chrom in new_pop:
                 if chrom._plan_sig is not None and chrom.raw_fitness > 0:
                     # Already evaluated elite — keep raw fitness
-                    best_raw_fitness = max(best_raw_fitness, chrom.raw_fitness)
+                    best_gen_fitness = max(best_gen_fitness, chrom.raw_fitness)
                     chrom.fitness = chrom.raw_fitness
                     continue
                 plans = generate_variant(request, chrom)
@@ -854,19 +923,33 @@ class FloorPlanOptimizer:
                     chrom.fitness = raw_fitness
                     chrom.fitness_breakdown = breakdown
                     chrom._plan_sig = _plan_signature(plans)
-                    if raw_fitness > best_raw_fitness:
-                        best_raw_fitness = raw_fitness
+                    if raw_fitness > best_gen_fitness:
+                        best_gen_fitness = raw_fitness
                 else:
                     chrom.fitness = 0.0
                     chrom.raw_fitness = 0.0
 
-            # Track overall best chromosome
+            # Track overall best chromosome (never goes down)
             for chrom in new_pop:
                 if chrom.raw_fitness > (best_ever_chrom.raw_fitness if best_ever_chrom else 0):
                     best_ever_chrom = chrom.clone()
+                    best_raw_fitness = best_ever_chrom.raw_fitness
 
             _apply_fitness_sharing(new_pop)
             population = new_pop
+
+            # Convergence logging (every 10 gens or first 3)
+            if gen <= 3 or gen % 10 == 0 or gen == generations:
+                nonzero_raw = [c.raw_fitness for c in population if c.raw_fitness > 0]
+                unique_sigs = len({c._plan_sig for c in population if c._plan_sig})
+                fail_count = sum(1 for c in population if c.raw_fitness <= 0)
+                logger.info(
+                    "Gen %d/%d: best_ever=%.2f, best_gen=%.2f, avg=%.2f, "
+                    "unique_plans=%d, failures=%d, stagnation=%d",
+                    gen, generations, best_raw_fitness, best_gen_fitness,
+                    (sum(nonzero_raw) / len(nonzero_raw)) if nonzero_raw else 0,
+                    unique_sigs, fail_count, stagnation_counter,
+                )
 
             if progress_callback:
                 nonzero = [c.raw_fitness for c in population if c.raw_fitness > 0]
@@ -928,7 +1011,7 @@ class FloorPlanOptimizer:
                     fitness_breakdown={k: round(v, 2) for k, v in breakdown.items()},
                     building_floor_plans=plans,
                 ))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Deterministic fallback variant generation failed: {e}")
 
         return variants

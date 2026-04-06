@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, HTTPException
 
 from app.models.plot import PlotInput, PlotAnalysis
@@ -5,7 +7,11 @@ from app.services.geometry_engine import GeometryEngine
 from app.services.geocoding import geocode_address
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 geometry = GeometryEngine()
+
+# Default fallback: Frankfurt am Main (central Germany)
+_DEFAULT_CENTROID = {"lng": 8.6821, "lat": 50.1109}
 
 
 @router.post("/analyze", response_model=PlotAnalysis)
@@ -21,8 +27,11 @@ async def analyze_plot(plot_input: PlotInput):
             if plot_input.address:
                 geo_result = await geocode_address(plot_input.address)
 
+            if not geo_result and plot_input.address:
+                logger.warning(f"Geocoding failed for '{plot_input.address}', using Frankfurt default")
+
             if plot_input.width_m and plot_input.depth_m:
-                centroid = geo_result if geo_result else {"lng": -104.9903, "lat": 39.7392}
+                centroid = geo_result if geo_result else _DEFAULT_CENTROID
                 analysis = geometry.analyze_rectangular_plot(
                     width_m=plot_input.width_m,
                     depth_m=plot_input.depth_m,
@@ -34,7 +43,7 @@ async def analyze_plot(plot_input: PlotInput):
                 return analysis
 
             elif plot_input.vertices_m:
-                centroid = geo_result if geo_result else {"lng": -104.9903, "lat": 39.7392}
+                centroid = geo_result if geo_result else _DEFAULT_CENTROID
                 analysis = geometry.analyze_from_local_vertices(
                     vertices=plot_input.vertices_m,
                     centroid_lng=centroid["lng"],

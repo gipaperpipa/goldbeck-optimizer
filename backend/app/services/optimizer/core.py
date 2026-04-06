@@ -1,6 +1,9 @@
 import uuid
 import random
+import logging
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 from shapely.geometry import Polygon
 
@@ -40,13 +43,16 @@ class LayoutOptimizer:
         plot_polygon = Polygon(boundary)
         plot_area = request.plot.area_sqm
 
-        print(f"[LayoutOpt] plot_area={plot_area:.1f} sqm, boundary={boundary[:4]}...", flush=True)
-        print(f"[LayoutOpt] plot_polygon valid={plot_polygon.is_valid}, area={plot_polygon.area:.1f}", flush=True)
+        logger.info("plot_area=%.1f sqm, boundary=%s...", plot_area, boundary[:4])
+        logger.info("plot_polygon valid=%s, area=%.1f", plot_polygon.is_valid, plot_polygon.area)
 
         regs = request.regulations
-        print(f"[LayoutOpt] regs: max_far={regs.max_far}, max_stories={regs.max_stories}, "
-              f"max_height_m={regs.max_height_m}, max_lot_cov={regs.max_lot_coverage_pct}, "
-              f"min_open_space={regs.min_open_space_pct}, min_sep={regs.min_building_separation_m}", flush=True)
+        logger.info(
+            "regs: max_far=%s, max_stories=%s, max_height_m=%s, "
+            "max_lot_cov=%s, min_open_space=%s, min_sep=%s",
+            regs.max_far, regs.max_stories, regs.max_height_m,
+            regs.max_lot_coverage_pct, regs.min_open_space_pct, regs.min_building_separation_m,
+        )
 
         buildable = self.geometry.compute_buildable_area(
             boundary,
@@ -56,14 +62,14 @@ class LayoutOptimizer:
             side_right_m=regs.setbacks.side_right_m,
         )
         if buildable is None or buildable.is_empty:
-            print("[LayoutOpt] ERROR: buildable area is None or empty!", flush=True)
+            logger.error("Buildable area is None or empty!")
             return []
 
-        print(f"[LayoutOpt] buildable bounds={buildable.bounds}, area={buildable.area:.1f}", flush=True)
+        logger.info("buildable bounds=%s, area=%.1f", buildable.bounds, buildable.area)
 
         # Reset per-run diagnostics
-        LayoutOptimizer._eval_count = 0
-        LayoutOptimizer._fail_reasons = {}
+        self._eval_count = 0
+        self._fail_reasons = {}
 
         buildable_bounds = buildable.bounds
         max_building_height = regs.max_height_m
@@ -172,9 +178,10 @@ class LayoutOptimizer:
                 ]
                 best_fitness = max(fitness_scores)
                 if gen % 50 == 0:
-                    print(f"[LayoutOpt] gen={gen} RESTART: stagnation={stagnation_counter}, "
-                          f"best={best_fitness:.4f}, mutation_rate={mutation_rate:.3f}, sigma={mutation_sigma:.3f}",
-                          flush=True)
+                    logger.info(
+                        "gen=%d RESTART: stagnation=%d, best=%.4f, mutation_rate=%.3f, sigma=%.3f",
+                        gen, stagnation_counter, best_fitness, mutation_rate, mutation_sigma,
+                    )
 
             prev_best = best_fitness
 
@@ -260,8 +267,9 @@ class LayoutOptimizer:
             genes.append(gene)
         return Chromosome(genes=genes)
 
-    _eval_count = 0
-    _fail_reasons: dict[str, int] = {}
+    # M38: Instance variables (initialized in optimize()) — not class-level to avoid sharing across instances
+    _eval_count: int
+    _fail_reasons: dict[str, int]
 
     def _evaluate(
         self,
@@ -271,8 +279,8 @@ class LayoutOptimizer:
         plot_area: float,
         request: OptimizationRequest,
     ) -> float:
-        LayoutOptimizer._eval_count += 1
-        log_this = LayoutOptimizer._eval_count <= 5  # Log first 5 evaluations in detail
+        self._eval_count += 1
+        log_this = self._eval_count <= 5  # Log first 5 evaluations in detail
 
         buildings = self._decode_buildings(chromosome, buildable, request)
         if not buildings:
@@ -281,9 +289,11 @@ class LayoutOptimizer:
 
         if log_this:
             for i, b in enumerate(buildings):
-                print(f"  [eval#{LayoutOptimizer._eval_count}] bldg{i}: "
-                      f"pos=({b['x']:.1f},{b['y']:.1f}) size={b['width']:.1f}x{b['depth']:.1f} "
-                      f"rot={b['rotation']:.1f} stories={b['stories']}", flush=True)
+                logger.debug(
+                    "eval#%d bldg%d: pos=(%.1f,%.1f) size=%.1fx%.1f rot=%.1f stories=%d",
+                    self._eval_count, i,
+                    b['x'], b['y'], b['width'], b['depth'], b['rotation'], b['stories'],
+                )
 
         bldg_polys = [
             self.geometry.create_building_polygon(
@@ -301,7 +311,8 @@ class LayoutOptimizer:
                 try:
                     outside_area = poly.difference(buildable).area
                     overlap_ratio = 1.0 - min(1.0, outside_area / max(poly.area, 0.01))
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Geometry difference failed for building {idx}: {e}")
                     overlap_ratio = 0.0
                 if overlap_ratio < 0.5:
                     # Too far outside — still effectively zero
@@ -310,8 +321,10 @@ class LayoutOptimizer:
                 # Soft penalty: proportional to how much is outside
                 penalty *= overlap_ratio ** 2
                 if log_this:
-                    print(f"  [eval#{LayoutOptimizer._eval_count}] SOFT PENALTY bldg{idx}: "
-                          f"overlap_ratio={overlap_ratio:.3f}", flush=True)
+                    logger.debug(
+                        "eval#%d SOFT PENALTY bldg%d: overlap_ratio=%.3f",
+                        self._eval_count, idx, overlap_ratio,
+                    )
 
         # Overlap between buildings: hard zero (can't have buildings intersect)
         for i in range(len(bldg_polys)):
@@ -365,8 +378,10 @@ class LayoutOptimizer:
             penalty *= max(0.15, 1.0 - shortfall * 1.5)
 
         if log_this:
-            print(f"  [eval#{LayoutOptimizer._eval_count}] PASS: far={far:.3f}, lot_cov={lot_cov:.1f}%, "
-                  f"open_space={open_space:.1f}%, penalty={penalty:.3f}", flush=True)
+            logger.debug(
+                "eval#%d PASS: far=%.3f, lot_cov=%.1f%%, open_space=%.1f%%, penalty=%.3f",
+                self._eval_count, far, lot_cov, open_space, penalty,
+            )
 
         raw_score = self.fitness_eval.evaluate(
             far=far,
@@ -433,15 +448,14 @@ class LayoutOptimizer:
                 total += 1.0
         return (total / max_len) ** 0.5
 
-    @classmethod
-    def _track_fail(cls, reason: str):
+    def _track_fail(self, reason: str):
         # Simplify parameterized reasons for aggregation
         key = reason.split("(")[0]
-        cls._fail_reasons[key] = cls._fail_reasons.get(key, 0) + 1
+        self._fail_reasons[key] = self._fail_reasons.get(key, 0) + 1
         # Periodically log failure distribution
-        total = sum(cls._fail_reasons.values())
+        total = sum(self._fail_reasons.values())
         if total % 500 == 0:
-            print(f"[LayoutOpt] Failure distribution after {total} fails: {cls._fail_reasons}", flush=True)
+            logger.info("Failure distribution after %d fails: %s", total, self._fail_reasons)
 
     def _decode_buildings(
         self,

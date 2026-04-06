@@ -11,7 +11,7 @@ Standard IFC wall/slab convention:
 
 import uuid
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.models.floorplan import (
@@ -61,7 +61,7 @@ class IfcWriter:
         self._lines = []
         self._id = 0
 
-        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
         # ── Header ──────────────────────────────────────────────
         header = f"""ISO-10303-21;
@@ -79,7 +79,7 @@ DATA;"""
         app = self._add(f"IFCAPPLICATION(#{org},'1.0','BuildingOptimizer','BuildingOptimizer')")
         owner = self._add(
             f"IFCOWNERHISTORY(#{person_org},#{app},$,.NOCHANGE.,$,"
-            f"#{person_org},#{app},{int(datetime.utcnow().timestamp())})"
+            f"#{person_org},#{app},{int(datetime.now(timezone.utc).timestamp())})"
         )
 
         # Units
