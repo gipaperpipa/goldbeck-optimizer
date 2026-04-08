@@ -62,6 +62,7 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     error,
     setError,
     detectedState,
+    detectState,
   } = useCadastral();
 
   // ── Update nearby parcels on map ────────────────────────
@@ -113,17 +114,17 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
 
   // ── Trigger nearby parcel loading ───────────────────────
 
-  const triggerNearbyLoad = useCallback(() => {
+  const triggerNearbyLoad = useCallback(async () => {
     const map = mapRef.current;
     if (!map || map.getZoom() < MIN_CADASTRAL_ZOOM) return;
 
     const center = map.getCenter();
-    const key = `${center.lng.toFixed(4)},${center.lat.toFixed(4)},${radiusM}`;
-    if (key === lastLoadCenter.current) return;
-    lastLoadCenter.current = key;
-
-    loadParcelsInRadius(center.lng, center.lat, radiusM);
-  }, [loadParcelsInRadius, radiusM]);
+    detectState(center.lng, center.lat);
+    const parcels = await loadParcelsInRadius(center.lng, center.lat, radiusM);
+    if (parcels && parcels.length > 0) {
+      lastLoadCenter.current = `${center.lng.toFixed(4)},${center.lat.toFixed(4)},${radiusM}`;
+    }
+  }, [loadParcelsInRadius, detectState, radiusM]);
 
   // ── Update map when nearby parcels change ───────────────
 
@@ -152,6 +153,8 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
 
     map.on("load", () => {
       setIsMapReady(true);
+
+      // ── WMS cadastral overlay placeholder (added dynamically per state) ─────
 
       // ── Nearby parcels (from DB, cache-first) ─────────
       map.addSource("nearby-parcels", {
@@ -254,16 +257,22 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
       map.getCanvas().style.cursor = z >= MIN_CADASTRAL_ZOOM ? "crosshair" : "";
     });
 
-    // Load parcels on map move (debounced)
+    // Load parcels + detect state on map move (debounced)
     map.on("moveend", () => {
       if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
-      loadTimeoutRef.current = setTimeout(() => {
+      loadTimeoutRef.current = setTimeout(async () => {
         if (map.getZoom() >= MIN_CADASTRAL_ZOOM) {
           const center = map.getCenter();
-          const key = `${center.lng.toFixed(4)},${center.lat.toFixed(4)}`;
+          // Detect state for WMS overlay (cheap API call, cached on backend)
+          detectState(center.lng, center.lat);
+          // Load parcel polygons via WFS
+          const key = `${center.lng.toFixed(4)},${center.lat.toFixed(4)},${radiusM}`;
           if (key !== lastLoadCenter.current) {
-            lastLoadCenter.current = key;
-            loadParcelsInRadius(center.lng, center.lat, radiusM);
+            const parcels = await loadParcelsInRadius(center.lng, center.lat, radiusM);
+            // Only cache key if we got results — allow retry on failure
+            if (parcels && parcels.length > 0) {
+              lastLoadCenter.current = key;
+            }
           }
         }
       }, 500);
@@ -277,15 +286,55 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
       map.remove();
       mapRef.current = null;
     };
-  }, [selectParcelAtPoint, loadParcelsInRadius, radiusM]);
+  }, [selectParcelAtPoint, loadParcelsInRadius, detectState, radiusM]);
 
-  // ── Update state badge ──────────────────────────────────
+  // ── Update state badge + WMS cadastral overlay ──────────
 
   useEffect(() => {
     if (detectedState && detectedState !== currentState) {
       setCurrentState(detectedState);
     }
   }, [detectedState, currentState]);
+
+  // Add/update the WMS cadastral tile overlay when state changes
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !isMapReady || !currentState) return;
+
+    const sourceId = "cadastral-wms";
+    const layerId = "cadastral-wms-layer";
+
+    // Remove existing WMS layer/source if switching states
+    if (map.getLayer(layerId)) map.removeLayer(layerId);
+    if (map.getSource(sourceId)) map.removeSource(sourceId);
+
+    const tileUrl =
+      `${API_BASE}/v1/cadastral/wms/tile` +
+      `?state=${encodeURIComponent(currentState)}` +
+      `&bbox={bbox-epsg-3857}&width=256&height=256&crs=EPSG:3857`;
+
+    map.addSource(sourceId, {
+      type: "raster",
+      tiles: [tileUrl],
+      tileSize: 256,
+    });
+
+    // Insert below the GeoJSON parcel layers so interactive fills stay on top
+    const beforeLayer = map.getLayer("nearby-parcels-fill")
+      ? "nearby-parcels-fill"
+      : undefined;
+
+    map.addLayer(
+      {
+        id: layerId,
+        type: "raster",
+        source: sourceId,
+        paint: { "raster-opacity": 0.55 },
+        minzoom: MIN_CADASTRAL_ZOOM,
+      },
+      beforeLayer
+    );
+  }, [currentState, isMapReady]);
 
   // ── Update selected parcels layer ───────────────────────
 
@@ -460,6 +509,13 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
           <div className="absolute top-3 left-3 bg-white/90 px-2 py-1 rounded text-xs text-neutral-600 shadow flex items-center gap-1.5">
             <span className="inline-block h-2.5 w-2.5 border-2 border-neutral-300 border-t-blue-500 rounded-full animate-spin" />
             Katasterdaten laden...
+          </div>
+        )}
+
+        {/* WMS-only hint: shown when zoomed in but no polygons loaded */}
+        {isMapReady && zoomLevel >= MIN_CADASTRAL_ZOOM && !isLoadingNearby && nearbyParcels.length === 0 && currentState && (
+          <div className="absolute bottom-12 left-1/2 -translate-x-1/2 bg-amber-50 border border-amber-200 text-amber-800 text-xs px-3 py-1.5 rounded-lg shadow max-w-xs text-center">
+            Katastergrenzen sichtbar (WMS). Klicken Sie auf ein Flurst&uuml;ck um es auszuw&auml;hlen.
           </div>
         )}
 

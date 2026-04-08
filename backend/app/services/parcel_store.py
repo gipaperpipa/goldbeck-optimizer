@@ -257,27 +257,36 @@ async def get_parcels_in_radius(
             )
 
             if wfs_parcels:
-                logger.info(f"WFS returned {len(wfs_parcels)} parcels, storing...")
+                logger.info(f"WFS bbox returned {len(wfs_parcels)} parcels, storing...")
                 await store_many_parcels_from_wfs(wfs_parcels)
-
-                # Re-query DB to get stored parcels with IDs
-                async with get_db() as session:
-                    stmt = (
-                        select(Parcel)
-                        .where(
-                            and_(
-                                Parcel.centroid_lng >= min_lng,
-                                Parcel.centroid_lng <= max_lng,
-                                Parcel.centroid_lat >= min_lat,
-                                Parcel.centroid_lat <= max_lat,
-                            )
-                        )
-                        .limit(500)
-                    )
-                    result = await session.execute(stmt)
-                    db_parcels = list(result.scalars().all())
             else:
-                logger.warning(f"WFS returned 0 parcels for ({lng:.5f}, {lat:.5f})")
+                # Fallback: try single-point multi-source lookup (Nominatim, Overpass, etc.)
+                logger.warning(
+                    f"WFS bbox returned 0 parcels for ({lng:.5f}, {lat:.5f}), "
+                    f"trying single-point fallback..."
+                )
+                from app.services.cadastral import get_parcel_geometry_at_point
+                center_parcel = await get_parcel_geometry_at_point(lng, lat, state)
+                if center_parcel and center_parcel.get("polygon_wgs84"):
+                    wfs_parcels = [center_parcel]
+                    await store_many_parcels_from_wfs(wfs_parcels)
+
+            # Re-query DB to get stored parcels with IDs
+            async with get_db() as session:
+                stmt = (
+                    select(Parcel)
+                    .where(
+                        and_(
+                            Parcel.centroid_lng >= min_lng,
+                            Parcel.centroid_lng <= max_lng,
+                            Parcel.centroid_lat >= min_lat,
+                            Parcel.centroid_lat <= max_lat,
+                        )
+                    )
+                    .limit(500)
+                )
+                result = await session.execute(stmt)
+                db_parcels = list(result.scalars().all())
         except Exception as e:
             logger.error(f"WFS fetch failed: {e}", exc_info=True)
 

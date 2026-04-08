@@ -42,9 +42,9 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 
 ## Last Request
 **Status:** DONE
-**Date:** 2026-04-06
-**Request:** Production-readiness fixes for deployment (Step 4 of professional reliability plan)
-**Progress:** Fixed debug default (safe for prod), Railway start command (venv activation), Dockerfile (PORT env + data dir), DB path configurability (DATABASE_URL/DB_DIR env vars), updated DEPLOY.md with notes on ephemeral storage and new env vars.
+**Date:** 2026-04-08
+**Request:** Fix cadastral map — parcels not showing, search not working
+**Progress:** Added WMS cadastral tile overlay (visual borders independent of WFS), fixed CRS reprojection in WMS proxy, added state detection on map pan, improved radius load retry logic, added single-point fallback when bbox WFS fails.
 
 ## Current State
 **Last updated:** 2026-04-06

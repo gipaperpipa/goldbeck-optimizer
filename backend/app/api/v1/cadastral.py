@@ -116,19 +116,39 @@ async def wms_tile_proxy(
     """
     Proxy WMS GetMap requests to state geoportals.
     This solves CORS issues — the frontend calls our backend, which calls the state WMS.
-    Accepts EPSG:3857 (web mercator) bbox from Mapbox and forwards to the state service.
+    Accepts EPSG:3857 (web mercator) bbox from Mapbox and reprojects to the state's
+    native CRS if needed, since many German WMS services don't support EPSG:3857.
     """
+    from pyproj import Transformer
+
     service = get_state_service(state)
     if not service:
         raise HTTPException(status_code=404, detail=f"No WMS service for state: {state}")
+
+    native_crs = service["crs"]
+    request_crs = crs
+    request_bbox = bbox
+
+    # Reproject from EPSG:3857 → state native CRS if different
+    if crs == "EPSG:3857" and native_crs != "EPSG:3857":
+        try:
+            transformer = Transformer.from_crs("EPSG:3857", native_crs, always_xy=True)
+            parts = [float(x) for x in bbox.split(",")]
+            min_x, min_y = transformer.transform(parts[0], parts[1])
+            max_x, max_y = transformer.transform(parts[2], parts[3])
+            # WMS 1.3.0 with EPSG:25832/25833 uses easting,northing order
+            request_bbox = f"{min_x},{min_y},{max_x},{max_y}"
+            request_crs = native_crs
+        except Exception as e:
+            logger.warning(f"CRS reprojection failed, using EPSG:3857: {e}")
 
     params = {
         "SERVICE": "WMS",
         "VERSION": "1.3.0",
         "REQUEST": "GetMap",
         "LAYERS": service["wms_layers"],
-        "CRS": crs,
-        "BBOX": bbox,
+        "CRS": request_crs,
+        "BBOX": request_bbox,
         "WIDTH": width,
         "HEIGHT": height,
         "FORMAT": "image/png",
@@ -138,7 +158,11 @@ async def wms_tile_proxy(
 
     try:
         content, content_type = await proxy_wms_request(state, params)
-        return Response(content=content, media_type=content_type)
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={"Cache-Control": "public, max-age=86400"},  # Cache tiles for 24h
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"WMS request failed: {str(e)}")
 
