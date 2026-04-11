@@ -85,8 +85,8 @@ def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            timeout=httpx.Timeout(connect=8.0, read=20.0, write=5.0, pool=8.0),
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
             headers={
                 "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
             },

@@ -39,20 +39,19 @@ export function useCadastral() {
 
     debounceRef.current = setTimeout(async () => {
       setIsSearching(true);
-      setError(null);
       try {
         const results = await apiClient.get<AddressSearchResult[]>(
           `/cadastral/search?q=${encodeURIComponent(query)}&limit=5`
         );
         setSearchResults(results);
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : "Address search failed";
-        setError(msg);
-        setSearchResults([]);
+        console.warn("Address search failed:", e);
+        // Don't show error for search — just keep previous results
+        // The user can keep typing
       } finally {
         setIsSearching(false);
       }
-    }, 300);
+    }, 350);
   }, []);
 
   // ── State detection ─────────────────────────────────────
@@ -113,33 +112,50 @@ export function useCadastral() {
   const selectParcelAtPoint = useCallback(async (lng: number, lat: number) => {
     setIsLoadingParcel(true);
     setError(null);
-    try {
-      // Use new cache-first endpoint
+
+    // Helper: try fetching a parcel (used for retry)
+    const fetchParcel = async () => {
       const parcel = await apiClient.get<ParcelInfo | null>(
         `/parcels/at-point?lng=${lng}&lat=${lat}`
       );
-      if (parcel && parcel.polygon_wgs84 && parcel.polygon_wgs84.length > 0) {
-        // Use the DB id as the unique key if available
+      return parcel;
+    };
+
+    try {
+      let parcel = await fetchParcel();
+
+      // If first attempt returned empty/not_found, retry once after a short delay
+      // (WFS services are flaky — a second request often succeeds)
+      if (!parcel || !parcel.polygon_wgs84 || parcel.polygon_wgs84.length === 0 ||
+          parcel.parcel_id === "not_found") {
+        await new Promise((r) => setTimeout(r, 1000));
+        parcel = await fetchParcel();
+      }
+
+      if (parcel && parcel.polygon_wgs84 && parcel.polygon_wgs84.length > 0 &&
+          parcel.parcel_id !== "not_found") {
         const parcelKey = parcel.id || parcel.parcel_id;
         setSelectedParcels((prev) => {
           const exists = prev.some((p) => (p.id || p.parcel_id) === parcelKey);
           if (exists) {
-            // Deselect if already selected
             return prev.filter((p) => (p.id || p.parcel_id) !== parcelKey);
           }
-          return [...prev, parcel];
+          return [...prev, parcel!];
         });
         if (parcel.state) {
           setDetectedState(parcel.state);
         }
         return parcel;
       } else {
-        setError("Kein Flurstück gefunden. Versuchen Sie einen anderen Punkt.");
+        setError(
+          "Kein Flurstück an dieser Stelle gefunden. " +
+          "Bitte versuchen Sie einen leicht anderen Punkt oder zoomen Sie näher heran."
+        );
         return null;
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Flurstück konnte nicht geladen werden";
-      setError(msg);
+      setError(msg + " — Bitte erneut versuchen.");
       return null;
     } finally {
       setIsLoadingParcel(false);

@@ -241,12 +241,28 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
       });
     });
 
-    // Click handler — select/deselect parcels (debounced to prevent rapid duplicates)
+    // Click handler — try local GeoJSON first, fall back to API
     map.on("click", async (e) => {
       if (map.getZoom() < MIN_CADASTRAL_ZOOM) return;
       if (clickDebounceRef.current) return;
       clickDebounceRef.current = true;
-      setTimeout(() => { clickDebounceRef.current = false; }, 300);
+      setTimeout(() => { clickDebounceRef.current = false; }, 800);
+
+      // Check if click hit an already-loaded nearby parcel polygon
+      const features = map.queryRenderedFeatures(e.point, {
+        layers: ["nearby-parcels-fill"],
+      });
+      if (features.length > 0) {
+        const feat = features[0];
+        const parcelId = feat.properties?.id || feat.properties?.parcel_id;
+        if (parcelId) {
+          // Toggle selection from already-loaded data (instant, no API call)
+          selectParcelAtPoint(e.lngLat.lng, e.lngLat.lat);
+          return;
+        }
+      }
+
+      // No local polygon hit — fetch from API (slower, but always works)
       selectParcelAtPoint(e.lngLat.lng, e.lngLat.lat);
     });
 
@@ -385,15 +401,21 @@ export function CadastralMap({ onPlotConfirmed }: CadastralMapProps) {
     setSearchQuery(result.display_name);
     setShowDropdown(false);
 
+    // Set state immediately so WMS overlay starts loading during fly
+    if (result.state) {
+      setCurrentState(result.state);
+    } else {
+      detectState(result.lng, result.lat);
+    }
+
     map.flyTo({
       center: [result.lng, result.lat],
       zoom: 17,
       duration: 2000,
     });
 
-    if (result.state) {
-      setCurrentState(result.state);
-    }
+    // Clear dedup key so the new location always loads parcels
+    lastLoadCenter.current = "";
 
     // Trigger parcel loading at destination (guard against unmount)
     setTimeout(() => {

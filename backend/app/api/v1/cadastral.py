@@ -32,6 +32,32 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 geometry = GeometryEngine()
 
+# Minimal 1×1 transparent PNG (avoids broken tile display on WMS errors)
+# Mapbox stretches it to tile size, so 1×1 is sufficient
+import struct
+import zlib
+
+_TRANSPARENT_PNG_BYTES: bytes | None = None
+
+
+def _transparent_png() -> bytes:
+    """Return a minimal 1×1 transparent PNG."""
+    global _TRANSPARENT_PNG_BYTES
+    if _TRANSPARENT_PNG_BYTES is None:
+        # PNG file: signature + IHDR + IDAT + IEND
+        def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+            c = chunk_type + data
+            crc = struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+            return struct.pack(">I", len(data)) + c + crc
+
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+        raw = zlib.compress(b"\x00\x00\x00\x00\x00")  # filter=none, RGBA=0,0,0,0
+        idat = _chunk(b"IDAT", raw)
+        iend = _chunk(b"IEND", b"")
+        _TRANSPARENT_PNG_BYTES = sig + ihdr + idat + iend
+    return _TRANSPARENT_PNG_BYTES
+
 
 # ── Models ───────────────────────────────────────────────────────────────
 
@@ -158,13 +184,29 @@ async def wms_tile_proxy(
 
     try:
         content, content_type = await proxy_wms_request(state, params)
+
+        # Some WMS services return XML error documents instead of images
+        if "xml" in (content_type or "") or (content[:5] == b"<?xml"):
+            logger.warning(f"WMS for {state} returned XML instead of image")
+            return Response(
+                content=_transparent_png(),
+                media_type="image/png",
+                headers={"Cache-Control": "public, max-age=300"},
+            )
+
         return Response(
             content=content,
             media_type=content_type,
-            headers={"Cache-Control": "public, max-age=86400"},  # Cache tiles for 24h
+            headers={"Cache-Control": "public, max-age=86400"},
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"WMS request failed: {str(e)}")
+        logger.warning(f"WMS request failed for {state}: {e}")
+        # Return a transparent PNG so Mapbox doesn't show broken tiles
+        return Response(
+            content=_transparent_png(),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=300"},  # Retry sooner on failure
+        )
 
 
 @router.get("/parcel/at-point", response_model=ParcelInfo | None)
