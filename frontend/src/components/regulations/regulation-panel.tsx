@@ -87,10 +87,12 @@ export function RegulationPanel({ onNext }: RegulationPanelProps) {
   const [nearTransit, setNearTransit] = useState(false);
   const [germanRegs, setGermanRegs] = useState<GermanRegulationSet | null>(germanRegulations);
   const [loading, setLoading] = useState(false);
+  const [regError, setRegError] = useState<string | null>(null);
 
   // Build German regulations from backend
   const buildGermanRegs = useCallback(async () => {
     setLoading(true);
+    setRegError(null);
     try {
       const resp = await fetch(`${API_BASE}/v1/regulations/german/build`, {
         method: "POST",
@@ -109,9 +111,13 @@ export function RegulationPanel({ onNext }: RegulationPanelProps) {
         setGermanRegs(data.german);
         // Also set the compatible regulation set for the optimizer
         setIntlRegs({ ...DEFAULT_INTL_REGS, ...data.compatible });
+      } else {
+        const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
+        setRegError(detail.detail || `Server-Fehler (${resp.status})`);
       }
     } catch (err) {
       console.error("Failed to build German regulations:", err);
+      setRegError("Verbindung zum Server fehlgeschlagen. Bitte erneut versuchen.");
     } finally {
       setLoading(false);
     }
@@ -226,6 +232,13 @@ export function RegulationPanel({ onNext }: RegulationPanelProps) {
             aiLoading={aiLoading}
             notes={notes}
           />
+        )}
+
+        {regError && (
+          <div className="flex items-center gap-2 text-sm text-red-600 bg-red-50 p-2 rounded border border-red-200">
+            <span className="shrink-0">⚠</span>
+            {regError}
+          </div>
         )}
 
         <Button onClick={handleSave} className="w-full" disabled={loading}>

@@ -39,6 +39,22 @@ class LayoutOptimizer:
         request: OptimizationRequest,
         progress_callback: Callable[[int, int, float, float], None] | None = None,
     ) -> list[LayoutOption]:
+        """Run the genetic algorithm to find optimal building layouts.
+
+        Evolves a population of building placement candidates, scoring each
+        by efficiency, financial viability, livability, and regulation
+        compliance.  Returns the top-K unique LayoutOptions ranked by
+        overall fitness.
+
+        Args:
+            request: Plot geometry, regulations, unit mix, GA parameters
+                (population_size, generations, weights).
+            progress_callback: Called each generation with
+                (gen, total_gens, best_fitness, avg_fitness).
+
+        Returns:
+            Ranked list of LayoutOptions with scores and regulation checks.
+        """
         boundary = request.plot.boundary_polygon_local
         plot_polygon = Polygon(boundary)
         plot_area = request.plot.area_sqm
