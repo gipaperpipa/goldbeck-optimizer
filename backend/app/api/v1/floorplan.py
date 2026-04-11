@@ -43,9 +43,11 @@ def _run_generation(job_id: str, request: FloorPlanRequest):
         # ALWAYS run the optimizer — no more deterministic shortcut
         optimizer = FloorPlanOptimizer()
 
-        # Create a dedicated event loop for async WebSocket broadcasting
+        # Create a dedicated event loop for async WebSocket broadcasting.
+        # The loop runs in a daemon thread so run_coroutine_threadsafe works.
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
 
         def _ws_broadcast_progress(gen, total, best_fit, avg_fit):
             """Fire-and-forget WebSocket broadcast from background thread."""
@@ -106,20 +108,21 @@ def _run_generation(job_id: str, request: FloorPlanRequest):
                 logger.warning(f"[FloorPlan] Job {job_id[:8]}: validation failed for rank {variant.rank}", exc_info=True)
 
         # Build completion state atomically
+        best_variant = variants[0] if variants else None
         _store.update(
             job_id,
             status="completed",
             variants=variants,
-            building_floor_plans=variants[0].building_floor_plans,
+            building_floor_plans=best_variant.building_floor_plans if best_variant else None,
             progress_pct=100.0,
             elapsed_seconds=round(time.time() - start_time, 1),
             estimated_remaining_seconds=0.0,
         )
 
         # Broadcast best variant to Grasshopper clients (outside lock)
-        if sync_manager.client_count > 0:
+        if best_variant and sync_manager.client_count > 0:
             try:
-                best_data = variants[0].building_floor_plans.model_dump()
+                best_data = best_variant.building_floor_plans.model_dump()
                 asyncio.run_coroutine_threadsafe(
                     sync_manager.broadcast_floor_plans(best_data), loop,
                 )
@@ -140,6 +143,14 @@ def _run_generation(job_id: str, request: FloorPlanRequest):
     except Exception as e:
         _store.update(job_id, status="failed", error=str(e))
         logger.exception(f"[FloorPlan] Job {job_id[:8]}: FAILED - {e}")
+    finally:
+        # Shut down the WS event loop cleanly to prevent resource leaks
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=2.0)
+            loop.close()
+        except Exception:
+            pass
 
 
 @router.post("", response_model=FloorPlanResult)
