@@ -10,6 +10,21 @@ import type {
   FloorPlanVariant,
 } from "@/types/api";
 
+// ── Undo/Redo snapshot ───────────────────────────────────────────────
+// Only tracks the fields that represent meaningful user decisions.
+
+interface UndoableSnapshot {
+  selectedLayout: LayoutOption | null;
+  floorPlans: Record<string, BuildingFloorPlans>;
+  floorPlanVariants: Record<string, FloorPlanVariant[]>;
+  selectedVariantIndex: number;
+  selectedBuildingId: string | null;
+  selectedFloorIndex: number;
+  regulations: RegulationSet | null;
+}
+
+const MAX_HISTORY = 30;
+
 interface ProjectState {
   // Step tracking
   currentStep: number;
@@ -56,11 +71,34 @@ interface ProjectState {
   activeTab: string;
   setActiveTab: (tab: string) => void;
 
+  // Undo/Redo
+  _undoStack: UndoableSnapshot[];
+  _redoStack: UndoableSnapshot[];
+  canUndo: boolean;
+  canRedo: boolean;
+  undo: () => void;
+  redo: () => void;
+  /** Manually push a snapshot before a significant change. Called automatically
+   *  by setSelectedLayout, setFloorPlan, and setRegulations. */
+  _pushSnapshot: () => void;
+
   // Reset
   reset: () => void;
 }
 
-export const useProjectStore = create<ProjectState>((set) => ({
+function _takeSnapshot(state: ProjectState): UndoableSnapshot {
+  return {
+    selectedLayout: state.selectedLayout,
+    floorPlans: { ...state.floorPlans },
+    floorPlanVariants: { ...state.floorPlanVariants },
+    selectedVariantIndex: state.selectedVariantIndex,
+    selectedBuildingId: state.selectedBuildingId,
+    selectedFloorIndex: state.selectedFloorIndex,
+    regulations: state.regulations,
+  };
+}
+
+export const useProjectStore = create<ProjectState>((set, get) => ({
   currentStep: 0,
   setCurrentStep: (step) => set({ currentStep: step }),
 
@@ -68,7 +106,10 @@ export const useProjectStore = create<ProjectState>((set) => ({
   setPlotAnalysis: (analysis) => set({ plotAnalysis: analysis }),
 
   regulations: null,
-  setRegulations: (regs) => set({ regulations: regs }),
+  setRegulations: (regs) => {
+    get()._pushSnapshot();
+    set({ regulations: regs });
+  },
   regulationMode: "german" as "german" | "international",
   setRegulationMode: (mode) => set({ regulationMode: mode }),
   germanRegulations: null,
@@ -104,6 +145,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   selectedLayout: null,
   setSelectedLayout: (layout) => {
+    get()._pushSnapshot();
     // When selecting a layout, populate floor plans if available (combined mode)
     const newFloorPlans: Record<string, BuildingFloorPlans> = {};
     const newVariants: Record<string, FloorPlanVariant[]> = {};
@@ -134,10 +176,12 @@ export const useProjectStore = create<ProjectState>((set) => ({
   setFinancialAnalysis: (analysis) => set({ financialAnalysis: analysis }),
 
   floorPlans: {},
-  setFloorPlan: (buildingId, plans) =>
+  setFloorPlan: (buildingId, plans) => {
+    get()._pushSnapshot();
     set((state) => ({
       floorPlans: { ...state.floorPlans, [buildingId]: plans },
-    })),
+    }));
+  },
   floorPlanVariants: {},
   setFloorPlanVariants: (buildingId, variants) =>
     set((state) => ({
@@ -164,6 +208,51 @@ export const useProjectStore = create<ProjectState>((set) => ({
   activeTab: "site-plan",
   setActiveTab: (tab) => set({ activeTab: tab }),
 
+  // ── Undo / Redo ────────────────────────────────────────────────────
+  _undoStack: [],
+  _redoStack: [],
+  canUndo: false,
+  canRedo: false,
+
+  _pushSnapshot: () => {
+    const state = get();
+    const snapshot = _takeSnapshot(state);
+    const newStack = [...state._undoStack, snapshot].slice(-MAX_HISTORY);
+    set({ _undoStack: newStack, _redoStack: [], canUndo: true, canRedo: false });
+  },
+
+  undo: () => {
+    const state = get();
+    if (state._undoStack.length === 0) return;
+    const current = _takeSnapshot(state);
+    const prev = state._undoStack[state._undoStack.length - 1];
+    const newUndo = state._undoStack.slice(0, -1);
+    const newRedo = [...state._redoStack, current];
+    set({
+      ...prev,
+      _undoStack: newUndo,
+      _redoStack: newRedo,
+      canUndo: newUndo.length > 0,
+      canRedo: true,
+    });
+  },
+
+  redo: () => {
+    const state = get();
+    if (state._redoStack.length === 0) return;
+    const current = _takeSnapshot(state);
+    const next = state._redoStack[state._redoStack.length - 1];
+    const newRedo = state._redoStack.slice(0, -1);
+    const newUndo = [...state._undoStack, current];
+    set({
+      ...next,
+      _undoStack: newUndo,
+      _redoStack: newRedo,
+      canUndo: true,
+      canRedo: newRedo.length > 0,
+    });
+  },
+
   reset: () =>
     set({
       currentStep: 0,
@@ -180,5 +269,9 @@ export const useProjectStore = create<ProjectState>((set) => ({
       selectedBuildingId: null,
       selectedFloorIndex: 0,
       activeTab: "site-plan",
+      _undoStack: [],
+      _redoStack: [],
+      canUndo: false,
+      canRedo: false,
     }),
 }));

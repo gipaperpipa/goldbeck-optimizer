@@ -27,6 +27,9 @@ interface Scene3DProps {
 }
 
 export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DProps) {
+  // Default sun direction: northern hemisphere → sun from south, southern → from north
+  const latitude = plot?.centroid_geo?.lat ?? 50; // Default to Germany
+  const defaultSunZ = latitude >= 0 ? 200 : -200; // Flip Z for southern hemisphere
   const [showLabels, setShowLabels] = useState(true);
   const [sectionY, setSectionY] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -75,7 +78,7 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
 
   if (!layout) {
     return (
-      <div className="w-full h-[min(600px,70vh)] bg-neutral-100 rounded-lg flex items-center justify-center">
+      <div className="w-full h-[clamp(300px,60vh,800px)] bg-neutral-100 rounded-lg flex items-center justify-center">
         <p className="text-neutral-500">Select a layout to view in 3D</p>
       </div>
     );
@@ -96,7 +99,7 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   const hasDetailedData = floorPlansMap && Object.keys(floorPlansMap).length > 0;
 
   return (
-    <div className="relative w-full h-[min(600px,70vh)] rounded-lg overflow-hidden border">
+    <div className="relative w-full h-[clamp(300px,60vh,800px)] rounded-lg overflow-hidden border">
       {/* Top controls */}
       <div className="absolute top-3 left-3 z-10 flex gap-2">
         <Button
@@ -162,7 +165,7 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
           ) : (
             <directionalLight
               castShadow
-              position={[200, 300, 200]}
+              position={[200, 300, defaultSunZ]}
               intensity={1.5}
               shadow-mapSize={[2048, 2048]}
               shadow-camera-far={1500}
