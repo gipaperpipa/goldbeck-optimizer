@@ -42,8 +42,8 @@ export function OptimizationPreferences({ onComplete }: OptimizationPreferencesP
     livability: 0.20, compliance: 0.20,
   });
   const [maxBuildings, setMaxBuildings] = useState(4);
-  const [generations, setGenerations] = useState(500);
-  const [populationSize, setPopulationSize] = useState(500);
+  const [generations, setGenerations] = useState(100);
+  const [populationSize, setPopulationSize] = useState(100);
   const [estimatedTime, setEstimatedTime] = useState<number | null>(null);
 
   // Combined mode settings
