@@ -94,11 +94,17 @@ export function useCadastral() {
       const parcels = await apiClient.get<ParcelInfo[]>(url);
       if (!controller.signal.aborted) {
         setNearbyParcels(parcels);
+        if (parcels.length === 0) {
+          console.info(
+            `[Cadastral] No parcels found in ${radiusM}m radius at (${lng.toFixed(5)}, ${lat.toFixed(5)}). ` +
+            `WFS services for this area may be unavailable. Click directly on the map to select parcels.`
+          );
+        }
       }
       return parcels;
     } catch (e: unknown) {
       if (e instanceof DOMException && e.name === "AbortError") return [];
-      console.warn("Failed to load nearby parcels:", e);
+      console.warn("[Cadastral] Failed to load nearby parcels:", e);
       return [];
     } finally {
       if (!controller.signal.aborted) {

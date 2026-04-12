@@ -85,11 +85,12 @@ def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=8.0, read=20.0, write=5.0, pool=8.0),
+            timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
             limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
             headers={
                 "User-Agent": "GoldbeckOptimizer/1.0 (adrian.krasniqi@aplusa-studio.com)",
             },
+            follow_redirects=True,
         )
     return _http_client
 
@@ -164,10 +165,10 @@ GERMAN_STATE_SERVICES = {
         "crs": "EPSG:25833",
     },
     "Berlin": {
-        "wms": "https://fbinter.stadt-berlin.de/fb/wms/senstadt/wmsk_alkis",
-        "wfs": "https://fbinter.stadt-berlin.de/fb/wfs/data/senstadt/s_wfs_alkis_flst",
-        "wms_layers": "0",
-        "wfs_typename": "fis:s_wfs_alkis_flst",
+        "wms": "https://gdi.berlin.de/services/wms/alkis_flurstuecke",
+        "wfs": "https://gdi.berlin.de/services/wfs/alkis_flurstuecke",
+        "wms_layers": "alkis_flurstuecke:flurstuecke",
+        "wfs_typename": "alkis_flurstuecke:flurstuecke",
         "crs": "EPSG:25833",
     },
     "Schleswig-Holstein": {
@@ -215,14 +216,14 @@ GERMAN_STATE_SERVICES = {
 }
 
 
-# ── BKG federal-level services (nationwide, single endpoint) ─────────────
-# The BKG provides INSPIRE-compliant WFS for cadastral parcels across Germany.
-# These are more reliable than individual state services for many regions.
+# ── BKG federal-level services ──────────────────────────────────────────
+# NOTE: BKG (geodatenzentrum.de) does NOT provide a public WFS for cadastral
+# parcels. German cadastral data is state-level only. The BKG WFS source is
+# DISABLED — all parcel data comes from state WFS, Nominatim, and Overpass.
 BKG_SERVICES = {
-    "wfs": "https://sgx.geodatenzentrum.de/wfs_inspire_cp",
+    "wfs": None,  # No federal cadastral WFS exists
     "wfs_typename": "CP:CadastralParcel",
     "crs": "EPSG:25832",
-    # Fallback BKG basemap WMS (always works, but no parcel polygons)
     "wms_basemap": "https://sgx.geodatenzentrum.de/wms_basemapde",
 }
 
@@ -471,8 +472,9 @@ async def _get_parcel_via_wfs(
 
     client = _get_http_client()
 
-    for output_format in ["application/json", "application/geo+json",
-                          "text/xml; subtype=gml/3.2.1", "text/xml"]:
+    # Try JSON first (fastest), then GML as fallback.
+    # Fewer format attempts = faster overall response on Railway (30s timeout).
+    for output_format in ["application/json", "text/xml; subtype=gml/3.2.1"]:
         params = {
             "SERVICE": "WFS",
             "VERSION": "2.0.0",
@@ -486,8 +488,11 @@ async def _get_parcel_via_wfs(
 
         try:
             await rate_limiter.acquire("wfs")
-            response = await client.get(service["wfs"], params=params)
+            response = await client.get(service["wfs"], params=params, timeout=10.0)
             if response.status_code != 200:
+                logger.warning(
+                    f"State WFS ({state}, {output_format}) returned {response.status_code}"
+                )
                 continue
 
             content_type = response.headers.get("content-type", "")
@@ -503,6 +508,9 @@ async def _get_parcel_via_wfs(
                 # If none contain the point, return the first one as fallback
                 if parcels:
                     parcels[0]["properties"]["source"] = f"state_wfs_{state}"
+                    logger.info(
+                        f"State WFS ({state}) returning nearest parcel (none contained click)"
+                    )
                     return parcels[0]
             elif "xml" in content_type or "gml" in content_type:
                 parcels = _process_gml_parcels(response.text, epsg, state)
@@ -514,8 +522,16 @@ async def _get_parcel_via_wfs(
                 if parcels:
                     parcels[0]["properties"]["source"] = f"state_wfs_{state}"
                     return parcels[0]
+            else:
+                logger.warning(
+                    f"State WFS ({state}): unexpected content-type '{content_type}' "
+                    f"for format {output_format}"
+                )
+        except httpx.TimeoutException:
+            logger.warning(f"State WFS ({state}, {output_format}) timed out")
+            continue
         except Exception as e:
-            logger.debug(f"State WFS ({state}, {output_format}) failed: {e}")
+            logger.warning(f"State WFS ({state}, {output_format}) failed: {e}")
             continue
 
     return None
@@ -604,8 +620,10 @@ async def get_parcel_info_at_point(
 async def _get_parcel_via_bkg(lng: float, lat: float, state: str) -> Optional[dict]:
     """
     Query the BKG (federal) INSPIRE Cadastral Parcel WFS.
-    Single nationwide endpoint — more reliable than individual state services.
+    DISABLED — BKG does not provide a public cadastral WFS.
     """
+    if not BKG_SERVICES.get("wfs"):
+        return None
     epsg = BKG_SERVICES["crs"]
     easting, northing = wgs84_to_utm(lng, lat, epsg)
     half = 50.0  # 100m×100m search area to catch parcels reliably
@@ -692,18 +710,25 @@ async def get_parcel_geometry_at_point(
         logger.info(f"Cache hit for ({lng:.5f}, {lat:.5f})")
         return cached
 
-    # Fire all sources concurrently
-    results = await asyncio.gather(
-        _get_parcel_via_bkg(lng, lat, state),
-        _get_parcel_via_wfs(lng, lat, state),
-        _get_parcel_via_nominatim(lng, lat, state),
-        _get_parcel_via_overpass(lng, lat, state),
-        return_exceptions=True,
-    )
+    # Fire all sources concurrently with a hard 20s timeout.
+    # Railway has a ~30s response limit, so we must finish before that.
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                _get_parcel_via_wfs(lng, lat, state),
+                _get_parcel_via_nominatim(lng, lat, state),
+                _get_parcel_via_overpass(lng, lat, state),
+                return_exceptions=True,
+            ),
+            timeout=20.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"All parcel sources timed out for ({lng:.5f}, {lat:.5f}) in {state}")
+        results = []
 
-    # Priority order: BKG > State WFS > Nominatim > Overpass
-    # Validate each result: polygon must contain the click point
-    source_names = ["BKG", "State WFS", "Nominatim", "Overpass"]
+    # Priority order: State WFS > Nominatim > Overpass
+    # (BKG disabled — no federal cadastral WFS exists)
+    source_names = ["State WFS", "Nominatim", "Overpass"]
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             logger.warning(f"{source_names[i]} failed for ({lng:.5f}, {lat:.5f}): {result}")
@@ -715,7 +740,13 @@ async def get_parcel_geometry_at_point(
                 _parcel_cache.put(lng, lat, result)
                 return result
             else:
-                logger.debug(f"{source_names[i]}: polygon doesn't contain click point, skipping")
+                # Still usable — just doesn't perfectly contain the click point
+                logger.info(
+                    f"{source_names[i]}: polygon doesn't contain click point, "
+                    f"using as best available result"
+                )
+                _parcel_cache.put(lng, lat, result)
+                return result
 
     # Last resort: synthetic parcel (always succeeds)
     logger.warning(f"All sources failed for ({lng:.5f}, {lat:.5f}) — using synthetic parcel")
@@ -732,8 +763,7 @@ async def get_parcels_in_bbox(
     state: Optional[str] = None,
 ) -> list[dict]:
     """
-    Fetch all parcels within a bounding box.
-    Tries BKG federal WFS first (nationwide, most reliable), then state WFS as fallback.
+    Fetch all parcels within a bounding box via state WFS.
     Returns list of parcel dicts with WGS84 polygon coordinates.
     """
     center_lng = (min_lng + max_lng) / 2
@@ -744,15 +774,10 @@ async def get_parcels_in_bbox(
     if not state:
         return []
 
-    # ── Try BKG federal WFS first (most reliable, nationwide) ────────
-    bkg_results = await _get_parcels_in_bbox_bkg(min_lng, min_lat, max_lng, max_lat, state)
-    if bkg_results:
-        logger.info(f"BKG bbox returned {len(bkg_results)} parcels")
-        return bkg_results
-
-    # ── Fallback to state WFS ────────────────────────────────────────
+    # ── State WFS (the only real source for German cadastral data) ───
     service = get_state_service(state)
     if not service:
+        logger.warning(f"No WFS service configured for state: {state}")
         return []
 
     epsg = service["crs"]
@@ -761,8 +786,7 @@ async def get_parcels_in_bbox(
 
     bbox_filter = f"{min_e},{min_n},{max_e},{max_n},{epsg}"
 
-    for output_format in ["application/json", "application/geo+json",
-                          "text/xml; subtype=gml/3.2.1"]:
+    for output_format in ["application/json", "text/xml; subtype=gml/3.2.1"]:
         params = {
             "SERVICE": "WFS",
             "VERSION": "2.0.0",
@@ -777,8 +801,11 @@ async def get_parcels_in_bbox(
         try:
             client = _get_http_client()
             await rate_limiter.acquire("wfs")
-            response = await client.get(service["wfs"], params=params)
+            response = await client.get(service["wfs"], params=params, timeout=12.0)
             if response.status_code != 200:
+                logger.warning(
+                    f"State WFS bbox ({state}, {output_format}) returned {response.status_code}"
+                )
                 continue
 
             content_type = response.headers.get("content-type", "")
@@ -788,13 +815,24 @@ async def get_parcels_in_bbox(
                 if results:
                     logger.info(f"State WFS bbox ({state}) returned {len(results)} parcels")
                     return results
+                else:
+                    logger.info(f"State WFS bbox ({state}) JSON response had 0 features")
             elif "xml" in content_type or "gml" in content_type:
                 results = _process_gml_parcels(response.text, epsg, state)
                 if results:
                     logger.info(f"State WFS GML bbox ({state}) returned {len(results)} parcels")
                     return results
+                else:
+                    logger.info(f"State WFS bbox ({state}) GML response had 0 features")
+            else:
+                logger.warning(
+                    f"State WFS bbox ({state}): unexpected content-type '{content_type}'"
+                )
+        except httpx.TimeoutException:
+            logger.warning(f"State WFS bbox ({state}, {output_format}) timed out")
+            continue
         except Exception as e:
-            logger.debug(f"State WFS bbox format {output_format} failed: {e}")
+            logger.warning(f"State WFS bbox ({state}, {output_format}) failed: {e}")
             continue
 
     return []
@@ -803,7 +841,9 @@ async def get_parcels_in_bbox(
 async def _get_parcels_in_bbox_bkg(
     min_lng: float, min_lat: float, max_lng: float, max_lat: float, state: str
 ) -> list[dict]:
-    """Fetch parcels in bbox via BKG federal INSPIRE WFS."""
+    """Fetch parcels in bbox via BKG federal INSPIRE WFS. DISABLED."""
+    if not BKG_SERVICES.get("wfs"):
+        return []
     epsg = BKG_SERVICES["crs"]
     min_e, min_n = wgs84_to_utm(min_lng, min_lat, epsg)
     max_e, max_n = wgs84_to_utm(max_lng, max_lat, epsg)

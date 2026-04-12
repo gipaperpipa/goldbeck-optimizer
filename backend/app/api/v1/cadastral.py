@@ -346,3 +346,75 @@ async def merge_parcels(req: MergeRequest):
             analysis.address_resolved = " — ".join(parts)
 
         return analysis
+
+
+@router.get("/diagnostics/wfs-health")
+async def wfs_diagnostics():
+    """
+    Test connectivity to all German state WFS/WMS endpoints.
+    Useful for debugging which services are reachable from the deployment.
+    """
+    import httpx as httpx_diag
+    import asyncio
+    import time as time_mod
+
+    from app.services.cadastral import GERMAN_STATE_SERVICES as diag_services
+
+    results = {}
+
+    async def test_endpoint(state_name: str, service: dict):
+        result = {"wfs_ok": False, "wms_ok": False, "wfs_error": "", "wms_error": "",
+                  "wfs_ms": 0, "wms_ms": 0}
+
+        async with httpx_diag.AsyncClient(
+            timeout=httpx_diag.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0),
+            follow_redirects=True,
+            headers={"User-Agent": "GoldbeckOptimizer/1.0 (health-check)"},
+        ) as client:
+            # Test WFS
+            try:
+                t0 = time_mod.time()
+                resp = await client.get(
+                    service["wfs"],
+                    params={"SERVICE": "WFS", "REQUEST": "GetCapabilities"},
+                )
+                result["wfs_ms"] = int((time_mod.time() - t0) * 1000)
+                result["wfs_ok"] = resp.status_code == 200
+                if not result["wfs_ok"]:
+                    result["wfs_error"] = f"HTTP {resp.status_code}"
+            except Exception as e:
+                result["wfs_error"] = str(e)[:120]
+
+            # Test WMS
+            try:
+                t0 = time_mod.time()
+                resp = await client.get(
+                    service["wms"],
+                    params={"SERVICE": "WMS", "REQUEST": "GetCapabilities"},
+                )
+                result["wms_ms"] = int((time_mod.time() - t0) * 1000)
+                result["wms_ok"] = resp.status_code == 200
+                if not result["wms_ok"]:
+                    result["wms_error"] = f"HTTP {resp.status_code}"
+            except Exception as e:
+                result["wms_error"] = str(e)[:120]
+
+        return state_name, result
+
+    tasks = []
+    for sn, sc in diag_services.items():
+        tasks.append(test_endpoint(sn, sc))
+
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for item in gathered:
+        if isinstance(item, Exception):
+            continue
+        sn, result = item
+        results[sn] = result
+
+    healthy = sum(1 for r in results.values() if r["wfs_ok"])
+    return {
+        "summary": f"{healthy}/{len(results)} WFS endpoints reachable",
+        "states": results,
+    }

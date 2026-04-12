@@ -41,15 +41,24 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 4. **If the next session sees status = `IN PROGRESS`:** The previous session was cut off. Read the request, check what was partially done (git diff, file state), and resume.
 
 ## Last Request
-**Status:** DONE
-**Date:** 2026-04-08
-**Request:** Fix cadastral map — parcels not showing, search not working
-**Progress:** Added WMS cadastral tile overlay (visual borders independent of WFS), fixed CRS reprojection in WMS proxy, added state detection on map pan, improved radius load retry logic, added single-point fallback when bbox WFS fails.
+**Status:** DONE — awaiting git push to deploy
+**Date:** 2026-04-12
+**Request:** Fix cadastral parcel selection — always returning synthetic placeholders instead of real parcels
+**Progress:** Root-caused: BKG federal WFS doesn't exist (ERROR_UNKNOWN_SERVICE), Berlin WFS migrated to gdi.berlin.de (old URL 404), timeout budget exceeded Railway's 30s limit. Fixed all three issues + added diagnostics endpoint. Verified Berlin WFS returns real GeoJSON. Changes need `git push` from local machine to deploy.
 
 ## Current State
-**Last updated:** 2026-04-06
+**Last updated:** 2026-04-12
 
 ### Recently completed
+- **Cadastral parcel fix** (2026-04-12):
+  - Disabled BKG federal WFS (service doesn't exist — wasted timeout budget)
+  - Updated Berlin WFS/WMS from fbinter.stadt-berlin.de → gdi.berlin.de (old URLs return 404/503)
+  - Berlin typename: `alkis_flurstuecke:flurstuecke` (verified via GetCapabilities + GetFeature)
+  - Reduced httpx timeouts: 10s per-request, 20s hard cap on concurrent gather, 15s on radius fetch
+  - Reduced WFS format attempts from 4 to 2 (JSON + GML only)
+  - Added `/diagnostics/wfs-health` endpoint to test all 16 state WFS/WMS endpoints
+  - Accept best-available polygon even if click point isn't perfectly inside
+  - Files changed: `services/cadastral.py`, `services/parcel_store.py`, `api/v1/cadastral.py`, `hooks/use-cadastral.ts`
 - **Production-readiness fixes** (deployment prep):
   - `config.py`: debug defaults to `false` (was hardcoded `true`)
   - `railway.toml`: start command activates venv (was missing)
@@ -76,12 +85,14 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - Full 100-issue audit completed (AUDIT.md)
 
 ### Known issues / next up
-- Git push failed from sandbox (403) — needs push from local machine
+- **Git push needed** — cadastral fix is local only, needs `git push` from local machine to deploy on Railway/Vercel
+- After deploy: hit `/api/v1/cadastral/diagnostics/wfs-health` to see which of 16 state WFS services are reachable from Railway
+- After deploy: test parcel selection in Chrome for Berlin, NRW, Bayern to confirm real parcels load
+- Some state WFS URLs may have moved (like Berlin did) — diagnostics endpoint will reveal which
 - Optimizer changes need real-world testing (run on actual parcel + compare before/after)
 - Validation needs to be run locally to find systematic generator issues
 - Rhino plugin code exists but is NOT YET COMPILED (needs VS2022 + .NET 4.8 + Rhino 8 SDK)
 - Financial model conversation started on Machine B but no details shared yet
-- Next priorities: deploy for testing, test against real parcels, fix any validation failures
 
 ## Preferences
 - Continue without asking questions when resuming from a session summary

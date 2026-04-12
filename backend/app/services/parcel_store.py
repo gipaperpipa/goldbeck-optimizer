@@ -241,7 +241,10 @@ async def get_parcels_in_radius(
         db_parcels = list(result.scalars().all())
 
     # Step 2: If we have fewer than 5 parcels, try WFS fetch
+    # Hard timeout of 20s to stay within Railway's ~30s response limit
     if len(db_parcels) < 5:
+        import asyncio
+
         logger.info(
             f"Only {len(db_parcels)} parcels in DB for ({lng:.5f}, {lat:.5f}) r={radius_m}m, "
             f"triggering WFS fetch..."
@@ -252,24 +255,18 @@ async def get_parcels_in_radius(
             if not state:
                 state = detect_state(lng, lat)
 
-            wfs_parcels = await get_parcels_in_bbox(
-                min_lng, min_lat, max_lng, max_lat, state=state
+            wfs_parcels = await asyncio.wait_for(
+                get_parcels_in_bbox(min_lng, min_lat, max_lng, max_lat, state=state),
+                timeout=15.0,
             )
 
             if wfs_parcels:
                 logger.info(f"WFS bbox returned {len(wfs_parcels)} parcels, storing...")
                 await store_many_parcels_from_wfs(wfs_parcels)
             else:
-                # Fallback: try single-point multi-source lookup (Nominatim, Overpass, etc.)
                 logger.warning(
-                    f"WFS bbox returned 0 parcels for ({lng:.5f}, {lat:.5f}), "
-                    f"trying single-point fallback..."
+                    f"WFS bbox returned 0 parcels for ({lng:.5f}, {lat:.5f}) in {state}"
                 )
-                from app.services.cadastral import get_parcel_geometry_at_point
-                center_parcel = await get_parcel_geometry_at_point(lng, lat, state)
-                if center_parcel and center_parcel.get("polygon_wgs84"):
-                    wfs_parcels = [center_parcel]
-                    await store_many_parcels_from_wfs(wfs_parcels)
 
             # Re-query DB to get stored parcels with IDs
             async with get_db() as session:
@@ -287,6 +284,10 @@ async def get_parcels_in_radius(
                 )
                 result = await session.execute(stmt)
                 db_parcels = list(result.scalars().all())
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"WFS fetch timed out (15s) for ({lng:.5f}, {lat:.5f}) in {state or 'unknown'}"
+            )
         except Exception as e:
             logger.error(f"WFS fetch failed: {e}", exc_info=True)
 
