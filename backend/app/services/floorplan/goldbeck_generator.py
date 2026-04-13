@@ -1193,7 +1193,10 @@ class GoldbeckGenerator(ConstructionSystem):
             min_bed1_w = math.ceil((15.0 / room_d) / C.GRID_UNIT) * C.GRID_UNIT
             bed_w = round(apt_w * max(0.25, min(0.55, prop)), 2)
             bed_w = max(bed_w, min_bed1_w)  # Enforce minimum bedroom size
+            # Clamp bedroom so living room still fits within apartment
+            bed_w = min(bed_w, apt_w - C.PARTITION_WALL - 1.0)
             liv_w = apt_w - bed_w - C.PARTITION_WALL
+            liv_w = max(liv_w, 1.0)  # Absolute minimum
 
             rooms.append(Room(
                 id=f"room_{_uid()}", room_type=RoomType.BEDROOM,
@@ -1232,8 +1235,26 @@ class GoldbeckGenerator(ConstructionSystem):
                 bed1_w = max(round(bed1_w * scale, 2), min_bed1_w)
                 bed2_w = max(round(max_bed_total - bed1_w, 2), min_bed_w)
 
-            liv_w = apt_w - bed1_w - bed2_w - 2 * C.PARTITION_WALL
-            liv_w = max(liv_w, 3.0)  # Ensure minimum living space
+            # HARD CLAMP: ensure rooms never exceed apartment boundary
+            # If minimums force overflow, shrink living room first, then bedrooms
+            total_rooms_w = bed1_w + bed2_w + 2 * C.PARTITION_WALL
+            liv_w = apt_w - total_rooms_w
+            if liv_w < min_liv_w:
+                # Not enough room — shrink bed2 to fit
+                bed2_w = apt_w - bed1_w - min_liv_w - 2 * C.PARTITION_WALL
+                if bed2_w < min_bed_w:
+                    # Still not enough — shrink bed1 too
+                    bed2_w = min_bed_w
+                    bed1_w = apt_w - bed2_w - min_liv_w - 2 * C.PARTITION_WALL
+                    bed1_w = max(bed1_w, min_bed_w)
+                liv_w = apt_w - bed1_w - bed2_w - 2 * C.PARTITION_WALL
+            liv_w = max(liv_w, 1.0)  # Absolute minimum so room exists
+
+            # Final safety: clamp all widths so total exactly equals apt_w
+            total_check = bed1_w + bed2_w + 2 * C.PARTITION_WALL + liv_w
+            if total_check > apt_w + 0.01:
+                overflow = total_check - apt_w
+                liv_w = max(1.0, liv_w - overflow)
 
             rooms.append(Room(
                 id=f"room_{_uid()}", room_type=RoomType.BEDROOM,
@@ -1282,6 +1303,10 @@ class GoldbeckGenerator(ConstructionSystem):
                 max_this_bed = remaining - min_liv_w - (num_beds - b - 1) * min_bed_w
                 if max_this_bed > 0:
                     bed_w = min(bed_w, max_this_bed)
+                # Hard clamp: bedroom must not extend past apartment boundary
+                bed_w = min(bed_w, x1 - x_cursor)
+                if bed_w < 1.0:
+                    break  # Not enough room for more bedrooms
 
                 rooms.append(Room(
                     id=f"room_{_uid()}", room_type=RoomType.BEDROOM,
@@ -1291,7 +1316,7 @@ class GoldbeckGenerator(ConstructionSystem):
                 ))
                 x_cursor += bed_w + C.PARTITION_WALL
 
-            liv_w = x1 - x_cursor
+            liv_w = max(0, x1 - x_cursor)
             if liv_w > 3.0:
                 rooms.append(Room(
                     id=f"room_{_uid()}", room_type=RoomType.LIVING,
@@ -1329,6 +1354,24 @@ class GoldbeckGenerator(ConstructionSystem):
             area_sqm=_rect_area(balcony_w, balcony_d),
             label="Balcony", apartment_id=apt_id,
         ))
+
+        # === SAFETY CLAMP: ensure NO room polygon exceeds apartment boundary ===
+        # This catches any edge case where minimum sizes, rounding, or partition
+        # wall accumulation push rooms beyond the bounding box.
+        for room in rooms:
+            if room.room_type == RoomType.BALCONY:
+                continue  # Balconies are intentionally outside the envelope
+            clamped_poly = []
+            for pt in room.polygon:
+                cx = max(x0, min(x1, pt.x))
+                cy = max(bbox["y_start"], min(bbox["y_end"], pt.y))
+                clamped_poly.append(Point2D(x=round(cx, 3), y=round(cy, 3)))
+            room.polygon = clamped_poly
+            # Recalculate area from clamped polygon
+            if len(clamped_poly) == 4:
+                cw = max(p.x for p in clamped_poly) - min(p.x for p in clamped_poly)
+                ch = max(p.y for p in clamped_poly) - min(p.y for p in clamped_poly)
+                room.area_sqm = round(cw * ch, 2)
 
         return rooms, bath_dims, entrance_door_id
 
@@ -1562,11 +1605,27 @@ class GoldbeckGenerator(ConstructionSystem):
                                 placed_windows.append((center_x, max(0.625, win_w)))
 
                         for wx, ww in placed_windows:
+                            # Clamp window to building envelope
+                            half_w = ww / 2
+                            # Ensure window doesn't protrude past building edges
+                            wx = max(half_w + C.MIN_EDGE_TO_OPENING, wx)
+                            wx = min(length - half_w - C.MIN_EDGE_TO_OPENING, wx)
+                            # Also clamp to room boundaries
+                            wx = max(min_x + half_w + C.MIN_EDGE_TO_OPENING, wx)
+                            wx = min(max_x - half_w - C.MIN_EDGE_TO_OPENING, wx)
+                            # Skip window if room is too narrow to fit it
+                            if max_x - min_x < ww + 2 * C.MIN_EDGE_TO_OPENING:
+                                # Try a smaller window
+                                ww = max(0.625, max_x - min_x - 2 * C.MIN_EDGE_TO_OPENING)
+                                half_w = ww / 2
+                                wx = (min_x + max_x) / 2
+                                if ww < 0.5:
+                                    continue  # Room too narrow for any window
                             windows.append(WindowPlacement(
                                 id=f"win_{_uid()}",
                                 position=Point2D(x=round(wx, 3), y=round(win_y, 3)),
                                 wall_id="south_wall" if on_south else "north_wall",
-                                width_m=ww,
+                                width_m=round(ww, 3),
                                 height_m=win_h,
                                 sill_height_m=sill_h,
                                 is_floor_to_ceiling=is_ftc,
