@@ -20,7 +20,7 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 from app.models.floorplan import (
-    FloorPlanRequest, BuildingFloorPlans, FloorPlanVariant,
+    FloorPlan, FloorPlanRequest, BuildingFloorPlans, FloorPlanVariant,
     FloorPlanWeights, AccessType, RoomType,
 )
 from app.services.floorplan.registry import get_system
@@ -37,6 +37,8 @@ SERVICE_ORDERS = ["hall_bath_kitchen", "kitchen_bath_hall", "hall_kitchen_bath"]
 
 # Number of raster preference values (enough for ~20 bays in longest buildings)
 NUM_RASTER_PREFS = 24
+# Maximum floors with independent variation genes (ground floor uses base genes)
+MAX_FLOOR_GENES = 8
 
 
 class FloorPlanChromosome:
@@ -76,6 +78,17 @@ class FloorPlanChromosome:
         # Dimension offsets: allow ±3 grid units for meaningful width/depth variation
         self.dim_offset: float = random.uniform(-3.0, 3.0)
         self.depth_offset: float = random.uniform(-3.0, 3.0)
+        # Per-floor variation genes (for per-floor independent generation)
+        # Each floor can have a different allocation order and room proportion bias
+        self.floor_allocation_orders: list[str] = [
+            random.choice(ALLOCATION_ORDERS) for _ in range(MAX_FLOOR_GENES)
+        ]
+        self.floor_service_orders: list[str] = [
+            random.choice(SERVICE_ORDERS) for _ in range(MAX_FLOOR_GENES)
+        ]
+        self.floor_proportion_offsets: list[float] = [
+            random.uniform(-0.10, 0.10) for _ in range(MAX_FLOOR_GENES)
+        ]
         # Evaluation results
         self.fitness: float = 0.0
         self.raw_fitness: float = 0.0
@@ -95,6 +108,9 @@ class FloorPlanChromosome:
         c.bathroom_preference = self.bathroom_preference
         c.dim_offset = self.dim_offset
         c.depth_offset = self.depth_offset
+        c.floor_allocation_orders = list(self.floor_allocation_orders)
+        c.floor_service_orders = list(self.floor_service_orders)
+        c.floor_proportion_offsets = list(self.floor_proportion_offsets)
         c.fitness = self.fitness
         c.raw_fitness = self.raw_fitness
         c.fitness_breakdown = dict(self.fitness_breakdown)
@@ -102,7 +118,32 @@ class FloorPlanChromosome:
         return c
 
     def to_variation_params(self) -> dict:
-        """Convert chromosome to variation_params dict for the generator."""
+        """Convert chromosome to variation_params dict for the generator.
+
+        Includes ``floor_variation_params`` for per-floor independent
+        generation.  Floor 0 (ground) uses the base genes; floors 1+
+        get their own allocation order and room proportion bias.
+        """
+        # Build per-floor overrides for floors 1..MAX_FLOOR_GENES
+        floor_vp: dict[int, dict] = {}
+        for i in range(MAX_FLOOR_GENES):
+            floor_idx = i + 1  # floor 0 uses base genes
+            # Only include override if it differs from base (saves work in generator)
+            fvp: dict = {}
+            if self.floor_allocation_orders[i] != self.allocation_order:
+                fvp["allocation_order"] = self.floor_allocation_orders[i]
+            if self.floor_service_orders[i] != self.service_layout_order:
+                fvp["service_layout_order"] = self.floor_service_orders[i]
+            offset = self.floor_proportion_offsets[i]
+            if abs(offset) > 0.02:
+                # Apply offset to base room_proportions
+                fvp["room_proportions"] = [
+                    max(0.20, min(0.65, p + offset))
+                    for p in self.room_proportions
+                ]
+            if fvp:
+                floor_vp[floor_idx] = fvp
+
         return {
             "raster_preferences": self.raster_preferences,
             "depth_config_index": self.depth_config_index,
@@ -111,6 +152,7 @@ class FloorPlanChromosome:
             "room_proportions": self.room_proportions,
             "staircase_count_delta": self.staircase_count_delta,
             "staircase_position_offset": self.staircase_position_offset,
+            "floor_variation_params": floor_vp,
         }
 
     @staticmethod
@@ -226,6 +268,16 @@ def _mutate(
     if random.random() < effective_rate:
         c.depth_offset = max(-3.0, min(3.0, c.depth_offset + random.gauss(0, 0.8 * sigma_scale)))
 
+    # Mutate per-floor genes
+    for i in range(MAX_FLOOR_GENES):
+        if random.random() < effective_rate:
+            c.floor_allocation_orders[i] = random.choice(ALLOCATION_ORDERS)
+        if random.random() < effective_rate:
+            c.floor_service_orders[i] = random.choice(SERVICE_ORDERS)
+        if random.random() < effective_rate:
+            c.floor_proportion_offsets[i] = max(-0.10, min(0.10,
+                c.floor_proportion_offsets[i] + random.gauss(0, 0.04 * sigma_scale)))
+
     for i in range(len(c.room_proportions)):
         if random.random() < effective_rate:
             c.room_proportions[i] = max(0.20, min(0.65,
@@ -253,6 +305,18 @@ def _crossover(a: FloorPlanChromosome, b: FloorPlanChromosome) -> FloorPlanChrom
     c.bathroom_preference = pick(a.bathroom_preference, b.bathroom_preference)
     c.dim_offset = pick(a.dim_offset, b.dim_offset)
     c.depth_offset = pick(a.depth_offset, b.depth_offset)
+    c.floor_allocation_orders = [
+        pick(a.floor_allocation_orders[i], b.floor_allocation_orders[i])
+        for i in range(MAX_FLOOR_GENES)
+    ]
+    c.floor_service_orders = [
+        pick(a.floor_service_orders[i], b.floor_service_orders[i])
+        for i in range(MAX_FLOOR_GENES)
+    ]
+    c.floor_proportion_offsets = [
+        pick(a.floor_proportion_offsets[i], b.floor_proportion_offsets[i])
+        for i in range(MAX_FLOOR_GENES)
+    ]
     c.room_proportions = [
         pick(a.room_proportions[i], b.room_proportions[i])
         for i in range(min(len(a.room_proportions), len(b.room_proportions)))
@@ -273,72 +337,40 @@ def _tournament_select(population: list[FloorPlanChromosome], k: int = 3) -> Flo
 # 10-Criterion Fitness Function
 # ============================================================
 
-def _evaluate_floor_plan(
+def _evaluate_single_floor(
+    floor: FloorPlan,
     plans: BuildingFloorPlans,
     request: FloorPlanRequest,
     weights: FloorPlanWeights,
-) -> tuple[float, dict[str, float]]:
-    """
-    Multi-criteria fitness evaluation. Returns (total_score, breakdown_dict).
-    Each criterion scores 0.0 to 10.0.
-
-    Efficiency group:
-      1. net_to_gross     - net usable area / gross area
-      2. construction_regularity - uniformity of bay widths
-
-    Livability group:
-      3. room_aspect_ratios - penalize rooms narrower than 1:3
-      4. natural_light      - % habitable rooms touching exterior wall
-      5. noise_separation   - bedrooms far from staircases
-
-    Revenue group:
-      6. unit_mix_match    - closeness to requested unit mix
-      7. room_size_compliance - rooms within Goldbeck spec areas
-      8. area_balance      - same-type apartments have similar areas
-
-    Compliance group:
-      9.  fire_egress      - all apartments within 35m of staircase
-      10. barrier_free     - adequate barrier-free bathroom coverage
-    """
-    breakdown: dict[str, float] = {}
-
-    if not plans.floor_plans:
-        return 0.0, {}
-
-    floor = plans.floor_plans[0]
-    grid = plans.structural_grid
+) -> dict[str, float]:
+    """Evaluate a single floor plan and return per-criterion scores (0-10)."""
+    fb: dict[str, float] = {}
+    grid = floor.structural_grid
     depth = grid.building_depth_m
 
     # --- 1. Net-to-gross ratio ---
     if floor.gross_area_sqm > 0:
         ratio = floor.net_area_sqm / floor.gross_area_sqm
-        breakdown["net_to_gross"] = max(0.0, min(10.0, (ratio - 0.40) / 0.45 * 10.0))
+        fb["net_to_gross"] = max(0.0, min(10.0, (ratio - 0.40) / 0.45 * 10.0))
     else:
-        breakdown["net_to_gross"] = 0.0
+        fb["net_to_gross"] = 0.0
 
     # --- 2. Construction regularity ---
-    # NOTE: Reduced impact — uniform bays (6.25+6.25) are not inherently better
-    # than mixed bays (5.00+6.25). All Goldbeck rasters are valid.
     bays = grid.bay_widths
     if len(bays) >= 2:
         mean_bay = sum(bays) / len(bays)
         std_dev = (sum((b - mean_bay) ** 2 for b in bays) / len(bays)) ** 0.5
         cv = std_dev / mean_bay if mean_bay > 0 else 0
-        # All valid Goldbeck rasters score well; moderate penalty for extreme variation
-        breakdown["construction_regularity"] = max(0.0, min(10.0, 8.0 - cv * 8.0))
+        fb["construction_regularity"] = max(0.0, min(10.0, 8.0 - cv * 8.0))
     else:
-        breakdown["construction_regularity"] = 7.0
+        fb["construction_regularity"] = 7.0
 
     # --- 2b. Circulation efficiency ---
-    # Penalize excessive hallway/corridor area. Hallways, corridors, staircases,
-    # and elevator shafts are non-sellable/non-rentable "dead" area. The target
-    # is <15% of gross floor area; anything above 25% is heavily penalized.
     circulation_area = 0.0
     for apt in floor.apartments:
         for room in apt.rooms:
             if room.room_type in (RoomType.HALLWAY, RoomType.CORRIDOR):
                 circulation_area += room.area_sqm
-    # Add corridor/staircase common areas (not inside apartments)
     for room in floor.rooms:
         if room.room_type in (RoomType.CORRIDOR, RoomType.STAIRCASE, RoomType.ELEVATOR, RoomType.SHAFT):
             if room.apartment_id is None or room.apartment_id == "":
@@ -346,17 +378,16 @@ def _evaluate_floor_plan(
 
     if floor.gross_area_sqm > 0:
         circ_pct = circulation_area / floor.gross_area_sqm
-        # 0-12% → score 10, 12-18% → 6-10, 18-30% → 0-6
         if circ_pct <= 0.12:
-            breakdown["circulation_efficiency"] = 10.0
+            fb["circulation_efficiency"] = 10.0
         elif circ_pct <= 0.18:
-            breakdown["circulation_efficiency"] = 6.0 + (0.18 - circ_pct) / 0.06 * 4.0
+            fb["circulation_efficiency"] = 6.0 + (0.18 - circ_pct) / 0.06 * 4.0
         elif circ_pct <= 0.30:
-            breakdown["circulation_efficiency"] = max(0.0, 6.0 - (circ_pct - 0.18) / 0.12 * 6.0)
+            fb["circulation_efficiency"] = max(0.0, 6.0 - (circ_pct - 0.18) / 0.12 * 6.0)
         else:
-            breakdown["circulation_efficiency"] = 0.0
+            fb["circulation_efficiency"] = 0.0
     else:
-        breakdown["circulation_efficiency"] = 5.0
+        fb["circulation_efficiency"] = 5.0
 
     # --- 3. Room aspect ratios ---
     aspect_scores = []
@@ -377,7 +408,7 @@ def _evaluate_floor_plan(
                             aspect_scores.append(5.0 + (ratio - 0.33) / 0.17 * 5.0)
                         else:
                             aspect_scores.append(max(0.0, ratio / 0.33 * 5.0))
-    breakdown["room_aspect_ratios"] = (
+    fb["room_aspect_ratios"] = (
         sum(aspect_scores) / len(aspect_scores) if aspect_scores else 5.0
     )
 
@@ -398,7 +429,7 @@ def _evaluate_floor_plan(
                     )
                     if on_exterior:
                         lit_count += 1
-    breakdown["natural_light"] = (
+    fb["natural_light"] = (
         (lit_count / habitable_count * 10.0) if habitable_count > 0 else 5.0
     )
 
@@ -424,11 +455,11 @@ def _evaluate_floor_plan(
 
         if bedroom_distances:
             avg_dist = sum(bedroom_distances) / len(bedroom_distances)
-            breakdown["noise_separation"] = min(10.0, avg_dist / 6.0 * 10.0)
+            fb["noise_separation"] = min(10.0, avg_dist / 6.0 * 10.0)
         else:
-            breakdown["noise_separation"] = 5.0
+            fb["noise_separation"] = 5.0
     else:
-        breakdown["noise_separation"] = 5.0
+        fb["noise_separation"] = 5.0
 
     # --- 6. Unit mix match ---
     if request.unit_mix and "entries" in request.unit_mix:
@@ -451,13 +482,13 @@ def _evaluate_floor_plan(
                     match_scores.append(max(0, 1.0 - abs(actual - target) / target))
                 else:
                     match_scores.append(1.0 if actual == 0 else 0.5)
-            breakdown["unit_mix_match"] = (
+            fb["unit_mix_match"] = (
                 sum(match_scores) / len(match_scores) * 10.0 if match_scores else 7.0
             )
         else:
-            breakdown["unit_mix_match"] = 7.0
+            fb["unit_mix_match"] = 7.0
     else:
-        breakdown["unit_mix_match"] = 7.0
+        fb["unit_mix_match"] = 7.0
 
     # --- 7. Room size compliance ---
     compliant = 0.0
@@ -476,11 +507,11 @@ def _evaluate_floor_plan(
             compliant += max(0.6, 1.0 - deviation * 0.5)
         else:
             if area < min_area:
-                ratio = area / min_area
+                r = area / min_area
             else:
-                ratio = max_area / area
-            compliant += max(0.1, ratio * 0.5)
-    breakdown["room_size_compliance"] = (
+                r = max_area / area
+            compliant += max(0.1, r * 0.5)
+    fb["room_size_compliance"] = (
         (compliant / total_apts * 10.0) if total_apts > 0 else 5.0
     )
 
@@ -501,7 +532,7 @@ def _evaluate_floor_plan(
                 balance_scores.append(5.0)
         else:
             balance_scores.append(8.0)
-    breakdown["area_balance"] = (
+    fb["area_balance"] = (
         sum(balance_scores) / len(balance_scores) if balance_scores else 5.0
     )
 
@@ -526,11 +557,11 @@ def _evaluate_floor_plan(
                 if min_dist > C.MAX_TRAVEL_DISTANCE:
                     violations += 1
 
-        breakdown["fire_egress"] = (
+        fb["fire_egress"] = (
             max(0.0, 10.0 - violations * 3.0) if total_apts > 0 else 10.0
         )
     else:
-        breakdown["fire_egress"] = 5.0
+        fb["fire_egress"] = 5.0
 
     # --- 10. Barrier-free compliance ---
     barrier_free_count = 0
@@ -544,12 +575,11 @@ def _evaluate_floor_plan(
 
     if total_bath_count > 0:
         bf_ratio = barrier_free_count / total_bath_count
-        breakdown["barrier_free"] = min(10.0, bf_ratio * 12.5)
+        fb["barrier_free"] = min(10.0, bf_ratio * 12.5)
     else:
-        breakdown["barrier_free"] = 5.0
+        fb["barrier_free"] = 5.0
 
-    # --- 11. Dimension conformance ---
-    # Penalize floor plans whose dimensions don't match the requested footprint
+    # --- 11. Dimension conformance (building-level, same for all floors) ---
     actual_width = plans.building_width_m
     actual_depth = plans.building_depth_m
     requested_width = request.building_width_m
@@ -557,22 +587,14 @@ def _evaluate_floor_plan(
     width_deviation = abs(actual_width - requested_width) / max(requested_width, 1.0)
     depth_deviation = abs(actual_depth - requested_depth) / max(requested_depth, 1.0)
     avg_deviation = (width_deviation + depth_deviation) / 2
-    # Score: 10.0 if exact match, gentle decay for small deviations (≤5%),
-    # steeper penalty above 10%. This allows the optimizer to explore ±1-2
-    # grid units without being crushed, while still penalizing large changes.
     if avg_deviation <= 0.05:
-        breakdown["dimension_conformance"] = 10.0 - avg_deviation * 20.0  # 10→9 for 5%
+        fb["dimension_conformance"] = 10.0 - avg_deviation * 20.0
     elif avg_deviation <= 0.15:
-        breakdown["dimension_conformance"] = 9.0 - (avg_deviation - 0.05) * 50.0  # 9→4 for 15%
+        fb["dimension_conformance"] = 9.0 - (avg_deviation - 0.05) * 50.0
     else:
-        breakdown["dimension_conformance"] = max(0.0, 4.0 - (avg_deviation - 0.15) * 20.0)
+        fb["dimension_conformance"] = max(0.0, 4.0 - (avg_deviation - 0.15) * 20.0)
 
     # --- 12. Apartment access compliance ---
-    # Validates architectural rules:
-    #   - Each apartment has exactly one entrance door
-    #   - Entrance door connects to hallway room
-    #   - Upper floors: entrance faces corridor/gallery (not exterior)
-    #   - Ground floor: entrance can face exterior (direct outside access)
     access_violations = 0
     for apt in floor.apartments:
         has_hallway = any(r.room_type == RoomType.HALLWAY for r in apt.rooms)
@@ -582,39 +604,59 @@ def _evaluate_floor_plan(
         if not has_entrance:
             access_violations += 1
 
-    # Check that entrance doors exist in the door list
     entrance_door_ids = {d.id for d in floor.doors if d.is_entrance}
     for apt in floor.apartments:
         if apt.entrance_door_id and apt.entrance_door_id not in entrance_door_ids:
             access_violations += 1
 
     if total_apts > 0:
-        violation_ratio = access_violations / (total_apts * 3)  # 3 checks per apt
-        breakdown["access_compliance"] = max(0.0, 10.0 - violation_ratio * 30.0)
+        violation_ratio = access_violations / (total_apts * 3)
+        fb["access_compliance"] = max(0.0, 10.0 - violation_ratio * 30.0)
     else:
-        breakdown["access_compliance"] = 5.0
+        fb["access_compliance"] = 5.0
 
-    # === Advanced quality criteria (5 new architectural quality scores) ===
-    # These evaluate deeper architectural quality: room connectivity,
-    # furniture fit, daylight, kitchen-living relationship, orientation.
+    # === Advanced quality criteria ===
     quality = evaluate_quality(plans, building_rotation_deg=request.rotation_deg)
-    breakdown["connectivity"] = quality["connectivity"]
-    breakdown["furniture"] = quality["furniture"]
-    breakdown["daylight_quality"] = quality["daylight"]
-    breakdown["kitchen_living"] = quality["kitchen_living"]
-    breakdown["orientation"] = quality["orientation"]
+    fb["connectivity"] = quality["connectivity"]
+    fb["furniture"] = quality["furniture"]
+    fb["daylight_quality"] = quality["daylight"]
+    fb["kitchen_living"] = quality["kitchen_living"]
+    fb["orientation"] = quality["orientation"]
+
+    return fb
+
+
+def _evaluate_floor_plan(
+    plans: BuildingFloorPlans,
+    request: FloorPlanRequest,
+    weights: FloorPlanWeights,
+) -> tuple[float, dict[str, float]]:
+    """Multi-criteria fitness evaluation across ALL floors.
+
+    Returns (total_score, breakdown_dict).  Each criterion scores 0-10,
+    averaged across all floors so the optimizer rewards buildings where
+    every storey is good, not just the first one.
+    """
+    if not plans.floor_plans:
+        return 0.0, {}
+
+    # Evaluate each floor independently
+    all_fb = [_evaluate_single_floor(f, plans, request, weights) for f in plans.floor_plans]
+
+    # Average all criteria across floors
+    breakdown: dict[str, float] = {}
+    all_keys = all_fb[0].keys()
+    for key in all_keys:
+        vals = [fb[key] for fb in all_fb if key in fb]
+        breakdown[key] = sum(vals) / len(vals) if vals else 5.0
 
     # === Weighted combination ===
-    # Efficiency now includes circulation penalty — hallways are dead area
     efficiency_score = (
         breakdown["net_to_gross"] * 1.0 +
         breakdown["construction_regularity"] * 0.5 +
-        breakdown["circulation_efficiency"] * 1.5  # heavy weight: minimize hallways
+        breakdown["circulation_efficiency"] * 1.5
     ) / 3.0
 
-    # Enhanced livability: 8 criteria with relative weights.
-    # Normalized by sum of weights so each point of improvement
-    # in any criterion contributes proportionally to the group score.
     _liv_w = {
         "room_aspect_ratios": 0.8,
         "natural_light": 0.5,
@@ -625,7 +667,7 @@ def _evaluate_floor_plan(
         "kitchen_living": 1.0,
         "orientation": 0.8,
     }
-    _liv_sum = sum(_liv_w.values())  # 7.0
+    _liv_sum = sum(_liv_w.values())
     livability_score = sum(
         breakdown[k] * w for k, w in _liv_w.items()
     ) / _liv_sum

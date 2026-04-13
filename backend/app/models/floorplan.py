@@ -63,6 +63,12 @@ class ApartmentType(str, Enum):
     FIVE_ROOM = "5_room"
 
 
+class FloorType(str, Enum):
+    GROUND = "ground"                  # Erdgeschoss — barrier-free priority, exterior access
+    STANDARD = "standard"              # Regelgeschoss — typical residential floor
+    STAFFELGESCHOSS = "staffelgeschoss"  # Setback top floor — reduced footprint
+
+
 # --- Geometry Primitives ---
 
 class Point2D(BaseModel):
@@ -101,6 +107,21 @@ class WindowPlacement(BaseModel):
 
 
 # --- Layout Elements ---
+
+class FloorConfig(BaseModel):
+    """Per-floor configuration for independent generation.
+
+    Standard floors share the structural grid but can have different
+    apartment allocations, room proportions, and unit mixes.
+    Staffelgeschoss gets its own reduced grid.
+    """
+    floor_index: int
+    floor_type: FloorType = FloorType.STANDARD
+    unit_mix_override: Optional[dict] = None  # Per-floor unit mix (same format as FloorPlanRequest.unit_mix)
+    allocation_order_override: Optional[str] = None  # "large_first" | "small_first" | "mixed"
+    force_barrier_free: bool = False  # Ground floor: all units barrier-free
+    setback_m: Optional[float] = None  # Staffelgeschoss only: setback from building edge
+
 
 class Room(BaseModel):
     id: str
@@ -165,6 +186,7 @@ class StructuralGrid(BaseModel):
 class FloorPlan(BaseModel):
     """Complete floor plan for one story of a building."""
     floor_index: int            # 0 = ground floor
+    floor_type: FloorType = FloorType.STANDARD
     structural_grid: StructuralGrid
     walls: list[WallSegment]
     doors: list[DoorPlacement]
@@ -246,6 +268,10 @@ class FloorPlanRequest(BaseModel):
     population_size: int = Field(default=1, ge=1, le=200, description="Individuals per generation")
     weights: Optional[FloorPlanWeights] = None
     use_ai_generation: bool = False  # Enable AI-assisted generation with enhanced parameters
+    # Per-floor independent generation
+    enable_per_floor: bool = True  # Generate each floor independently (allocation + rooms vary)
+    floor_configs: Optional[list[FloorConfig]] = None  # Optional per-floor overrides
+    ground_floor_barrier_free: bool = True  # Force barrier-free on ground floor (BauO NRW §50)
     # Staffelgeschoss (setback top floor — does not count as Vollgeschoss)
     enable_staffelgeschoss: bool = False
     staffelgeschoss_setback_m: float = 2.0  # setback from building edge on each side

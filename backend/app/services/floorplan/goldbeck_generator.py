@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 from app.models.floorplan import (
     AccessType, ApartmentType, BathroomType, StaircaseType,
-    WallType, RoomType,
+    WallType, RoomType, FloorType, FloorConfig,
     Point2D, WallSegment, DoorPlacement, WindowPlacement,
     Room, BathroomUnit, Apartment, StaircaseUnit,
     StructuralGrid, FloorPlan, BuildingFloorPlans,
@@ -95,19 +95,20 @@ class GoldbeckGenerator(ConstructionSystem):
     ) -> BuildingFloorPlans:
         """Generate complete floor plans for a building via the 7-phase pipeline.
 
-        Phases:
-            1. Snap dimensions to the Goldbeck 62.5 cm grid
-            2. Select access type (Ganghaus / Laubengang / Spaenner)
-            3. Build the structural grid (bay widths, zone depths)
-            4. Place staircases at grid-legal positions
-            5. Allocate apartment slots per zone
-            6. Generate rooms inside each apartment (service strip → living)
-            7. Generate architectural elements (walls, doors, windows)
+        Phases 1-4 (structural) are shared across all regular floors to ensure
+        Schottwand continuity (bearing walls, staircases, TGA shafts stack
+        vertically).  Phases 5-7 (apartment allocation, rooms, elements) run
+        independently per floor when ``enable_per_floor`` is True, giving each
+        story its own unit mix, room proportions, and door placement.
+
+        Ground floor (index 0) forces barrier-free units and exterior entrance
+        doors.  Staffelgeschoss gets its own reduced structural grid.
 
         Args:
             request: Building dimensions, stories, unit mix, and overrides.
             variation_params: Optimizer knobs — bay strategy, allocation order,
-                room proportions, staircase tweaks, etc.
+                room proportions, staircase tweaks, etc.  Per-floor overrides
+                via ``floor_variation_params`` dict keyed by floor index.
 
         Returns:
             BuildingFloorPlans with one FloorPlan per storey, plus summary.
@@ -122,6 +123,17 @@ class GoldbeckGenerator(ConstructionSystem):
         staircase_position_offset = vp.get("staircase_position_offset", 0.0)
         depth_config_index = vp.get("depth_config_index", -1)
 
+        # Per-floor variation overrides from optimizer chromosome
+        floor_vp: dict[int, dict] = vp.get("floor_variation_params", {})
+
+        # Build FloorConfig lookup from request (or defaults)
+        floor_configs: dict[int, FloorConfig] = {}
+        if request.floor_configs:
+            for fc in request.floor_configs:
+                floor_configs[fc.floor_index] = fc
+
+        # ── Shared structural phases (1-4) ─────────────────────
+
         # Phase 1: Convert and snap to grid
         dims = self._phase1_snap_to_grid(request)
 
@@ -134,73 +146,13 @@ class GoldbeckGenerator(ConstructionSystem):
             bay_strategy, raster_preferences, depth_config_index,
         )
 
-        # Phase 4: Place staircases
+        # Phase 4: Place staircases (shared — must stack vertically)
         staircases = self._phase4_place_staircases(
             grid, access_type, staircase_count_delta, staircase_position_offset
         )
 
-        # Phase 5: Allocate apartments to bays
-        allocations = self._phase5_allocate_apartments(
-            grid, staircases, request, access_type, allocation_order
-        )
+        # ── Determine floor count and types ────────────────────
 
-        # Phase 6: Generate room layouts
-        apartments, all_rooms = self._phase6_generate_rooms(
-            allocations, grid, access_type, request.prefer_barrier_free,
-            room_proportions, service_layout_order,
-        )
-
-        # Phase 7: Generate walls, doors, windows
-        walls, doors, windows, corridor_rooms = self._phase7_generate_elements(
-            grid, apartments, staircases, access_type
-        )
-
-        # Add corridor/staircase rooms to all_rooms
-        all_rooms.extend(corridor_rooms)
-
-        # Build floor plans — ground floor may differ from upper floors
-        # (ground floor apartments can have direct exterior access)
-        gross_area = dims["length_m"] * dims["depth_m"]
-        net_area = sum(a.total_area_sqm for a in apartments)
-
-        # Upper floor plan (standard: entrance doors face corridor/gallery)
-        upper_floor = FloorPlan(
-            floor_index=1,
-            structural_grid=grid,
-            walls=walls,
-            doors=doors,
-            windows=windows,
-            apartments=apartments,
-            staircases=staircases,
-            rooms=all_rooms,
-            access_type=access_type,
-            gross_area_sqm=round(gross_area, 2),
-            net_area_sqm=round(net_area, 2),
-            num_apartments=len(apartments),
-        )
-
-        # Ground floor plan — re-generate doors with exterior access
-        gf_doors = self._generate_ground_floor_doors(
-            apartments, grid, access_type
-        )
-        # Keep all non-entrance doors from upper floor, replace entrance doors
-        non_entrance_doors = [d for d in doors if not d.is_entrance]
-        ground_floor = FloorPlan(
-            floor_index=0,
-            structural_grid=grid,
-            walls=walls,
-            doors=non_entrance_doors + gf_doors,
-            windows=windows,
-            apartments=apartments,
-            staircases=staircases,
-            rooms=all_rooms,
-            access_type=access_type,
-            gross_area_sqm=round(gross_area, 2),
-            net_area_sqm=round(net_area, 2),
-            num_apartments=len(apartments),
-        )
-
-        floor_plans = [ground_floor]
         num_regular = request.stories
         staffelgeschoss_enabled = getattr(request, "enable_staffelgeschoss", False)
         staffelgeschoss_setback = getattr(request, "staffelgeschoss_setback_m", 2.0)
@@ -209,45 +161,137 @@ class GoldbeckGenerator(ConstructionSystem):
         if has_staffel:
             num_regular = request.stories - 1  # last story is Staffelgeschoss
 
-        for i in range(1, num_regular):
-            fp = upper_floor.model_copy(deep=True)
-            fp.floor_index = i
-            floor_plans.append(fp)
+        enable_per_floor = getattr(request, "enable_per_floor", True)
+        gross_area = dims["length_m"] * dims["depth_m"]
 
-        # Staffelgeschoss: generate reduced top floor
-        staffel_apts = []
+        # ── Per-floor independent generation (phases 5-7) ──────
+
+        floor_plans: list[FloorPlan] = []
+        full_summary: dict[str, int] = {}
+        total_apts = 0
+
+        # Generate a single reference layout for cloning when per-floor is off
+        ref_floor = None
+
+        for floor_idx in range(num_regular):
+            is_ground = (floor_idx == 0)
+            floor_type = FloorType.GROUND if is_ground else FloorType.STANDARD
+
+            # Resolve per-floor config
+            fc = floor_configs.get(floor_idx)
+
+            # Determine per-floor variation params
+            fvp_alloc = allocation_order
+            fvp_props = room_proportions
+            fvp_service = service_layout_order
+            fvp_barrier_free = request.prefer_barrier_free
+
+            if fc:
+                if fc.allocation_order_override:
+                    fvp_alloc = fc.allocation_order_override
+                if fc.force_barrier_free:
+                    fvp_barrier_free = True
+
+            # Ground floor: force barrier-free (BauO NRW §50)
+            if is_ground and getattr(request, "ground_floor_barrier_free", True):
+                fvp_barrier_free = True
+
+            # Per-floor optimizer overrides (from chromosome)
+            f_overrides = floor_vp.get(floor_idx, {})
+            if f_overrides.get("allocation_order"):
+                fvp_alloc = f_overrides["allocation_order"]
+            if f_overrides.get("room_proportions"):
+                fvp_props = f_overrides["room_proportions"]
+            if f_overrides.get("service_layout_order"):
+                fvp_service = f_overrides["service_layout_order"]
+
+            # Decide: independent generation or clone reference
+            if enable_per_floor or ref_floor is None:
+                # Phase 5: Allocate apartments to bays
+                allocations = self._phase5_allocate_apartments(
+                    grid, staircases, request, access_type, fvp_alloc
+                )
+
+                # Phase 6: Generate room layouts
+                apartments, all_rooms = self._phase6_generate_rooms(
+                    allocations, grid, access_type, fvp_barrier_free,
+                    fvp_props, fvp_service,
+                )
+
+                # Phase 7: Generate walls, doors, windows
+                walls, doors, windows, corridor_rooms = self._phase7_generate_elements(
+                    grid, apartments, staircases, access_type
+                )
+                all_rooms.extend(corridor_rooms)
+
+                # Ground floor: replace entrance doors with exterior access
+                if is_ground:
+                    gf_doors = self._generate_ground_floor_doors(
+                        apartments, grid, access_type
+                    )
+                    non_entrance_doors = [d for d in doors if not d.is_entrance]
+                    doors = non_entrance_doors + gf_doors
+
+                net_area = sum(a.total_area_sqm for a in apartments)
+
+                fp = FloorPlan(
+                    floor_index=floor_idx,
+                    floor_type=floor_type,
+                    structural_grid=grid,
+                    walls=walls,
+                    doors=doors,
+                    windows=windows,
+                    apartments=apartments,
+                    staircases=staircases,
+                    rooms=all_rooms,
+                    access_type=access_type,
+                    gross_area_sqm=round(gross_area, 2),
+                    net_area_sqm=round(net_area, 2),
+                    num_apartments=len(apartments),
+                )
+
+                if ref_floor is None:
+                    ref_floor = fp
+
+                floor_plans.append(fp)
+            else:
+                # Clone reference floor (per-floor disabled, not ground floor)
+                fp = ref_floor.model_copy(deep=True)
+                fp.floor_index = floor_idx
+                fp.floor_type = floor_type
+                floor_plans.append(fp)
+
+            # Accumulate apartment summary
+            for apt in floor_plans[-1].apartments:
+                key = apt.apartment_type.value
+                full_summary[key] = full_summary.get(key, 0) + 1
+            total_apts += floor_plans[-1].num_apartments
+
+        # ── Staffelgeschoss: independent reduced top floor ─────
+
         if has_staffel:
             staffel_fp = self._generate_staffelgeschoss(
                 request, dims, access_type, vp,
                 staffelgeschoss_setback, num_regular,
             )
             if staffel_fp is not None:
+                staffel_fp.floor_type = FloorType.STAFFELGESCHOSS
                 floor_plans.append(staffel_fp)
-                staffel_apts = staffel_fp.apartments
+                for apt in staffel_fp.apartments:
+                    key = apt.apartment_type.value
+                    full_summary[key] = full_summary.get(key, 0) + 1
+                total_apts += staffel_fp.num_apartments
             else:
-                # Fallback: use regular floor plan for top floor too
-                fp = upper_floor.model_copy(deep=True)
-                fp.floor_index = num_regular
-                floor_plans.append(fp)
-                has_staffel = False  # reset flag
-
-        # Apartment summary
-        summary: dict[str, int] = {}
-        for apt in apartments:
-            key = apt.apartment_type.value
-            summary[key] = summary.get(key, 0) + 1
-
-        # Total apartments: regular floors + Staffelgeschoss floor
-        regular_total = len(apartments) * num_regular
-        staffel_total = len(staffel_apts) if has_staffel else 0
-        total_apts = regular_total + staffel_total
-
-        # Build summary including Staffelgeschoss
-        full_summary: dict[str, int] = {k: v * num_regular for k, v in summary.items()}
-        if has_staffel:
-            for apt in staffel_apts:
-                key = apt.apartment_type.value
-                full_summary[key] = full_summary.get(key, 0) + 1
+                # Fallback: clone last regular floor
+                if ref_floor:
+                    fp = ref_floor.model_copy(deep=True)
+                    fp.floor_index = num_regular
+                    fp.floor_type = FloorType.STANDARD
+                    floor_plans.append(fp)
+                    for apt in fp.apartments:
+                        key = apt.apartment_type.value
+                        full_summary[key] = full_summary.get(key, 0) + 1
+                    total_apts += fp.num_apartments
 
         return BuildingFloorPlans(
             building_id=request.building_id,

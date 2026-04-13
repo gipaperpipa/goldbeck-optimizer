@@ -565,8 +565,11 @@ export interface StructuralGrid {
   gallery_side?: string | null;  // "north" or "south" — Laubengang only
 }
 
+export type FloorType = "ground" | "standard" | "staffelgeschoss";
+
 export interface FloorPlan {
   floor_index: number;
+  floor_type?: FloorType;
   structural_grid: StructuralGrid;
   walls: WallSegment[];
   doors: DoorPlacement[];

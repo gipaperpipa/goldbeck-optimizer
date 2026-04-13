@@ -442,7 +442,11 @@ export function FloorPlanPanel() {
                   : "bg-neutral-100 text-neutral-600 hover:bg-neutral-200"
               }`}
             >
-              {fp.floor_index === 0 ? "EG" : `${fp.floor_index}. OG`}
+              {fp.floor_type === "staffelgeschoss"
+                ? "SG"
+                : fp.floor_index === 0
+                  ? "EG"
+                  : `${fp.floor_index}. OG`}
             </button>
           ))}
         </div>
