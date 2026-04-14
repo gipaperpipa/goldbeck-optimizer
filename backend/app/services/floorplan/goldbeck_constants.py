@@ -3,6 +3,17 @@ Goldbeck Wohngebäude construction system constants.
 All dimensions in meters. Extracted from Produktleitfaden Mai 2024.
 """
 
+# --- Room Aspect Ratio Targets (Phase 2.3) ---
+# Ideal min/max edge ratio (short/long) per room type, used by the optimizer's
+# room_aspect_ratios criterion as a Gaussian-scored target. 1.0 = square.
+IDEAL_ASPECT_RATIOS = {
+    "LIVING":  0.70,  # near-square, slight rectangle
+    "BEDROOM": 0.65,
+    "KITCHEN": 0.55,  # galley-tolerant
+    "BATH":    0.50,
+}
+ASPECT_SIGMA = 0.18  # std-dev of the Gaussian — wider = more permissive
+
 # --- Grid System ---
 GRID_UNIT = 0.625  # Base module (Grundraster)
 STANDARD_RASTERS = [3.125, 3.75, 4.375, 5.00, 5.625, 6.25]  # Valid bay widths

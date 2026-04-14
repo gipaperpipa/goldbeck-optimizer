@@ -513,30 +513,99 @@ def score_orientation(
 
 
 # ============================================================
+# 6. ACOUSTIC ZONING — Bedroom isolation from wet/noisy rooms
+# ============================================================
+
+def _room_centroid(room: Room) -> tuple[float, float]:
+    xs = [p.x for p in room.polygon]
+    ys = [p.y for p in room.polygon]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def score_acoustic_zoning(
+    floor: FloorPlan,
+) -> float:
+    """Score how well bedrooms are isolated from acoustic nuisances (0-10).
+
+    Two sub-criteria, equally weighted:
+      A. Intra-apartment isolation: bedroom centroid distance to bathroom
+         centroid in the same apartment. Closer = bad (plumbing noise +
+         door slams). Distance ≥3.5m gets full marks; 0m gets zero.
+      B. Bedroom-to-staircase wall sharing: bedrooms whose centroid sits
+         within 2.5m of any staircase center are penalized (corridor traffic
+         and impact noise from stair use).
+    """
+    if not floor.apartments:
+        return 5.0
+
+    intra_scores: list[float] = []
+    for apt in floor.apartments:
+        bedrooms = [r for r in apt.rooms if r.room_type == RoomType.BEDROOM and len(r.polygon) >= 4]
+        baths = [r for r in apt.rooms if r.room_type == RoomType.BATHROOM and len(r.polygon) >= 4]
+        if not bedrooms or not baths:
+            continue
+        bath_cs = [_room_centroid(b) for b in baths]
+        for bed in bedrooms:
+            bcx, bcy = _room_centroid(bed)
+            min_d = min(
+                math.sqrt((bcx - bx) ** 2 + (bcy - by) ** 2)
+                for bx, by in bath_cs
+            )
+            # 0m → 0; 3.5m+ → 10
+            score = max(0.0, min(10.0, (min_d / 3.5) * 10.0))
+            intra_scores.append(score)
+
+    intra_avg = sum(intra_scores) / len(intra_scores) if intra_scores else 7.0
+
+    # Sub-criterion B: bedroom-to-staircase distance
+    stair_scores: list[float] = []
+    if floor.staircases:
+        stair_centers = [
+            (s.position.x + s.width_m / 2, s.position.y + s.depth_m / 2)
+            for s in floor.staircases
+        ]
+        for apt in floor.apartments:
+            for room in apt.rooms:
+                if room.room_type != RoomType.BEDROOM or len(room.polygon) < 4:
+                    continue
+                bcx, bcy = _room_centroid(room)
+                min_d = min(
+                    math.sqrt((bcx - sx) ** 2 + (bcy - sy) ** 2)
+                    for sx, sy in stair_centers
+                )
+                # <2.5m → 0; ≥6m → 10; linear in between
+                if min_d <= 2.5:
+                    stair_scores.append(0.0)
+                elif min_d >= 6.0:
+                    stair_scores.append(10.0)
+                else:
+                    stair_scores.append((min_d - 2.5) / 3.5 * 10.0)
+
+    stair_avg = sum(stair_scores) / len(stair_scores) if stair_scores else 7.0
+
+    return round((intra_avg + stair_avg) / 2.0, 2)
+
+
+# ============================================================
 # AGGREGATE SCORER
 # ============================================================
 
 def evaluate_quality(
-    plans: BuildingFloorPlans,
+    floor: FloorPlan,
+    building_depth_m: float,
     building_rotation_deg: float = 0.0,
 ) -> dict[str, float]:
-    """Run all 5 quality criteria on a floor plan. Returns breakdown dict.
+    """Run all 5 quality criteria on a single floor plan. Returns breakdown dict.
 
     Each criterion scores 0.0 to 10.0.
+
+    Note: takes a single FloorPlan (not BuildingFloorPlans) because Phase 1's
+    per-floor optimizer evaluates each floor independently. Pass the parent
+    building's depth_m as `building_depth_m` since FloorPlan doesn't carry it.
     """
     breakdown: dict[str, float] = {}
 
-    if not plans.floor_plans:
-        return {
-            "connectivity": 0.0,
-            "furniture": 0.0,
-            "daylight": 0.0,
-            "kitchen_living": 0.0,
-            "orientation": 0.0,
-        }
-
-    floor = plans.floor_plans[0]
-    depth = plans.building_depth_m
+    depth = building_depth_m
 
     # Collect per-apartment scores
     connectivity_scores = []
@@ -560,5 +629,6 @@ def evaluate_quality(
     breakdown["daylight"] = avg(daylight_scores)
     breakdown["kitchen_living"] = avg(kitchen_living_scores)
     breakdown["orientation"] = avg(orientation_scores)
+    breakdown["acoustic"] = score_acoustic_zoning(floor)
 
     return breakdown

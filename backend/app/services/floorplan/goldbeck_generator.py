@@ -122,6 +122,7 @@ class GoldbeckGenerator(ConstructionSystem):
         staircase_count_delta = vp.get("staircase_count_delta", 0)
         staircase_position_offset = vp.get("staircase_position_offset", 0.0)
         depth_config_index = vp.get("depth_config_index", -1)
+        distribution_arm_depth = float(vp.get("distribution_arm_depth", 1.10))
 
         # Per-floor variation overrides from optimizer chromosome
         floor_vp: dict[int, dict] = vp.get("floor_variation_params", {})
@@ -216,6 +217,8 @@ class GoldbeckGenerator(ConstructionSystem):
                 apartments, all_rooms = self._phase6_generate_rooms(
                     allocations, grid, access_type, fvp_barrier_free,
                     fvp_props, fvp_service,
+                    rotation_deg=request.rotation_deg,
+                    distribution_arm_depth=distribution_arm_depth,
                 )
 
                 # Phase 7: Generate walls, doors, windows
@@ -830,7 +833,14 @@ class GoldbeckGenerator(ConstructionSystem):
         access: AccessType,
         allocation_order: str = "large_first",
     ) -> list[dict]:
-        """Map unit_mix to physical bay groupings."""
+        """Map unit_mix to physical bay groupings.
+
+        Solar bias (Phase 2.1): in Ganghaus, when total unit counts split
+        unevenly across the two sides, the "extra" of each apartment type
+        is placed on the side that compass-faces south (after rotation_deg).
+        Larger apartment types (3_room, 4_room) benefit most from south sun
+        because their living rooms are bigger.
+        """
         stair_bay_indices = {s.bay_index for s in staircases}
         available_bays = [i for i in range(len(grid.bay_widths)) if i not in stair_bay_indices]
 
@@ -841,8 +851,24 @@ class GoldbeckGenerator(ConstructionSystem):
         allocations = []
 
         if access == AccessType.GANGHAUS:
-            for side in ["south", "north"]:
-                side_counts = {k: math.ceil(v / 2) for k, v in unit_counts.items()}
+            # Determine which labeled side compass-faces south after rotation.
+            # Default: "south" label = bearing 180° = compass south.
+            # rotation_deg rotates clockwise, so when rotation ∈ (90, 270),
+            # the labeled-south facade actually points compass-north.
+            rot_norm = request.rotation_deg % 360
+            preferred_side = "south" if not (90.0 < rot_norm < 270.0) else "north"
+
+            # Split unit counts: floor(v/2) goes to each side, the extra
+            # (v % 2) goes to the solar-preferred side.
+            south_counts: dict[str, int] = {}
+            north_counts: dict[str, int] = {}
+            for k, v in unit_counts.items():
+                base = v // 2
+                extra = v % 2
+                south_counts[k] = base + (extra if preferred_side == "south" else 0)
+                north_counts[k] = base + (extra if preferred_side == "north" else 0)
+
+            for side, side_counts in [("south", south_counts), ("north", north_counts)]:
                 side_allocs = self._allocate_side(
                     available_bays, grid.bay_widths, side_counts, side, allocation_order
                 )
@@ -998,8 +1024,20 @@ class GoldbeckGenerator(ConstructionSystem):
         prefer_barrier_free: bool,
         room_proportions: Optional[list[float]] = None,
         service_layout_order: str = "hall_bath_kitchen",
+        rotation_deg: float = 0.0,  # noqa: ARG002 — reserved for future per-room solar logic
+        distribution_arm_depth: float = 1.10,
     ) -> tuple[list[Apartment], list[Room]]:
-        """Generate room layouts for each apartment allocation."""
+        """Generate room layouts for each apartment allocation.
+
+        Solar orientation: handled by the optimizer's `orientation` fitness
+        criterion (`quality_scoring.score_orientation`), which uses
+        `request.rotation_deg` to compute compass bearings for each room's
+        facade. Since LIVING and BEDROOM rooms in a Goldbeck apartment share
+        the same exterior facade, the bearing is determined by the apartment's
+        side relative to the corridor — Phase 6 itself has no per-room choice
+        to make. Solar bias is therefore applied at allocation time (Phase 5)
+        by preferring living-heavy apartment types on the better-oriented side.
+        """
         apartments = []
         all_rooms = []
         apt_counter = {"south": 0, "north": 0, "single": 0}
@@ -1036,6 +1074,7 @@ class GoldbeckGenerator(ConstructionSystem):
             rooms, bathroom, entrance_door_id = self._layout_apartment_rooms(
                 apt_type_str, bbox, bath_dims, primary_bath, unit_num, grid, side,
                 apt_proportion, service_layout_order,
+                distribution_arm_depth=distribution_arm_depth,
             )
 
             total_area = sum(r.area_sqm for r in rooms if r.room_type != RoomType.BALCONY)
@@ -1110,6 +1149,7 @@ class GoldbeckGenerator(ConstructionSystem):
         side: str,
         room_proportion: Optional[float] = None,
         service_layout_order: str = "hall_bath_kitchen",
+        distribution_arm_depth: float = 1.10,
     ) -> tuple[list[Room], dict, str]:
         """
         Generate room subdivisions for one apartment.
@@ -1143,7 +1183,9 @@ class GoldbeckGenerator(ConstructionSystem):
         # hallway to all rooms — the standard German Flur layout.
         num_rooms = {"1_room": 1, "2_room": 2, "3_room": 3, "4_room": 4, "5_room": 5}
         needs_distribution_arm = num_rooms.get(apt_type, 1) >= 3
-        dist_arm_d = 1.10 if needs_distribution_arm else 0.0  # 1.10m = min barrier-free passage
+        # Phase 2.4: chromosome-controlled hallway depth (1.10m–1.50m). Clamp to range.
+        arm_d = max(1.10, min(1.50, distribution_arm_depth))
+        dist_arm_d = arm_d if needs_distribution_arm else 0.0  # min barrier-free passage
 
         room_d = apt_d - service_d - dist_arm_d
         room_d = max(room_d, 2.0)

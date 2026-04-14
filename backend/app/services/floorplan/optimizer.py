@@ -78,6 +78,9 @@ class FloorPlanChromosome:
         # Dimension offsets: allow ±3 grid units for meaningful width/depth variation
         self.dim_offset: float = random.uniform(-3.0, 3.0)
         self.depth_offset: float = random.uniform(-3.0, 3.0)
+        # Distribution-arm hallway depth for 3+ room apartments (Phase 2.4)
+        # Range: 1.10m (BauO NRW barrier-free min) to 1.50m (generous wheelchair turn)
+        self.distribution_arm_depth: float = random.uniform(1.10, 1.50)
         # Per-floor variation genes (for per-floor independent generation)
         # Each floor can have a different allocation order and room proportion bias
         self.floor_allocation_orders: list[str] = [
@@ -108,6 +111,7 @@ class FloorPlanChromosome:
         c.bathroom_preference = self.bathroom_preference
         c.dim_offset = self.dim_offset
         c.depth_offset = self.depth_offset
+        c.distribution_arm_depth = self.distribution_arm_depth
         c.floor_allocation_orders = list(self.floor_allocation_orders)
         c.floor_service_orders = list(self.floor_service_orders)
         c.floor_proportion_offsets = list(self.floor_proportion_offsets)
@@ -152,6 +156,7 @@ class FloorPlanChromosome:
             "room_proportions": self.room_proportions,
             "staircase_count_delta": self.staircase_count_delta,
             "staircase_position_offset": self.staircase_position_offset,
+            "distribution_arm_depth": self.distribution_arm_depth,
             "floor_variation_params": floor_vp,
         }
 
@@ -267,6 +272,9 @@ def _mutate(
         c.dim_offset = max(-3.0, min(3.0, c.dim_offset + random.gauss(0, 0.8 * sigma_scale)))
     if random.random() < effective_rate:
         c.depth_offset = max(-3.0, min(3.0, c.depth_offset + random.gauss(0, 0.8 * sigma_scale)))
+    if random.random() < effective_rate:
+        c.distribution_arm_depth = max(1.10, min(1.50,
+            c.distribution_arm_depth + random.gauss(0, 0.10 * sigma_scale)))
 
     # Mutate per-floor genes
     for i in range(MAX_FLOOR_GENES):
@@ -305,6 +313,7 @@ def _crossover(a: FloorPlanChromosome, b: FloorPlanChromosome) -> FloorPlanChrom
     c.bathroom_preference = pick(a.bathroom_preference, b.bathroom_preference)
     c.dim_offset = pick(a.dim_offset, b.dim_offset)
     c.depth_offset = pick(a.depth_offset, b.depth_offset)
+    c.distribution_arm_depth = pick(a.distribution_arm_depth, b.distribution_arm_depth)
     c.floor_allocation_orders = [
         pick(a.floor_allocation_orders[i], b.floor_allocation_orders[i])
         for i in range(MAX_FLOOR_GENES)
@@ -389,25 +398,34 @@ def _evaluate_single_floor(
     else:
         fb["circulation_efficiency"] = 5.0
 
-    # --- 3. Room aspect ratios ---
+    # --- 3. Room aspect ratios (Gaussian around per-type ideal — Phase 2.3) ---
     aspect_scores = []
+    _type_to_key = {
+        RoomType.LIVING: "LIVING",
+        RoomType.BEDROOM: "BEDROOM",
+        RoomType.KITCHEN: "KITCHEN",
+        RoomType.BATHROOM: "BATH",
+    }
+    sigma_sq2 = 2.0 * (C.ASPECT_SIGMA ** 2)
     for apt in floor.apartments:
         for room in apt.rooms:
-            if room.room_type in (RoomType.LIVING, RoomType.BEDROOM, RoomType.KITCHEN):
-                poly = room.polygon
-                if len(poly) >= 4:
-                    xs = [p.x for p in poly]
-                    ys = [p.y for p in poly]
-                    w = max(xs) - min(xs)
-                    h = max(ys) - min(ys)
-                    if h > 0 and w > 0:
-                        ratio = min(w, h) / max(w, h)
-                        if ratio >= 0.5:
-                            aspect_scores.append(10.0)
-                        elif ratio >= 0.33:
-                            aspect_scores.append(5.0 + (ratio - 0.33) / 0.17 * 5.0)
-                        else:
-                            aspect_scores.append(max(0.0, ratio / 0.33 * 5.0))
+            key = _type_to_key.get(room.room_type)
+            if not key:
+                continue
+            poly = room.polygon
+            if len(poly) < 4:
+                continue
+            xs = [p.x for p in poly]
+            ys = [p.y for p in poly]
+            w = max(xs) - min(xs)
+            h = max(ys) - min(ys)
+            if h <= 0 or w <= 0:
+                continue
+            ratio = min(w, h) / max(w, h)
+            ideal = C.IDEAL_ASPECT_RATIOS.get(key, 0.65)
+            # Gaussian: 10 at ratio==ideal, smoothly falling off
+            score = 10.0 * math.exp(-((ratio - ideal) ** 2) / sigma_sq2)
+            aspect_scores.append(score)
     fb["room_aspect_ratios"] = (
         sum(aspect_scores) / len(aspect_scores) if aspect_scores else 5.0
     )
@@ -616,12 +634,17 @@ def _evaluate_single_floor(
         fb["access_compliance"] = 5.0
 
     # === Advanced quality criteria ===
-    quality = evaluate_quality(plans, building_rotation_deg=request.rotation_deg)
+    quality = evaluate_quality(
+        floor,
+        building_depth_m=plans.building_depth_m,
+        building_rotation_deg=request.rotation_deg,
+    )
     fb["connectivity"] = quality["connectivity"]
     fb["furniture"] = quality["furniture"]
     fb["daylight_quality"] = quality["daylight"]
     fb["kitchen_living"] = quality["kitchen_living"]
     fb["orientation"] = quality["orientation"]
+    fb["acoustic"] = quality["acoustic"]
 
     return fb
 
@@ -666,6 +689,7 @@ def _evaluate_floor_plan(
         "daylight_quality": 1.0,
         "kitchen_living": 1.0,
         "orientation": 0.8,
+        "acoustic": 0.7,
     }
     _liv_sum = sum(_liv_w.values())
     livability_score = sum(
