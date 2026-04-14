@@ -81,7 +81,7 @@ class TestGoldbeckGenerator:
         """All bay widths should be valid Goldbeck rasters (3.125 to 6.25m)."""
         from app.services.floorplan import goldbeck_constants as C
         result = self._generate(self._make_request())
-        valid = set(C.VALID_RASTERS)
+        valid = set(C.STANDARD_RASTERS)
         for fp in result.floor_plans:
             for bw in fp.structural_grid.bay_widths:
                 assert bw in valid, f"Bay width {bw}m is not a valid Goldbeck raster"

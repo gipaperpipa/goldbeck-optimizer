@@ -102,7 +102,7 @@ class TestStructuralGridValidation:
         """Generator should always produce valid Goldbeck rasters."""
         from app.services.floorplan import goldbeck_constants as C
         plans = _generate_building()
-        valid = set(C.VALID_RASTERS)
+        valid = set(C.STANDARD_RASTERS)
         for fp in plans.floor_plans:
             for bw in fp.structural_grid.bay_widths:
                 assert bw in valid, f"Invalid bay width {bw}m on floor {fp.floor_index}"
