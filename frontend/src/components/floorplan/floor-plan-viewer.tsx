@@ -93,6 +93,15 @@ export function FloorPlanViewer({
   const toggleLayer = (k: keyof typeof layers) =>
     setLayers((p) => ({ ...p, [k]: !p[k] }));
 
+  // Inspected element — set by click; shows a property readout
+  type Inspected =
+    | { kind: "wall"; data: WallSegment }
+    | { kind: "window"; data: WindowPlacement }
+    | { kind: "door"; data: DoorPlacement }
+    | { kind: "room"; data: FloorPlanRoom }
+    | null;
+  const [inspected, setInspected] = useState<Inspected>(null);
+
   // View mode — Architect (technical, all layers, crisp black linework) vs
   // Presentation (client-facing, hides grid/dimensions, clean white background).
   const [viewMode, setViewMode] = useState<"architect" | "presentation">("architect");
@@ -162,20 +171,56 @@ export function FloorPlanViewer({
         return;
       }
 
-      // Handle apartment selection
-      if (!onApartmentSelect) return;
+      // --- Element inspection (priority: opening → wall → room) ---
+      const planX = invTx(mx);
+      const planY = invTy(my);
 
-      // Find which apartment was clicked (find the most specific match)
+      // 1. Windows / doors — hit if within half-width along the host wall + ~0.35m across
+      const OPENING_TOL = 0.35;
+      for (const win of floorPlan.windows) {
+        const d = Math.hypot(planX - win.position.x, planY - win.position.y);
+        if (d <= Math.max(win.width_m / 2, OPENING_TOL)) {
+          setInspected({ kind: "window", data: win });
+          return;
+        }
+      }
+      for (const door of floorPlan.doors) {
+        const d = Math.hypot(planX - door.position.x, planY - door.position.y);
+        if (d <= Math.max(door.width_m / 2, OPENING_TOL)) {
+          setInspected({ kind: "door", data: door });
+          return;
+        }
+      }
+
+      // 2. Walls — hit if perpendicular distance to segment < thickness/2 + 0.08m tolerance
+      for (const wall of floorPlan.walls) {
+        const sx = wall.start.x, sy = wall.start.y;
+        const ex = wall.end.x, ey = wall.end.y;
+        const dx = ex - sx, dy = ey - sy;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq < 1e-6) continue;
+        const t = Math.max(0, Math.min(1, ((planX - sx) * dx + (planY - sy) * dy) / lenSq));
+        const projX = sx + t * dx;
+        const projY = sy + t * dy;
+        const dist = Math.hypot(planX - projX, planY - projY);
+        const tol = (wall.thickness_m || 0.12) / 2 + 0.08;
+        if (dist <= tol) {
+          setInspected({ kind: "wall", data: wall });
+          return;
+        }
+      }
+
+      // 3. Room / apartment — point-in-polygon
       let selectedApt: FloorPlanApartment | null = null;
+      let selectedRoom: FloorPlanRoom | null = null;
       let smallestArea = Infinity;
-
       for (const apt of floorPlan.apartments) {
         for (const room of apt.rooms) {
           if (isPointInPolygon(mx, my, room.polygon, invTx, invTy)) {
-            // Prefer the apartment with the smallest total area (most specific match)
             const aptArea = apt.rooms.reduce((sum, r) => sum + r.area_sqm, 0);
             if (aptArea < smallestArea) {
               selectedApt = apt;
+              selectedRoom = room;
               smallestArea = aptArea;
             }
             break;
@@ -183,7 +228,15 @@ export function FloorPlanViewer({
         }
       }
 
-      onApartmentSelect(selectedApt);
+      if (selectedRoom) {
+        setInspected({ kind: "room", data: selectedRoom });
+      } else {
+        setInspected(null);
+      }
+
+      if (onApartmentSelect) {
+        onApartmentSelect(selectedApt);
+      }
     },
     [floorPlan, onApartmentSelect, getTransform, measureMode, measurePoints, snapPoint]
   );
@@ -580,6 +633,90 @@ export function FloorPlanViewer({
             Clear
           </button>
         )}
+      </div>
+      {inspected && (
+        <InspectorPanel inspected={inspected} onClose={() => setInspected(null)} />
+      )}
+    </div>
+  );
+}
+
+// ── Element inspector overlay ─────────────────────────────────────────────
+
+function InspectorPanel({
+  inspected,
+  onClose,
+}: {
+  inspected:
+    | { kind: "wall"; data: WallSegment }
+    | { kind: "window"; data: WindowPlacement }
+    | { kind: "door"; data: DoorPlacement }
+    | { kind: "room"; data: FloorPlanRoom };
+  onClose: () => void;
+}) {
+  let title = "";
+  const rows: [string, string][] = [];
+
+  if (inspected.kind === "wall") {
+    const w = inspected.data;
+    const len = Math.hypot(w.end.x - w.start.x, w.end.y - w.start.y);
+    title = w.is_bearing
+      ? w.is_exterior ? "Tragende Außenwand" : "Tragende Innenwand"
+      : "Nichttragende Wand";
+    rows.push(["ID", w.id]);
+    rows.push(["Type", w.wall_type]);
+    rows.push(["Length", `${len.toFixed(2)} m`]);
+    rows.push(["Thickness", `${(w.thickness_m * 100).toFixed(0)} cm`]);
+    rows.push(["Bearing", w.is_bearing ? "Yes" : "No"]);
+    rows.push(["Exterior", w.is_exterior ? "Yes" : "No"]);
+  } else if (inspected.kind === "window") {
+    const win = inspected.data;
+    title = win.is_floor_to_ceiling ? "Bodentiefes Fenster" : "Fenster";
+    rows.push(["ID", win.id]);
+    rows.push(["Width", `${win.width_m.toFixed(2)} m`]);
+    rows.push(["Height", `${win.height_m.toFixed(2)} m`]);
+    rows.push(["Sill height", `${win.sill_height_m.toFixed(2)} m`]);
+    rows.push(["Position", `x=${win.position.x.toFixed(2)}, y=${win.position.y.toFixed(2)}`]);
+  } else if (inspected.kind === "door") {
+    const d = inspected.data;
+    title = d.is_entrance ? "Wohnungseingangstür" : "Innentür";
+    rows.push(["ID", d.id]);
+    rows.push(["Width", `${d.width_m.toFixed(2)} m`]);
+    rows.push(["Height", `${d.height_m.toFixed(2)} m`]);
+    rows.push(["Swing", d.swing_direction]);
+    rows.push(["Entrance", d.is_entrance ? "Yes" : "No"]);
+  } else {
+    const r = inspected.data;
+    title = r.label || r.room_type;
+    rows.push(["ID", r.id]);
+    rows.push(["Type", r.room_type]);
+    rows.push(["Area", `${r.area_sqm.toFixed(2)} m²`]);
+    if (r.apartment_id) rows.push(["Apartment", r.apartment_id]);
+  }
+
+  return (
+    <div className="absolute bottom-2 left-2 w-64 bg-white/95 backdrop-blur border rounded-lg shadow-lg text-sm">
+      <div className="flex items-center justify-between px-3 py-2 border-b bg-neutral-50 rounded-t-lg">
+        <span className="font-semibold text-neutral-800 text-xs uppercase tracking-wide">
+          {title}
+        </span>
+        <button
+          onClick={onClose}
+          className="text-neutral-400 hover:text-neutral-700 leading-none text-lg"
+          title="Close inspector"
+        >
+          ×
+        </button>
+      </div>
+      <div className="px-3 py-2 space-y-1">
+        {rows.map(([k, v]) => (
+          <div key={k} className="flex items-baseline justify-between gap-3">
+            <span className="text-xs text-neutral-500">{k}</span>
+            <span className="text-xs font-medium text-neutral-800 text-right break-all">
+              {v}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
