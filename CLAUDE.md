@@ -42,14 +42,24 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 
 ## Last Request
 **Status:** DONE
-**Date:** 2026-04-13
-**Request:** Implement Phase 1 — Per-floor independent generation
-**Progress:** Full Phase 1 implementation complete. Per-floor independent generation with ground floor differentiation, Staffelgeschoss tagging, optimizer per-floor genes, and all-floor fitness evaluation. See details in "Recently completed" below.
+**Date:** 2026-04-17
+**Request:** Plan + implement stale test cleanup, then Phase 2 (generation intelligence)
+**Progress:** Both done. Stale `VALID_RASTERS` tests fixed. Phase 2 shipped: solar bias in Ganghaus allocation, acoustic zoning score, smooth Gaussian aspect ratios, distribution-arm hallway gene. Also fixed a silent Phase 1 bug where `evaluate_quality()` was reading `floor_plans[0]` on every per-floor eval. All committed + pushed (`ce82800`, `fd57302`).
 
 ## Current State
-**Last updated:** 2026-04-13
+**Last updated:** 2026-04-17
 
 ### Recently completed
+- **Phase 2: Generation intelligence** (2026-04-17):
+  - **B.1 Solar awareness** — `evaluate_quality()` refactored from `BuildingFloorPlans` → single `FloorPlan + building_depth_m` (silent Phase 1 bug fix: per-floor avg was re-using Floor-0 quality). Ganghaus allocation now puts the "extra" (odd count) of each apartment type on the side that compass-faces south after `rotation_deg`.
+  - **B.2 Acoustic zoning** — new `score_acoustic_zoning()` in `quality_scoring.py`: bedroom-to-bathroom intra-apt distance + bedroom-to-staircase distance. Wired into fitness as `acoustic`, weight 0.7 in livability.
+  - **B.3 Smooth aspect ratios** — replaced the cliff at 0.5/0.33 with Gaussian `10*exp(-(r-ideal)²/2σ²)`. Per-room-type ideals in `goldbeck_constants.py`: LIVING 0.70, BEDROOM 0.65, KITCHEN 0.55, BATH 0.50; σ=0.18.
+  - **B.4 Distribution-arm gene** — new `distribution_arm_depth: float` chromosome gene (1.10–1.50m range). Was hard-coded at 1.10m. Threaded through mutation/crossover/variation_params → `_layout_apartment_rooms`.
+  - Files changed: `goldbeck_constants.py`, `goldbeck_generator.py`, `optimizer.py`, `quality_scoring.py`
+  - Commits: `fd57302` (Phase 2), `ce82800` (test cleanup) — both pushed to origin/main
+  - Tests: 67 pass, 1 unrelated pre-existing financial calculator failure
+  - End-to-end smoke confirms: `acoustic` key in breakdown, `distribution_arm_depth` gene varies across chromosomes, smooth aspect scoring active
+- **CI fix** (2026-04-17): `pnpm/action-setup@v4` bumped from version 9 to 10 — lockfile incompatibility was causing every recent CI failure. Commit `525797a`.
 - **Phase 1: Per-floor independent generation** (2026-04-13):
   - Added `FloorType` enum (ground/standard/staffelgeschoss) and `FloorConfig` model to `models/floorplan.py`
   - Added `enable_per_floor`, `floor_configs`, `ground_floor_barrier_free` fields to `FloorPlanRequest`
@@ -88,13 +98,11 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **CI frontend always failing** — `pnpm-lock.yaml` out of sync with `package.json`. Lockfile verified in sync locally; may need commit + push to fix CI.
-- **Phase 1 uncommitted** — All changes are local. Need to commit + push when ready.
-- **Start Phase 2** — Generation intelligence (solar, acoustic, proportions, hallway efficiency). See `IMPLEMENTATION_PLAN.md`.
-- **Stale test constants** — 2 tests reference `C.VALID_RASTERS` which was renamed to `STANDARD_RASTERS`. Quick fix.
-- After deploy: hit `/api/v1/cadastral/diagnostics/wfs-health` to verify state WFS endpoints from Railway
-- Optimizer changes need real-world testing (run on actual parcel + compare before/after)
-- Rhino plugin code exists but is NOT YET COMPILED (needs VS2022 + .NET 4.8 + Rhino 8 SDK)
+- **Start Phase 3** — Interactive plan editor (full viewport, dual mode, wall dragging, real-time validation). See `IMPLEMENTATION_PLAN.md`.
+- **Rhino plugin still not compiled** — `.NET SDK` is not installed on this machine (only the runtime). `dotnet build` fails with "No .NET SDKs were found". User needs to install Visual Studio 2022 with .NET desktop workload, or the standalone .NET SDK, before the plugin can be built. BUILD.md has the one-line build command once SDK is present.
+- **WFS health check from Railway** — After the next backend deploy, hit `/api/v1/cadastral/diagnostics/wfs-health` on the Railway URL to verify all 16-state endpoints are live. Not known locally — the URL is assigned by Railway.
+- **Unrelated pre-existing test failure** — `test_financial_calculator.py::TestFinancialCalculatorZeroGuards::test_zero_total_dev_cost_edge` asserts `roi_pct == 0` but gets `-100.0` when there are zero units/revenue but nonzero debt service. Not related to floor plan work — separate fix.
+- **Optimizer real-world validation** — Phase 2 criteria (acoustic, orientation, smooth aspect) are wired correctly and the GA explores them, but no head-to-head on a real parcel has been done yet. Nice-to-have, not blocking.
 
 ## Preferences
 - Continue without asking questions when resuming from a session summary
