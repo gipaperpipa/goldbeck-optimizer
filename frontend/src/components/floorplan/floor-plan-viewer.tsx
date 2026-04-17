@@ -79,6 +79,20 @@ export function FloorPlanViewer({
   const [snapPoint, setSnapPoint] = useState<Point2D | null>(null);
   const rafRef = useRef<number | null>(null);
 
+  // Layer visibility — each architectural category can be toggled independently
+  const [layers, setLayers] = useState({
+    grid: true,
+    rooms: true,
+    walls: true,
+    openings: true,    // windows + doors
+    labels: true,
+    dimensions: true,
+    annotations: true, // north arrow, scale bar, title
+  });
+  const [showLayerPanel, setShowLayerPanel] = useState(false);
+  const toggleLayer = (k: keyof typeof layers) =>
+    setLayers((p) => ({ ...p, [k]: !p[k] }));
+
   // Precompute transform
   const getTransform = useCallback(() => {
     const grid = floorPlan.structural_grid;
@@ -316,51 +330,67 @@ export function FloorPlanViewer({
     ctx.strokeRect(tx(0), ty(bldgH), ts(bldgW), ts(bldgH));
 
     // --- 4. Structural grid with axis labels ---
-    drawStructuralGrid(ctx, grid, tx, ty, ts, bldgH);
+    if (layers.grid) {
+      drawStructuralGrid(ctx, grid, tx, ty, ts, bldgH);
+    }
 
     // --- 5. Rooms (filled polygons) ---
     const allRooms = [...floorPlan.rooms];
-    for (const room of allRooms) {
-      drawRoom(ctx, room, tx, ty, hoveredAptId, selectedApartmentId);
+    if (layers.rooms) {
+      for (const room of allRooms) {
+        drawRoom(ctx, room, tx, ty, hoveredAptId, selectedApartmentId);
+      }
     }
 
     // --- 6. Apartment outlines (trace actual apartment boundary) ---
-    for (const apt of floorPlan.apartments) {
-      const isSelected = apt.id === selectedApartmentId;
-      const isHovered = apt.id === hoveredAptId;
-      if (isSelected || isHovered) {
-        drawApartmentOutline(ctx, apt, tx, ty, ts, isSelected);
+    if (layers.rooms) {
+      for (const apt of floorPlan.apartments) {
+        const isSelected = apt.id === selectedApartmentId;
+        const isHovered = apt.id === hoveredAptId;
+        if (isSelected || isHovered) {
+          drawApartmentOutline(ctx, apt, tx, ty, ts, isSelected);
+        }
       }
     }
 
     // --- 7. Walls (filled rectangles with proper thickness) ---
-    for (const wall of floorPlan.walls) {
-      drawWall(ctx, wall, tx, ty, ts);
+    if (layers.walls) {
+      for (const wall of floorPlan.walls) {
+        drawWall(ctx, wall, tx, ty, ts);
+      }
     }
 
     // --- 8. Windows (architectural symbols — oriented along host wall) ---
-    for (const win of floorPlan.windows) {
-      const hostWall = findNearestWall2D(win.position, floorPlan.walls);
-      drawWindow(ctx, win, hostWall, tx, ty, ts);
-    }
+    if (layers.openings) {
+      for (const win of floorPlan.windows) {
+        const hostWall = findNearestWall2D(win.position, floorPlan.walls);
+        drawWindow(ctx, win, hostWall, tx, ty, ts);
+      }
 
-    // --- 9. Doors (architectural swing arcs — oriented along host wall) ---
-    for (const door of floorPlan.doors) {
-      const hostWall = findNearestWall2D(door.position, floorPlan.walls);
-      drawDoor(ctx, door, hostWall, tx, ty, ts);
+      // --- 9. Doors (architectural swing arcs — oriented along host wall) ---
+      for (const door of floorPlan.doors) {
+        const hostWall = findNearestWall2D(door.position, floorPlan.walls);
+        drawDoor(ctx, door, hostWall, tx, ty, ts);
+      }
     }
 
     // --- 10. Room labels (professional typography) ---
-    drawRoomLabels(ctx, allRooms, tx, ty, ts);
+    if (layers.labels) {
+      drawRoomLabels(ctx, allRooms, tx, ty, ts);
+    }
 
     // --- 11. Dimension lines with architectural style ---
-    drawDimensionLines(ctx, grid, tx, ty, ts, bldgW, bldgH);
+    if (layers.dimensions) {
+      drawDimensionLines(ctx, grid, tx, ty, ts, bldgW, bldgH);
+    }
 
     // --- 12. Scale bar ---
-    drawScaleBar(ctx, width, height, scale);
+    if (layers.annotations) {
+      drawScaleBar(ctx, width, height, scale);
 
-    // --- 13. North arrow ---
-    drawNorthArrow(ctx, width, height);
+      // --- 13. North arrow ---
+      drawNorthArrow(ctx, width, height);
+    }
 
     // --- 14. Measurement visualization (enhanced) ---
     if (measurePoints.length > 0) {
@@ -376,6 +406,7 @@ export function FloorPlanViewer({
     }
 
     // --- 16. Title and metadata ---
+    if (!layers.annotations) return;
     ctx.fillStyle = "#2b2520";
     ctx.font = "bold 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     ctx.textAlign = "left";
@@ -398,7 +429,7 @@ export function FloorPlanViewer({
       12,
       height - 8
     );
-  }, [floorPlan, width, height, hoveredAptId, selectedApartmentId, getTransform, measurePoints, snapPoint, measureMode]);
+  }, [floorPlan, width, height, hoveredAptId, selectedApartmentId, getTransform, measurePoints, snapPoint, measureMode, layers]);
 
   const handleMeasureToggle = () => {
     setMeasureMode(!measureMode);
@@ -422,6 +453,45 @@ export function FloorPlanViewer({
         onMouseMove={handleMouseMove}
       />
       <div className="absolute top-2 right-2 flex gap-2">
+        <div className="relative">
+          <button
+            onClick={() => setShowLayerPanel((v) => !v)}
+            className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+              showLayerPanel
+                ? "bg-neutral-900 text-white hover:bg-neutral-800"
+                : "bg-gray-200 text-gray-800 hover:bg-gray-300"
+            }`}
+            title="Ebenen ein-/ausblenden"
+          >
+            Layers
+          </button>
+          {showLayerPanel && (
+            <div className="absolute top-full right-0 mt-1 w-48 bg-white border rounded-lg shadow-lg p-2 z-10 text-sm">
+              {([
+                ["grid", "Structural grid"],
+                ["rooms", "Rooms"],
+                ["walls", "Walls"],
+                ["openings", "Doors & Windows"],
+                ["labels", "Room labels"],
+                ["dimensions", "Dimensions"],
+                ["annotations", "North / scale / title"],
+              ] as const).map(([key, label]) => (
+                <label
+                  key={key}
+                  className="flex items-center gap-2 px-2 py-1 rounded hover:bg-neutral-50 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={layers[key]}
+                    onChange={() => toggleLayer(key)}
+                    className="accent-neutral-900"
+                  />
+                  <span className="text-neutral-700">{label}</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
         <button
           onClick={handleMeasureToggle}
           className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
