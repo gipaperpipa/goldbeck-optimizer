@@ -1093,66 +1093,157 @@ function drawRoomLabels(
   }
 }
 
+/**
+ * Draws DIN 406-style dimension strings.
+ *
+ * Two strings on both axes:
+ *   • INNER string — individual bay widths (horizontal) / single span (vertical)
+ *   • OUTER string — overall building dimension
+ *
+ * Style: extension lines from the axis with a small gap; 45° tick slashes at
+ * each dimension stop; labels centered above the dimension line.
+ */
 function drawDimensionLines(
   ctx: CanvasRenderingContext2D,
-  grid: any,
+  grid: { axis_positions_x: number[]; bay_widths: number[] },
   tx: (x: number) => number,
   ty: (y: number) => number,
   ts: (s: number) => number,
   bldgW: number,
   bldgH: number,
 ) {
-  const offsetAbove = ts(0.6);
-  const offsetLeft = ts(0.6);
+  const DIM_COLOR = "#2b2520";
+  const LABEL_COLOR = "#1a1612";
+  const LINE_W = 0.75;
+  const EXT_GAP = 3;       // gap between building edge and start of extension line
+  const TICK = 5;          // length of 45° tick slash in px
+  // Absolute pixel offsets — stay within the viewer's 50px padding
+  const INNER_OFFSET = 18;
+  const OUTER_OFFSET = 38;
 
-  // Dimension line offset from building edge
-  ctx.strokeStyle = "#8b8277";
-  ctx.lineWidth = 0.8;
+  ctx.strokeStyle = DIM_COLOR;
+  ctx.lineWidth = LINE_W;
+  ctx.fillStyle = LABEL_COLOR;
+  ctx.font = "9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
 
-  // Horizontal bay dimensions
+  // ── Horizontal dimensions (placed ABOVE the building, i.e. smaller canvas Y) ──
+  const topY = ty(bldgH);
+  const innerY = topY - INNER_OFFSET;
+  const outerY = topY - OUTER_OFFSET;
+
+  // Extension lines from building edge up past the outer dimension
+  for (const ax of grid.axis_positions_x) {
+    const sx = tx(ax);
+    ctx.beginPath();
+    ctx.moveTo(sx, topY - EXT_GAP);
+    ctx.lineTo(sx, outerY - 3);
+    ctx.stroke();
+  }
+
+  // Inner dim line + per-bay ticks + labels
+  ctx.beginPath();
+  ctx.moveTo(tx(grid.axis_positions_x[0]), innerY);
+  ctx.lineTo(tx(grid.axis_positions_x[grid.axis_positions_x.length - 1]), innerY);
+  ctx.stroke();
+
+  for (const ax of grid.axis_positions_x) {
+    const sx = tx(ax);
+    ctx.beginPath();
+    ctx.moveTo(sx - TICK / 2, innerY + TICK / 2);
+    ctx.lineTo(sx + TICK / 2, innerY - TICK / 2);
+    ctx.stroke();
+  }
+
   let prevX = grid.axis_positions_x[0];
   for (let i = 0; i < grid.bay_widths.length; i++) {
     const nextX = grid.axis_positions_x[i + 1] ?? prevX + grid.bay_widths[i];
     const midX = (prevX + nextX) / 2;
-
-    // Dimension line
-    const y = ty(0) + offsetAbove;
-    ctx.beginPath();
-    ctx.moveTo(tx(prevX), y - 3);
-    ctx.lineTo(tx(prevX), y);
-    ctx.lineTo(tx(nextX), y);
-    ctx.lineTo(tx(nextX), y - 3);
-    ctx.stroke();
-
-    // Label
-    ctx.fillStyle = "#7a7066";
-    ctx.font = "8px -apple-system, BlinkMacSystemFont, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
-    ctx.fillText(`${grid.bay_widths[i].toFixed(2)}m`, tx(midX), y - 6);
-
+    ctx.fillText(grid.bay_widths[i].toFixed(2), tx(midX), innerY - 3);
     prevX = nextX;
   }
 
-  // Vertical depth dimension
-  ctx.save();
-  ctx.translate(tx(0) - offsetLeft, ty(bldgH / 2));
-  ctx.rotate(-Math.PI / 2);
-
-  const depthY = 0;
+  // Outer dim line (overall building width)
+  const leftSx = tx(0);
+  const rightSx = tx(bldgW);
   ctx.beginPath();
-  ctx.moveTo(-3, depthY);
-  ctx.lineTo(0, depthY);
-  ctx.lineTo(ts(bldgH), depthY);
-  ctx.lineTo(ts(bldgH), depthY - 3);
+  ctx.moveTo(leftSx, outerY);
+  ctx.lineTo(rightSx, outerY);
   ctx.stroke();
+  // End ticks
+  for (const sx of [leftSx, rightSx]) {
+    ctx.beginPath();
+    ctx.moveTo(sx - TICK / 2, outerY + TICK / 2);
+    ctx.lineTo(sx + TICK / 2, outerY - TICK / 2);
+    ctx.stroke();
+  }
+  ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+  ctx.fillText(`${bldgW.toFixed(2)} m`, (leftSx + rightSx) / 2, outerY - 3);
 
-  ctx.fillStyle = "#7a7066";
-  ctx.font = "8px -apple-system, BlinkMacSystemFont, sans-serif";
+  // ── Vertical dimensions (placed LEFT of the building) ──
+  const leftX = tx(0);
+  const innerX = leftX - INNER_OFFSET;
+  const outerX = leftX - OUTER_OFFSET;
+
+  ctx.lineWidth = LINE_W;
+  ctx.strokeStyle = DIM_COLOR;
+
+  // Extension lines at top and bottom
+  for (const yPlan of [0, bldgH]) {
+    const sy = ty(yPlan);
+    ctx.beginPath();
+    ctx.moveTo(leftX - EXT_GAP, sy);
+    ctx.lineTo(outerX + 3, sy);
+    ctx.stroke();
+  }
+
+  // Inner (= single span for building depth)
+  const topSy = ty(bldgH);
+  const botSy = ty(0);
+  ctx.beginPath();
+  ctx.moveTo(innerX, topSy);
+  ctx.lineTo(innerX, botSy);
+  ctx.stroke();
+  for (const sy of [topSy, botSy]) {
+    ctx.beginPath();
+    ctx.moveTo(innerX - TICK / 2, sy - TICK / 2);
+    ctx.lineTo(innerX + TICK / 2, sy + TICK / 2);
+    ctx.stroke();
+  }
+
+  // Outer (same value here, but stays consistent with horizontal layout)
+  ctx.beginPath();
+  ctx.moveTo(outerX, topSy);
+  ctx.lineTo(outerX, botSy);
+  ctx.stroke();
+  for (const sy of [topSy, botSy]) {
+    ctx.beginPath();
+    ctx.moveTo(outerX - TICK / 2, sy - TICK / 2);
+    ctx.lineTo(outerX + TICK / 2, sy + TICK / 2);
+    ctx.stroke();
+  }
+
+  // Rotated label for vertical depth
+  ctx.save();
+  ctx.translate(outerX - 3, (topSy + botSy) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillStyle = LABEL_COLOR;
+  ctx.font = "bold 10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
-  ctx.fillText(`${bldgH.toFixed(2)}m`, ts(bldgH / 2), depthY - 6);
+  ctx.fillText(`${bldgH.toFixed(2)} m`, 0, 0);
+  ctx.restore();
 
+  // Inner depth label (same value, shown smaller next to inner line)
+  ctx.save();
+  ctx.translate(innerX - 3, (topSy + botSy) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillStyle = LABEL_COLOR;
+  ctx.font = "9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(bldgH.toFixed(2), 0, 0);
   ctx.restore();
 }
 
