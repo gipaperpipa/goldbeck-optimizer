@@ -93,6 +93,25 @@ export function FloorPlanViewer({
   const toggleLayer = (k: keyof typeof layers) =>
     setLayers((p) => ({ ...p, [k]: !p[k] }));
 
+  // View mode — Architect (technical, all layers, crisp black linework) vs
+  // Presentation (client-facing, hides grid/dimensions, clean white background).
+  const [viewMode, setViewMode] = useState<"architect" | "presentation">("architect");
+  const applyViewMode = (mode: "architect" | "presentation") => {
+    setViewMode(mode);
+    if (mode === "architect") {
+      setLayers({
+        grid: true, rooms: true, walls: true, openings: true,
+        labels: true, dimensions: true, annotations: true,
+      });
+    } else {
+      // Presentation: hide technical layers, keep rooms + walls + openings + labels
+      setLayers({
+        grid: false, rooms: true, walls: true, openings: true,
+        labels: true, dimensions: false, annotations: true,
+      });
+    }
+  };
+
   // Precompute transform
   const getTransform = useCallback(() => {
     const grid = floorPlan.structural_grid;
@@ -314,19 +333,23 @@ export function FloorPlanViewer({
     const bldgW = grid.building_length_m;
     const bldgH = grid.building_depth_m;
 
+    const isPresentation = viewMode === "presentation";
+
     // --- 1. Background ---
     ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = "#fafaf8";
+    ctx.fillStyle = isPresentation ? "#ffffff" : "#fafaf8";
     ctx.fillRect(0, 0, width, height);
 
-    // --- 2. Building shadow/depth effect ---
-    ctx.fillStyle = "#e8e4df";
-    const shadowOffset = 2;
-    ctx.fillRect(tx(0) + shadowOffset, ty(bldgH) + shadowOffset, ts(bldgW), ts(bldgH));
+    // --- 2. Building shadow/depth effect (Architect mode only) ---
+    if (!isPresentation) {
+      ctx.fillStyle = "#e8e4df";
+      const shadowOffset = 2;
+      ctx.fillRect(tx(0) + shadowOffset, ty(bldgH) + shadowOffset, ts(bldgW), ts(bldgH));
+    }
 
-    // --- 3. Building outline (thick solid line) ---
+    // --- 3. Building outline ---
     ctx.strokeStyle = "#2b2520";
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = isPresentation ? 1.8 : 2.5;
     ctx.strokeRect(tx(0), ty(bldgH), ts(bldgW), ts(bldgH));
 
     // --- 4. Structural grid with axis labels ---
@@ -429,7 +452,7 @@ export function FloorPlanViewer({
       12,
       height - 8
     );
-  }, [floorPlan, width, height, hoveredAptId, selectedApartmentId, getTransform, measurePoints, snapPoint, measureMode, layers]);
+  }, [floorPlan, width, height, hoveredAptId, selectedApartmentId, getTransform, measurePoints, snapPoint, measureMode, layers, viewMode]);
 
   const handleMeasureToggle = () => {
     setMeasureMode(!measureMode);
@@ -453,6 +476,31 @@ export function FloorPlanViewer({
         onMouseMove={handleMouseMove}
       />
       <div className="absolute top-2 right-2 flex gap-2">
+        {/* View mode segmented toggle */}
+        <div className="inline-flex rounded overflow-hidden border border-neutral-300 text-sm font-medium">
+          <button
+            onClick={() => applyViewMode("architect")}
+            className={`px-3 py-1.5 transition-colors ${
+              viewMode === "architect"
+                ? "bg-neutral-900 text-white"
+                : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+            }`}
+            title="Technical drawing — all layers, grid, dimensions"
+          >
+            Architect
+          </button>
+          <button
+            onClick={() => applyViewMode("presentation")}
+            className={`px-3 py-1.5 transition-colors border-l border-neutral-300 ${
+              viewMode === "presentation"
+                ? "bg-neutral-900 text-white"
+                : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+            }`}
+            title="Client-facing — clean layout, no grid or dimensions"
+          >
+            Presentation
+          </button>
+        </div>
         <div className="relative">
           <button
             onClick={() => setShowLayerPanel((v) => !v)}
