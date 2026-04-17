@@ -43,13 +43,22 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 ## Last Request
 **Status:** DONE
 **Date:** 2026-04-17
-**Request:** Plan + implement stale test cleanup, then Phase 2 (generation intelligence)
-**Progress:** Both done. Stale `VALID_RASTERS` tests fixed. Phase 2 shipped: solar bias in Ganghaus allocation, acoustic zoning score, smooth Gaussian aspect ratios, distribution-arm hallway gene. Also fixed a silent Phase 1 bug where `evaluate_quality()` was reading `floor_plans[0]` on every per-floor eval. All committed + pushed (`ce82800`, `fd57302`).
+**Request:** Phase 3 viewer upgrade (3.0–3.5)
+**Progress:** Six slices shipped in one session — responsive full-viewport viewer, DIN 1356 drawing conventions (poché walls, window mullions, proper door swings), DIN 406 dimension strings, layer visibility controls, Architect/Presentation dual mode, and click-to-inspect element panel. All committed + pushed. Remaining: 3.6 interactive editing (wall drag, etc.) + 3.7 persistence/undo — big enough to deserve their own session.
 
 ## Current State
 **Last updated:** 2026-04-17
 
 ### Recently completed
+- **Phase 3.0–3.5: Viewer upgrade** (2026-04-17):
+  - **3.0 Full viewport** — viewer now fills available viewport via `ResizeObserver`; sidebar scrolls independently alongside, stacks below at <lg. Commit `345fbd9`.
+  - **3.1 Drawing conventions** — DIN 1356: exterior bearing walls solid black, interior bearing get diagonal poché hatch, non-bearing partitions light fill + outline. Windows redrawn with two parallel wall-face lines + centered glass line + jamb caps + interior sill tick. Doors drawn at 90° open position with quarter-circle swing, hinge dot, jamb lines. Commit `6757603`.
+  - **3.2 Dimensions** — DIN 406 two-string system: inner per-bay widths with 45° tick slashes, outer overall dimension with bold label + end ticks, extension lines from building edge. Pixel-based offsets so strings fit in the 50px padding at any zoom. Commit `6ee1257`.
+  - **3.3 Layer controls** — Layers dropdown toggles grid/rooms/walls/openings/labels/dimensions/annotations. Each draw step gated on its flag. Commit `9bdeedb`.
+  - **3.4 Dual mode** — Architect/Presentation segmented toggle. Architect: all layers on, soft bg, drop shadow, thick outline. Presentation: grid + dims off, pure white, no shadow, slim outline. Commit `e879367`.
+  - **3.5 Element inspection** — Click priority: windows → doors → walls → rooms. Inspector overlay (bottom-left) shows type-specific properties. Apartment sidebar selection still fires alongside room clicks. Commit `7b0cef9`.
+  - Files changed: `frontend/src/components/floorplan/floor-plan-panel.tsx`, `frontend/src/components/floorplan/floor-plan-viewer.tsx`
+  - TypeScript clean after every slice; no backend changes.
 - **Phase 2: Generation intelligence** (2026-04-17):
   - **B.1 Solar awareness** — `evaluate_quality()` refactored from `BuildingFloorPlans` → single `FloorPlan + building_depth_m` (silent Phase 1 bug fix: per-floor avg was re-using Floor-0 quality). Ganghaus allocation now puts the "extra" (odd count) of each apartment type on the side that compass-faces south after `rotation_deg`.
   - **B.2 Acoustic zoning** — new `score_acoustic_zoning()` in `quality_scoring.py`: bedroom-to-bathroom intra-apt distance + bedroom-to-staircase distance. Wired into fitness as `acoustic`, weight 0.7 in livability.
@@ -98,7 +107,7 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **Start Phase 3** — Interactive plan editor (full viewport, dual mode, wall dragging, real-time validation). See `IMPLEMENTATION_PLAN.md`.
+- **Phase 3.6 interactive editing** — 3.0–3.5 shipped (viewport, drawing conventions, dimensions, layers, dual mode, inspection). Still to do: 3.6a-e (wall drag, door move, room relabel, real-time validation) + 3.7 persistence/undo-redo. Biggest frontend epic remaining — give it its own session.
 - **Rhino plugin still not compiled** — `.NET SDK` is not installed on this machine (only the runtime). `dotnet build` fails with "No .NET SDKs were found". User needs to install Visual Studio 2022 with .NET desktop workload, or the standalone .NET SDK, before the plugin can be built. BUILD.md has the one-line build command once SDK is present.
 - **WFS health check from Railway** — After the next backend deploy, hit `/api/v1/cadastral/diagnostics/wfs-health` on the Railway URL to verify all 16-state endpoints are live. Not known locally — the URL is assigned by Railway.
 - **Unrelated pre-existing test failure** — `test_financial_calculator.py::TestFinancialCalculatorZeroGuards::test_zero_total_dev_cost_edge` asserts `roi_pct == 0` but gets `-100.0` when there are zero units/revenue but nonzero debt service. Not related to floor plan work — separate fix.
