@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Building2, Loader2, AlertTriangle, Clock, Zap, Trophy, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useProjectStore } from "@/stores/project-store";
@@ -73,6 +73,27 @@ export function FloorPlanPanel() {
     revenue: 0.25,
     compliance: 0.25,
   });
+
+  // Responsive viewer sizing — observe container and feed width/height to canvas
+  const viewerContainerRef = useRef<HTMLDivElement | null>(null);
+  const [viewerSize, setViewerSize] = useState({ width: 900, height: 600 });
+
+  useEffect(() => {
+    const el = viewerContainerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        // Clamp to sane minimums; height driven by aspect of container
+        setViewerSize({
+          width: Math.max(320, Math.floor(width)),
+          height: Math.max(320, Math.floor(height)),
+        });
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const buildings = selectedLayout?.buildings || [];
 
@@ -452,20 +473,24 @@ export function FloorPlanPanel() {
         </div>
       )}
 
-      {/* Main content */}
+      {/* Main content — full viewport floor plan with responsive viewer + sidebar */}
       {currentFloor && currentFloorPlans ? (
-        <div className="grid grid-cols-[1fr_280px] gap-4">
-          <div>
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-4">
+          <div
+            ref={viewerContainerRef}
+            className="relative w-full bg-white border rounded-lg overflow-hidden"
+            style={{ height: "calc(100vh - 280px)", minHeight: 480 }}
+          >
             <FloorPlanViewer
               floorPlan={currentFloor}
-              width={900}
-              height={600}
+              width={viewerSize.width}
+              height={viewerSize.height}
               selectedApartmentId={selectedApt?.id}
               onApartmentSelect={setSelectedApt}
             />
           </div>
 
-          <div className="space-y-4">
+          <div className="space-y-4 lg:max-h-[calc(100vh-280px)] lg:overflow-y-auto lg:pr-1">
             {/* Summary card */}
             <div className="bg-white border rounded-lg p-4 space-y-2">
               <h4 className="font-semibold text-sm text-neutral-700">Building Summary</h4>
