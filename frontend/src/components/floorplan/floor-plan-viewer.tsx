@@ -569,33 +569,84 @@ function drawWall(
 
   let wallThickness: number;
   let fillColor: string;
+  let strokeColor: string | null = null;
+  let pocheHatch = false;
 
   if (wall.is_bearing) {
     if (wall.is_exterior) {
+      // Exterior bearing — solid black (DIN 1356 "tragende Außenwand")
       wallThickness = ts(wall.thickness_m || 0.25);
-      fillColor = "#2b2520"; // Solid black/dark
+      fillColor = "#1a1612";
     } else {
+      // Interior bearing — dark fill + diagonal poché hatch
       wallThickness = ts(wall.thickness_m || 0.2);
-      fillColor = "#1e1a15"; // Dark gray
+      fillColor = "#2e2822";
+      pocheHatch = true;
     }
   } else if (wall.is_exterior) {
     wallThickness = ts(wall.thickness_m || 0.15);
-    fillColor = "#4a453f"; // Medium gray
+    fillColor = "#4a453f";
   } else {
+    // Non-bearing partition — light fill + crisp outline (DIN 1356 "nichttragende Wand")
     wallThickness = ts(wall.thickness_m || 0.08);
-    fillColor = "#b8b4ad"; // Light gray
+    fillColor = "#d4cfc6";
+    strokeColor = "#2b2520";
   }
 
-  // Draw wall as a filled rectangle
+  // Wall rectangle corners
   const offset = wallThickness / 2;
+  const c1x = startX + perpX * offset, c1y = startY + perpY * offset;
+  const c2x = endX + perpX * offset,   c2y = endY + perpY * offset;
+  const c3x = endX - perpX * offset,   c3y = endY - perpY * offset;
+  const c4x = startX - perpX * offset, c4y = startY - perpY * offset;
+
   ctx.fillStyle = fillColor;
   ctx.beginPath();
-  ctx.moveTo(startX + perpX * offset, startY + perpY * offset);
-  ctx.lineTo(endX + perpX * offset, endY + perpY * offset);
-  ctx.lineTo(endX - perpX * offset, endY - perpY * offset);
-  ctx.lineTo(startX - perpX * offset, startY - perpY * offset);
+  ctx.moveTo(c1x, c1y);
+  ctx.lineTo(c2x, c2y);
+  ctx.lineTo(c3x, c3y);
+  ctx.lineTo(c4x, c4y);
   ctx.closePath();
   ctx.fill();
+
+  // Poché hatch overlay for interior bearing walls
+  if (pocheHatch) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(c1x, c1y);
+    ctx.lineTo(c2x, c2y);
+    ctx.lineTo(c3x, c3y);
+    ctx.lineTo(c4x, c4y);
+    ctx.closePath();
+    ctx.clip();
+    ctx.strokeStyle = "rgba(255,255,255,0.25)";
+    ctx.lineWidth = 0.6;
+    const minX = Math.min(c1x, c2x, c3x, c4x);
+    const maxX = Math.max(c1x, c2x, c3x, c4x);
+    const minY = Math.min(c1y, c2y, c3y, c4y);
+    const maxY = Math.max(c1y, c2y, c3y, c4y);
+    const step = 4;
+    const range = (maxX - minX) + (maxY - minY);
+    ctx.beginPath();
+    for (let d = -range; d <= range; d += step) {
+      ctx.moveTo(minX + d, minY);
+      ctx.lineTo(minX + d + (maxY - minY), maxY);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Thin outline for non-bearing partitions
+  if (strokeColor) {
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(c1x, c1y);
+    ctx.lineTo(c2x, c2y);
+    ctx.moveTo(c4x, c4y);
+    ctx.lineTo(c3x, c3y);
+    ctx.stroke();
+  }
 }
 
 function drawWindow(
@@ -620,34 +671,51 @@ function drawWindow(
     screenAngle = Math.atan2(ey - sy, ex - sx);
   }
 
+  // Wall-thickness band for window (two parallel face lines with glass in between)
+  const wallTh = ts((hostWall?.thickness_m ?? 0.25));
+  const halfT = wallTh / 2;
+
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(screenAngle);
 
-  // Window opening line (along wall direction)
+  // 1. Erase the wall fill under the opening (so we sit cleanly inside the wall)
+  ctx.fillStyle = "#fafaf8";
+  ctx.fillRect(-w / 2, -halfT, w, wallTh);
+
+  // 2. Outer + inner wall face lines through the opening (DIN 1356)
+  ctx.strokeStyle = "#2b2520";
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, -halfT);
+  ctx.lineTo(w / 2, -halfT);
+  ctx.moveTo(-w / 2, halfT);
+  ctx.lineTo(w / 2, halfT);
+  ctx.stroke();
+
+  // 3. Frame end-caps (jambs)
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, -halfT);
+  ctx.lineTo(-w / 2, halfT);
+  ctx.moveTo(w / 2, -halfT);
+  ctx.lineTo(w / 2, halfT);
+  ctx.stroke();
+
+  // 4. Glass pane — single centered line along the wall axis
   ctx.strokeStyle = "#4a9fd8";
-  ctx.lineWidth = 2.5;
+  ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.moveTo(-w / 2, 0);
   ctx.lineTo(w / 2, 0);
   ctx.stroke();
 
-  // Glass pane indicator (arc perpendicular to wall)
-  const arcRadius = ts(0.3);
-  ctx.strokeStyle = "#2e7db3";
-  ctx.lineWidth = 1;
+  // 5. Sill tick on the interior face (assume interior = positive side)
+  ctx.strokeStyle = "#7a7066";
+  ctx.lineWidth = 0.8;
   ctx.beginPath();
-  ctx.arc(0, 0, arcRadius, 0, Math.PI, false);
-  ctx.stroke();
-
-  // End ticks (perpendicular to wall direction)
-  ctx.strokeStyle = "#4a9fd8";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(-w / 2, -2.5);
-  ctx.lineTo(-w / 2, 2.5);
-  ctx.moveTo(w / 2, -2.5);
-  ctx.lineTo(w / 2, 2.5);
+  ctx.moveTo(-w / 2 + 1, halfT + 1.5);
+  ctx.lineTo(w / 2 - 1, halfT + 1.5);
   ctx.stroke();
 
   ctx.restore();
@@ -676,28 +744,50 @@ function drawDoor(
   }
 
   const color = door.is_entrance ? "#c96e28" : "#8b6914";
+  const wallTh = ts((hostWall?.thickness_m ?? 0.12));
+  const halfT = wallTh / 2;
 
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(screenAngle);
 
-  // Door leaf line (along wall direction)
-  ctx.strokeStyle = color;
-  ctx.lineWidth = door.is_entrance ? 2 : 1.5;
-  ctx.beginPath();
-  ctx.moveTo(-doorW / 2, 0);
-  ctx.lineTo(doorW / 2, 0);
-  ctx.stroke();
+  // 1. Erase the wall fill under the opening so the door doesn't sit on top of hatch
+  ctx.fillStyle = "#fafaf8";
+  ctx.fillRect(-doorW / 2, -halfT, doorW, wallTh);
 
-  // 90-degree swing arc (opens perpendicular to wall)
-  const arcRadius = doorW * 0.65;
-  ctx.strokeStyle = color;
-  ctx.globalAlpha = 0.4;
+  // 2. Jambs (short frame lines at both ends, across wall thickness)
+  ctx.strokeStyle = "#2b2520";
   ctx.lineWidth = 1.2;
   ctx.beginPath();
-  ctx.arc(doorW / 2, 0, arcRadius, Math.PI, Math.PI / 2, true);
+  ctx.moveTo(-doorW / 2, -halfT);
+  ctx.lineTo(-doorW / 2, halfT);
+  ctx.moveTo(doorW / 2, -halfT);
+  ctx.lineTo(doorW / 2, halfT);
+  ctx.stroke();
+
+  // 3. Door leaf at 90° (drawn in the open position, hinged at left jamb)
+  //    Leaf swings to the interior side (positive Y in local frame).
+  ctx.strokeStyle = color;
+  ctx.lineWidth = door.is_entrance ? 2.2 : 1.6;
+  ctx.beginPath();
+  ctx.moveTo(-doorW / 2, 0);
+  ctx.lineTo(-doorW / 2, doorW);
+  ctx.stroke();
+
+  // 4. Swing arc — quarter circle from open leaf tip to closed (right jamb)
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = 0.55;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(-doorW / 2, 0, doorW, 0, Math.PI / 2, false);
   ctx.stroke();
   ctx.globalAlpha = 1;
+
+  // 5. Hinge dot
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(-doorW / 2, 0, 1.5, 0, Math.PI * 2);
+  ctx.fill();
 
   ctx.restore();
 }
