@@ -10,6 +10,7 @@ import type {
   DoorPlacement,
   FloorPlanRoom,
 } from "@/types/api";
+import { useProjectStore, editedPlanKey } from "@/stores/project-store";
 
 /** Props for the 2D canvas floor plan renderer.
  * @property floorPlan - Single-storey floor plan data (rooms, walls, doors, windows).
@@ -24,6 +25,12 @@ interface FloorPlanViewerProps {
   height?: number;
   selectedApartmentId?: string | null;
   onApartmentSelect?: (apt: FloorPlanApartment | null) => void;
+  /** When both `buildingId` and `floorIndex` are provided, user edits are
+   *  persisted to the Zustand store (localStorage-backed) under the key
+   *  `${buildingId}:${floorIndex}`. Page reload restores the saved edits
+   *  if the plan's fingerprint still matches (Phase 3.7b). */
+  buildingId?: string;
+  floorIndex?: number;
 }
 
 /**
@@ -165,6 +172,42 @@ const ROOM_TYPE_LABELS: Record<(typeof REASSIGNABLE_ROOM_TYPES)[number], string>
  *  are evicted from the front when the stack would exceed this. */
 const MAX_HISTORY = 20;
 
+// ── Edit persistence (Phase 3.7b) ─────────────────────────────────────────
+/**
+ * Stable fingerprint of a FloorPlan's structural identity — the set of
+ * UUIDs the backend generated for rooms / walls / openings, plus the
+ * building dimensions. Edits do not change these IDs, so the fingerprint
+ * stays constant through an edit session. A re-run of the optimizer
+ * produces new UUIDs and thus a different fingerprint, which invalidates
+ * any stored edits (so the user sees the fresh generation, not a stale
+ * edit stack applied on top).
+ *
+ * Uses a 32-bit FNV-1a hash — fast, no crypto import, stable across
+ * reloads and browsers.
+ */
+function fingerprintPlan(plan: FloorPlan): string {
+  const parts: string[] = [
+    String(plan.floor_index),
+    plan.structural_grid.building_length_m.toFixed(3),
+    plan.structural_grid.building_depth_m.toFixed(3),
+    String(plan.rooms.length),
+    String(plan.walls.length),
+    String(plan.doors.length),
+    String(plan.windows.length),
+    ...plan.rooms.map((r) => r.id).sort(),
+    ...plan.walls.map((w) => w.id).sort(),
+    ...plan.doors.map((d) => d.id).sort(),
+    ...plan.windows.map((w) => w.id).sort(),
+  ];
+  const s = parts.join("|");
+  let hash = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0; // FNV prime, keep as uint32
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
 // ── Real-time validation (Phase 3.6e) ─────────────────────────────────────
 
 /** Habitable room types — require natural light, relaxed aspect ratio rules,
@@ -232,6 +275,8 @@ export function FloorPlanViewer({
   height = 600,
   selectedApartmentId,
   onApartmentSelect,
+  buildingId,
+  floorIndex,
 }: FloorPlanViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hoveredAptId, setHoveredAptId] = useState<string | null>(null);
@@ -273,15 +318,50 @@ export function FloorPlanViewer({
   // opens a popover to change the room type (3.6d).
   // Edits live in a local copy of the FloorPlan; the prop is never mutated.
   const [editMode, setEditMode] = useState<"none" | "wall" | "opening" | "room">("none");
+
+  // ── Persistence (Phase 3.7b) ─────────────────────────────────────────────
+  // When buildingId + floorIndex are both provided, edits are persisted to
+  // the Zustand store (localStorage-backed). Survives page reload so long
+  // as the original plan's fingerprint still matches.
+  const persistKey = useMemo(
+    () =>
+      buildingId && floorIndex !== undefined
+        ? editedPlanKey(buildingId, floorIndex)
+        : null,
+    [buildingId, floorIndex],
+  );
+  const originalFingerprint = useMemo(() => fingerprintPlan(floorPlan), [floorPlan]);
+  const setEditedFloorPlan = useProjectStore((s) => s.setEditedFloorPlan);
+  const clearEditedFloorPlan = useProjectStore((s) => s.clearEditedFloorPlan);
+
   const [editedPlan, setEditedPlan] = useState<FloorPlan>(floorPlan);
   // ── Undo/redo history (Phase 3.7a) ───────────────────────────────────────
   // A bounded stack of FloorPlan snapshots, one per discrete commit (wall
   // drag, opening drag, opening delete, room type change). Intermediate drag
   // frames never push — only the final post-commit plan does. The effect
   // below syncs `editedPlan` when the index moves (undo/redo/reset).
-  const [history, setHistory] = useState<{ stack: FloorPlan[]; index: number }>({
-    stack: [floorPlan],
-    index: 0,
+  //
+  // Lazy initializer: if the store has a saved edit for this plan AND the
+  // original's fingerprint still matches, hydrate the history from the
+  // saved plan (single-entry stack — prior undo history is not persisted).
+  // Otherwise start fresh from the server-provided plan.
+  const [history, setHistory] = useState<{ stack: FloorPlan[]; index: number }>(() => {
+    if (persistKey) {
+      // Can't read from hook here; grab once from the store directly.
+      const entry = useProjectStore.getState().editedFloorPlans[persistKey];
+      if (entry && entry.originalFingerprint === originalFingerprint) {
+        return { stack: [entry.plan], index: 0 };
+      }
+    }
+    return { stack: [floorPlan], index: 0 };
+  });
+  /** True on first render iff the initial history was hydrated from localStorage.
+   *  Used to surface a "wiederhergestellt" pill in the toolbar so the user
+   *  knows they're looking at persisted edits rather than the fresh plan. */
+  const [restoredFromStore, setRestoredFromStore] = useState<boolean>(() => {
+    if (!persistKey) return false;
+    const entry = useProjectStore.getState().editedFloorPlans[persistKey];
+    return !!(entry && entry.originalFingerprint === originalFingerprint);
   });
   useEffect(() => {
     setEditedPlan(history.stack[history.index]);
@@ -302,6 +382,33 @@ export function FloorPlanViewer({
       return { stack: appended, index: appended.length - 1 };
     });
   }, []);
+
+  // Persist the current history tip (after any commit/undo/redo) to the
+  // store. Debounced implicitly by React's batching — each state update
+  // triggers one effect run. Only writes when persistKey is present AND
+  // the current plan is actually a user edit (not the pristine original).
+  useEffect(() => {
+    if (!persistKey) return;
+    const current = history.stack[history.index];
+    if (current === floorPlan) {
+      // Back at the original — remove any stored edit so next mount
+      // doesn't show a stale "wiederhergestellt" pill.
+      clearEditedFloorPlan(persistKey);
+      return;
+    }
+    // The store adds `savedAt` internally.
+    setEditedFloorPlan(persistKey, {
+      originalFingerprint,
+      plan: current,
+    });
+  }, [
+    history,
+    persistKey,
+    floorPlan,
+    originalFingerprint,
+    setEditedFloorPlan,
+    clearEditedFloorPlan,
+  ]);
   const undo = useCallback(() => {
     setHistory((prev) => (prev.index === 0 ? prev : { ...prev, index: prev.index - 1 }));
   }, []);
@@ -340,9 +447,26 @@ export function FloorPlanViewer({
   const [lastSyncedPlan, setLastSyncedPlan] = useState<FloorPlan>(floorPlan);
   if (floorPlan !== lastSyncedPlan) {
     setLastSyncedPlan(floorPlan);
-    // Clear history — the new server plan is the only entry. editedPlan is
-    // synced by the history useEffect above.
-    setHistory({ stack: [floorPlan], index: 0 });
+    // A newly-arrived server plan — check the store for a matching saved
+    // edit (by the NEW fingerprint, not the outgoing one). This handles the
+    // common case where a user navigates away and back without the plan
+    // regenerating. If the fingerprint differs (e.g. the optimizer just
+    // produced a fresh plan), fall back to a clean single-entry stack.
+    const newFingerprint = fingerprintPlan(floorPlan);
+    let nextHistory: { stack: FloorPlan[]; index: number } = {
+      stack: [floorPlan],
+      index: 0,
+    };
+    let nextRestored = false;
+    if (persistKey) {
+      const entry = useProjectStore.getState().editedFloorPlans[persistKey];
+      if (entry && entry.originalFingerprint === newFingerprint) {
+        nextHistory = { stack: [entry.plan], index: 0 };
+        nextRestored = true;
+      }
+    }
+    setHistory(nextHistory);
+    setRestoredFromStore(nextRestored);
     setWallDrag(null);
     setHoveredWallId(null);
     setSelectedOpening(null);
@@ -1656,6 +1780,18 @@ export function FloorPlanViewer({
             <span aria-hidden>↷</span>
           </button>
         </div>
+        {/* "Restored from localStorage" pill (Phase 3.7b) — only while
+            current history tip still differs from the original plan, so
+            the pill disappears after a user hits Reset or undoes all. */}
+        {restoredFromStore && editedPlan !== floorPlan && (
+          <span
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-800 border border-amber-300"
+            title="Änderungen wurden aus dem lokalen Speicher wiederhergestellt"
+          >
+            <span aria-hidden>◍</span>
+            wiederhergestellt
+          </span>
+        )}
         <button
           onClick={() => {
             setEditMode((prev) => {
@@ -1744,8 +1880,13 @@ export function FloorPlanViewer({
           <button
             onClick={() => {
               setHistory({ stack: [floorPlan], index: 0 });
+              setRestoredFromStore(false);
               setWallDrag(null);
               setHoveredWallId(null);
+              // Store entry is also cleared by the persistence effect
+              // when it sees history tip === floorPlan again, but clear
+              // eagerly here so the pill disappears immediately.
+              if (persistKey) clearEditedFloorPlan(persistKey);
             }}
             className="px-3 py-1.5 rounded text-sm font-medium bg-gray-200 text-gray-800 hover:bg-gray-300 transition-colors"
             title="Alle Änderungen verwerfen (Verlauf löschen)"

@@ -487,6 +487,8 @@ export function FloorPlanPanel() {
               height={viewerSize.height}
               selectedApartmentId={selectedApt?.id}
               onApartmentSelect={setSelectedApt}
+              buildingId={selectedBuildingId ?? undefined}
+              floorIndex={selectedFloorIndex}
             />
           </div>
 

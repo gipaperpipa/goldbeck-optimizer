@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { persist, createJSONStorage } from "zustand/middleware";
 import type {
   PlotAnalysis,
   RegulationSet,
@@ -8,7 +9,27 @@ import type {
   FinancialAnalysis,
   BuildingFloorPlans,
   FloorPlanVariant,
+  FloorPlan,
 } from "@/types/api";
+
+// ── Edited-floor-plan persistence (Phase 3.7b) ─────────────────────────────
+// A user-edited copy of a generated FloorPlan, stored alongside the original
+// plan's fingerprint so that regenerations can invalidate stale edits.
+export interface EditedFloorPlanEntry {
+  /** Stable fingerprint of the ORIGINAL (unedited) plan, computed once at
+   *  save time. On rehydrate, the viewer compares this against a freshly-
+   *  computed fingerprint of the current floorPlan prop; mismatch → discard. */
+  originalFingerprint: string;
+  /** The edited plan (top of the user's undo stack at the time of last save). */
+  plan: FloorPlan;
+  /** Unix millis at save time — for telemetry and conflict-resolution UX. */
+  savedAt: number;
+}
+
+/** Key format for `editedFloorPlans`. Combines the building id + floor index
+ *  so a building's floors don't clobber each other. */
+export const editedPlanKey = (buildingId: string, floorIndex: number) =>
+  `${buildingId}:${floorIndex}`;
 
 // ── Undo/Redo snapshot ───────────────────────────────────────────────
 // Only tracks the fields that represent meaningful user decisions.
@@ -67,6 +88,21 @@ interface ProjectState {
   selectedFloorIndex: number;
   setSelectedFloorIndex: (index: number) => void;
 
+  // ── User edits to generated plans (Phase 3.7b) ─────────────────────────
+  /** Edited floor plans keyed by `${buildingId}:${floorIndex}`. Persisted
+   *  via the `persist` middleware so edits survive a page reload. */
+  editedFloorPlans: Record<string, EditedFloorPlanEntry>;
+  /** Save a user-edited plan. The viewer computes `originalFingerprint`
+   *  from its `floorPlan` prop once and passes it in here. */
+  setEditedFloorPlan: (
+    key: string,
+    entry: { originalFingerprint: string; plan: FloorPlan },
+  ) => void;
+  /** Remove the edited plan for a given key (Reset). */
+  clearEditedFloorPlan: (key: string) => void;
+  /** Remove all edited plans (invoked on project reset). */
+  clearAllEditedFloorPlans: () => void;
+
   // UI state
   activeTab: string;
   setActiveTab: (tab: string) => void;
@@ -98,7 +134,9 @@ function _takeSnapshot(state: ProjectState): UndoableSnapshot {
   };
 }
 
-export const useProjectStore = create<ProjectState>((set, get) => ({
+export const useProjectStore = create<ProjectState>()(
+  persist(
+    (set, get) => ({
   currentStep: 0,
   setCurrentStep: (step) => set({ currentStep: step }),
 
@@ -205,6 +243,24 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   selectedFloorIndex: 0,
   setSelectedFloorIndex: (index) => set({ selectedFloorIndex: index }),
 
+  // ── Edited floor plans (Phase 3.7b) — survives page reload ──────────
+  editedFloorPlans: {},
+  setEditedFloorPlan: (key, entry) =>
+    set((state) => ({
+      editedFloorPlans: {
+        ...state.editedFloorPlans,
+        [key]: { ...entry, savedAt: Date.now() },
+      },
+    })),
+  clearEditedFloorPlan: (key) =>
+    set((state) => {
+      if (!(key in state.editedFloorPlans)) return state;
+      const next = { ...state.editedFloorPlans };
+      delete next[key];
+      return { editedFloorPlans: next };
+    }),
+  clearAllEditedFloorPlans: () => set({ editedFloorPlans: {} }),
+
   activeTab: "site-plan",
   setActiveTab: (tab) => set({ activeTab: tab }),
 
@@ -265,6 +321,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       financialAnalysis: null,
       floorPlans: {},
       floorPlanVariants: {},
+      editedFloorPlans: {},
       selectedVariantIndex: 0,
       selectedBuildingId: null,
       selectedFloorIndex: 0,
@@ -274,4 +331,30 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       canUndo: false,
       canRedo: false,
     }),
-}));
+    }),
+    {
+      name: "goldbeck-project-store",
+      storage: createJSONStorage(() => localStorage),
+      version: 1,
+      // Only persist the slices a user wants to survive a page reload.
+      // Skipped: large transient results (`optimizationResult`), UI-only
+      // flags (`activeTab`, `currentStep`), and the in-memory undo stacks
+      // (`_undoStack`, `_redoStack`, `canUndo`, `canRedo` — each session
+      // gets a fresh undo history).
+      partialize: (state) => ({
+        plotAnalysis: state.plotAnalysis,
+        regulations: state.regulations,
+        regulationMode: state.regulationMode,
+        germanRegulations: state.germanRegulations,
+        selectedLayout: state.selectedLayout,
+        financialAnalysis: state.financialAnalysis,
+        floorPlans: state.floorPlans,
+        floorPlanVariants: state.floorPlanVariants,
+        editedFloorPlans: state.editedFloorPlans,
+        selectedVariantIndex: state.selectedVariantIndex,
+        selectedBuildingId: state.selectedBuildingId,
+        selectedFloorIndex: state.selectedFloorIndex,
+      }),
+    },
+  ),
+);
