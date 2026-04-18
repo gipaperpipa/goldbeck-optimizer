@@ -94,16 +94,34 @@ const AXIS_ALIGN_TOL = 0.01;
 
 type WallAxis = "x" | "y";
 
+/**
+ * Kinds of wall drag — each applies different validation + snap behaviour.
+ *   • "partition"    — single non-bearing partition, 62.5cm grid snap,
+ *                      DIN minimum area check only (Phase 3.6a).
+ *   • "apt_boundary" — bearing_cross wall sitting between two apartments,
+ *                      all co-axis segments drag together, snaps to
+ *                      structural-grid bay axis positions, adds minimum
+ *                      apartment-width check (Phase 3.6b).
+ */
+type WallDragKind = "partition" | "apt_boundary";
+
 interface WallDragState {
-  wallId: string;
+  wallId: string;              // id of the wall the cursor picked up
+  kind: WallDragKind;
   axis: WallAxis;              // which plan axis the wall moves along
   original: number;            // original wall position on that axis
   current: number;             // snapped current position (updated during drag)
   minPos: number;              // min allowed position (from adjacent rooms)
   maxPos: number;              // max allowed position
+  affectedWallIds: string[];   // all walls that move together (co-axis group)
   affectedRoomIds: string[];   // rooms whose vertices move with the wall
-  valid: boolean;              // false if any affected room < DIN minimum
+  valid: boolean;              // false if validation fails (DIN / apt width)
+  invalidReason?: string;      // human-readable reason for overlay tooltip
 }
+
+/** Minimum apartment width (m) — apartments must keep ≥ this span along
+ *  the building length when an apt-boundary wall is dragged. */
+const MIN_APARTMENT_WIDTH_M = 3.125;  // narrowest Goldbeck bay
 
 export function FloorPlanViewer({
   floorPlan,
@@ -213,15 +231,81 @@ export function FloorPlanViewer({
     };
   }, [plan, width, height]);
 
-  // ── Partition-wall drag helpers (Phase 3.6a) ─────────────────────────────
+  // ── Wall drag helpers (Phase 3.6a partition + Phase 3.6b apt boundary) ───
 
-  /** True if the wall is a draggable interior partition. */
-  const isDraggablePartition = useCallback((wall: WallSegment): boolean => {
-    if (wall.is_bearing) return false;
-    if (wall.is_exterior) return false;
-    // Only "partition" wall_type — not corridor walls, not apartment separation
-    return wall.wall_type === "partition";
-  }, []);
+  /**
+   * Classify a wall for drag purposes. Returns:
+   *   • "partition"    — non-bearing interior partition (3.6a)
+   *   • "apt_boundary" — bearing cross wall separating two different
+   *                      apartments; identified by looking at the rooms
+   *                      whose vertices touch the wall axis (3.6b)
+   *   • null           — not draggable
+   */
+  const getWallDragKind = useCallback(
+    (wall: WallSegment): WallDragKind | null => {
+      if (wall.is_exterior) return null;
+
+      if (!wall.is_bearing && wall.wall_type === "partition") {
+        return "partition";
+      }
+
+      if (wall.is_bearing && wall.wall_type === "bearing_cross") {
+        // Only draggable if it separates two different apartments.
+        // Classify axis and check rooms on either side.
+        const dx = Math.abs(wall.end.x - wall.start.x);
+        const dy = Math.abs(wall.end.y - wall.start.y);
+        const axis: WallAxis | null =
+          dx < AXIS_ALIGN_TOL && dy > AXIS_ALIGN_TOL ? "x" :
+          dy < AXIS_ALIGN_TOL && dx > AXIS_ALIGN_TOL ? "y" : null;
+        if (!axis) return null;
+        const pos = axis === "x"
+          ? (wall.start.x + wall.end.x) / 2
+          : (wall.start.y + wall.end.y) / 2;
+        const perpMin = axis === "x"
+          ? Math.min(wall.start.y, wall.end.y)
+          : Math.min(wall.start.x, wall.end.x);
+        const perpMax = axis === "x"
+          ? Math.max(wall.start.y, wall.end.y)
+          : Math.max(wall.start.x, wall.end.x);
+
+        const leftApts = new Set<string>();
+        const rightApts = new Set<string>();
+        for (const apt of plan.apartments) {
+          for (const room of apt.rooms) {
+            if (room.polygon.length < 3) continue;
+            const alongVals = axis === "x"
+              ? room.polygon.map((p) => p.x)
+              : room.polygon.map((p) => p.y);
+            const perpVals = axis === "x"
+              ? room.polygon.map((p) => p.y)
+              : room.polygon.map((p) => p.x);
+            const pMin = Math.min(...perpVals);
+            const pMax = Math.max(...perpVals);
+            if (pMax < perpMin - VERTEX_MATCH_TOL) continue;
+            if (pMin > perpMax + VERTEX_MATCH_TOL) continue;
+            const aMin = Math.min(...alongVals);
+            const aMax = Math.max(...alongVals);
+            if (Math.abs(aMax - pos) < VERTEX_MATCH_TOL) leftApts.add(apt.id);
+            if (Math.abs(aMin - pos) < VERTEX_MATCH_TOL) rightApts.add(apt.id);
+          }
+        }
+        // Apt boundary if the two sides are non-overlapping, non-empty sets.
+        const overlap = [...leftApts].some((id) => rightApts.has(id));
+        if (!overlap && leftApts.size > 0 && rightApts.size > 0) {
+          return "apt_boundary";
+        }
+      }
+
+      return null;
+    },
+    [plan.apartments]
+  );
+
+  /** Back-compat shim: any wall that has a drag kind is draggable. */
+  const isDraggablePartition = useCallback(
+    (wall: WallSegment): boolean => getWallDragKind(wall) !== null,
+    [getWallDragKind]
+  );
 
   /** Axis-classify an axis-aligned wall; returns null if the wall is skewed. */
   const classifyWallAxis = useCallback(
@@ -276,30 +360,51 @@ export function FloorPlanViewer({
   );
 
   /**
-   * Begin a wall drag: identifies rooms whose polygons share a vertex on the
-   * wall axis (within VERTEX_MATCH_TOL), and precomputes the allowed drag
-   * range so we can clamp cursor motion to valid positions.
+   * Begin a wall drag. Identifies rooms whose polygons share a vertex on
+   * the wall axis (within VERTEX_MATCH_TOL), groups co-axis sibling walls
+   * together (important for apt-boundary drags, which cross the corridor
+   * and so are split into two WallSegments), and precomputes the allowed
+   * drag range.
    */
   const startWallDrag = useCallback(
     (wall: WallSegment): WallDragState | null => {
       const cls = classifyWallAxis(wall);
       if (!cls) return null;
+      const kind = getWallDragKind(wall);
+      if (!kind) return null;
+
+      // Grouping: apt-boundary drags co-move every bearing_cross wall on
+      // the same axis position (Ganghaus splits them at the corridor).
+      const affectedWallIds: string[] = [wall.id];
+      const groupMin: number[] = [cls.min];
+      const groupMax: number[] = [cls.max];
+      if (kind === "apt_boundary") {
+        for (const w of plan.walls) {
+          if (w.id === wall.id) continue;
+          if (w.wall_type !== "bearing_cross") continue;
+          const c2 = classifyWallAxis(w);
+          if (!c2 || c2.axis !== cls.axis) continue;
+          if (Math.abs(c2.pos - cls.pos) > VERTEX_MATCH_TOL) continue;
+          affectedWallIds.push(w.id);
+          groupMin.push(c2.min);
+          groupMax.push(c2.max);
+        }
+      }
+      // Perpendicular coverage = union of all grouped segments
+      const perpMin = Math.min(...groupMin);
+      const perpMax = Math.max(...groupMax);
 
       const affectedRoomIds: string[] = [];
-      // "Left" side: rooms whose max-on-axis equals wall pos (they grow smaller as wall moves toward their side)
-      // "Right" side: rooms whose min-on-axis equals wall pos
-      let leftNeighborMinEdge = -Infinity;   // farthest "other" edge of rooms whose max edge is on the wall
-      let rightNeighborMaxEdge = Infinity;   // closest "other" edge of rooms whose min edge is on the wall
+      let leftNeighborMinEdge = -Infinity;
+      let rightNeighborMaxEdge = Infinity;
 
       for (const room of plan.rooms) {
         if (room.polygon.length < 3) continue;
-        // Only consider rooms that span the wall's perpendicular range
         const perp = cls.axis === "x" ? room.polygon.map((p) => p.y) : room.polygon.map((p) => p.x);
-        const perpMin = Math.min(...perp);
-        const perpMax = Math.max(...perp);
-        // Room must overlap the wall's extent perpendicular to its axis
-        if (perpMax < cls.min - VERTEX_MATCH_TOL) continue;
-        if (perpMin > cls.max + VERTEX_MATCH_TOL) continue;
+        const rPerpMin = Math.min(...perp);
+        const rPerpMax = Math.max(...perp);
+        if (rPerpMax < perpMin - VERTEX_MATCH_TOL) continue;
+        if (rPerpMin > perpMax + VERTEX_MATCH_TOL) continue;
 
         const alongRoom = cls.axis === "x" ? room.polygon.map((p) => p.x) : room.polygon.map((p) => p.y);
         const alongMin = Math.min(...alongRoom);
@@ -310,7 +415,6 @@ export function FloorPlanViewer({
 
         if (onLeftSide) {
           affectedRoomIds.push(room.id);
-          // Left room's "other" edge is alongMin → clamp wall so it doesn't pass that
           if (alongMin > leftNeighborMinEdge) leftNeighborMinEdge = alongMin;
         } else if (onRightSide) {
           affectedRoomIds.push(room.id);
@@ -320,31 +424,54 @@ export function FloorPlanViewer({
 
       if (affectedRoomIds.length === 0) return null;
 
-      // Leave ≥ 1.0m breathing room so validation can still refine with DIN minimums
-      const pad = 1.0;
+      // Pad: partition leaves 1m for DIN; apt boundary must leave at least
+      // one minimum-width bay (3.125m) on each side of the wall.
+      const pad = kind === "apt_boundary" ? MIN_APARTMENT_WIDTH_M : 1.0;
       const minPos = Number.isFinite(leftNeighborMinEdge) ? leftNeighborMinEdge + pad : cls.pos - 10;
       const maxPos = Number.isFinite(rightNeighborMaxEdge) ? rightNeighborMaxEdge - pad : cls.pos + 10;
 
       return {
         wallId: wall.id,
+        kind,
         axis: cls.axis,
         original: cls.pos,
         current: cls.pos,
         minPos,
         maxPos,
+        affectedWallIds,
         affectedRoomIds,
         valid: true,
       };
     },
-    [plan.rooms, classifyWallAxis]
+    [plan.walls, plan.rooms, classifyWallAxis, getWallDragKind]
   );
 
   // applyWallDragOnPlan is a pure helper defined at module scope (below).
 
-  /** Snap a plan-space position to the nearest 62.5cm grid increment. */
-  const snapToGrid = useCallback((pos: number): number => {
-    return Math.round(pos / GRID_UNIT_M) * GRID_UNIT_M;
-  }, []);
+  /** Snap a plan-space position according to the drag kind. Partition
+   *  walls snap to the 62.5cm Goldbeck grid; apt-boundary walls snap to
+   *  the nearest structural bay-axis position (never the building edges). */
+  const snapForDrag = useCallback(
+    (pos: number, drag: WallDragState): number => {
+      if (drag.kind === "apt_boundary" && drag.axis === "x") {
+        const axes = plan.structural_grid.axis_positions_x ?? [];
+        // Allowed snap targets exclude the first and last axis (outer walls).
+        const interior = axes.slice(1, -1);
+        if (interior.length === 0) {
+          return Math.round(pos / GRID_UNIT_M) * GRID_UNIT_M;
+        }
+        let best = interior[0];
+        let bestD = Math.abs(pos - best);
+        for (const a of interior) {
+          const d = Math.abs(pos - a);
+          if (d < bestD) { best = a; bestD = d; }
+        }
+        return best;
+      }
+      return Math.round(pos / GRID_UNIT_M) * GRID_UNIT_M;
+    },
+    [plan.structural_grid.axis_positions_x]
+  );
 
   // Handle click
   const handleClick = useCallback(
@@ -502,11 +629,11 @@ export function FloorPlanViewer({
         const base = preDragPlanRef.current ?? plan;
         const raw = wallDrag.axis === "x" ? planX : planY;
         const clamped = Math.max(wallDrag.minPos, Math.min(wallDrag.maxPos, raw));
-        const snapped = snapToGrid(clamped);
+        const snapped = snapForDrag(clamped, wallDrag);
         if (Math.abs(snapped - wallDrag.current) > 1e-6) {
-          const { plan: nextPlan, valid } = applyWallDragOnPlan(base, wallDrag, snapped);
+          const { plan: nextPlan, valid, invalidReason } = applyWallDragOnPlan(base, wallDrag, snapped);
           setEditedPlan(nextPlan);
-          setWallDrag({ ...wallDrag, current: snapped, valid });
+          setWallDrag({ ...wallDrag, current: snapped, valid, invalidReason });
         }
         canvas.style.cursor = wallDrag.axis === "x" ? "ew-resize" : "ns-resize";
         return;
@@ -605,7 +732,7 @@ export function FloorPlanViewer({
       }
       }); // end rAF callback
     },
-    [plan, hoveredAptId, getTransform, measureMode, editMode, wallDrag, hoveredWallId, wallAtPoint, classifyWallAxis, snapToGrid]
+    [plan, hoveredAptId, getTransform, measureMode, editMode, wallDrag, hoveredWallId, wallAtPoint, classifyWallAxis, snapForDrag]
   );
 
   // Keyboard shortcuts (L10)
@@ -1410,16 +1537,52 @@ function drawEditOverlay(
 ) {
   ctx.save();
 
-  // Highlight all draggable partitions
+  // Precompute the set of apt-boundary wall ids so we can colour them
+  // differently from plain partitions.
+  const aptBoundaryIds = new Set<string>();
+  for (const w of plan.walls) {
+    if (!w.is_bearing || w.is_exterior) continue;
+    if (w.wall_type !== "bearing_cross") continue;
+    const dx = Math.abs(w.end.x - w.start.x);
+    const dy = Math.abs(w.end.y - w.start.y);
+    const axis: "x" | "y" | null =
+      dx < 0.01 && dy > 0.01 ? "x" :
+      dy < 0.01 && dx > 0.01 ? "y" : null;
+    if (!axis) continue;
+    const pos = axis === "x" ? (w.start.x + w.end.x) / 2 : (w.start.y + w.end.y) / 2;
+    const leftApts = new Set<string>();
+    const rightApts = new Set<string>();
+    for (const apt of plan.apartments) {
+      for (const room of apt.rooms) {
+        if (room.polygon.length < 3) continue;
+        const alongVals = axis === "x" ? room.polygon.map((p) => p.x) : room.polygon.map((p) => p.y);
+        const aMin = Math.min(...alongVals), aMax = Math.max(...alongVals);
+        if (Math.abs(aMax - pos) < VERTEX_MATCH_TOL) leftApts.add(apt.id);
+        if (Math.abs(aMin - pos) < VERTEX_MATCH_TOL) rightApts.add(apt.id);
+      }
+    }
+    const overlap = [...leftApts].some((id) => rightApts.has(id));
+    if (!overlap && leftApts.size > 0 && rightApts.size > 0) aptBoundaryIds.add(w.id);
+  }
+
+  // Highlight all draggable walls — partitions in emerald, apt boundaries
+  // in amber (user reads: thick amber = rearrange apartments)
   for (const wall of plan.walls) {
-    if (wall.is_bearing || wall.is_exterior) continue;
-    if (wall.wall_type !== "partition") continue;
+    const isPartition =
+      !wall.is_bearing && !wall.is_exterior && wall.wall_type === "partition";
+    const isAptBoundary = aptBoundaryIds.has(wall.id);
+    if (!isPartition && !isAptBoundary) continue;
 
     const sx = tx(wall.start.x), sy = ty(wall.start.y);
     const ex = tx(wall.end.x),   ey = ty(wall.end.y);
     const isHover = wall.id === hoveredWallId;
-    const isDragging = wallDrag?.wallId === wall.id;
-    const stroke = isDragging ? "#059669" : isHover ? "#10b981" : "#10b98166";
+    const isDragging = wallDrag?.affectedWallIds.includes(wall.id) ?? false;
+
+    // Colour palette: emerald for partitions, amber for apt boundaries
+    const palette = isAptBoundary
+      ? { base: "#f59e0b66", hover: "#f59e0b", active: "#b45309" }
+      : { base: "#10b98166", hover: "#10b981", active: "#059669" };
+    const stroke = isDragging ? palette.active : isHover ? palette.hover : palette.base;
 
     ctx.strokeStyle = stroke;
     ctx.lineWidth = isHover || isDragging ? 3 : 2;
@@ -1476,22 +1639,32 @@ function drawEditOverlay(
       ctx.fillText(text, tx(cx), ty(cy) + 1);
     }
 
-    // Ghost line at current snapped wall position — solid + end caps
-    const wall = plan.walls.find((w) => w.id === wallDrag.wallId);
-    if (wall) {
+    // Ghost line along every wall in the drag group (for apt-boundary
+    // drags this draws both the south-of-corridor and north-of-corridor
+    // segments so the user sees the whole boundary sweeping together).
+    const groupSet = new Set(wallDrag.affectedWallIds);
+    const groupWalls = plan.walls.filter((w) => groupSet.has(w.id));
+    for (const w of groupWalls) {
       ctx.strokeStyle = stroke;
       ctx.lineWidth = 2.2;
       ctx.beginPath();
-      ctx.moveTo(tx(wall.start.x), ty(wall.start.y));
-      ctx.lineTo(tx(wall.end.x), ty(wall.end.y));
+      ctx.moveTo(tx(w.start.x), ty(w.start.y));
+      ctx.lineTo(tx(w.end.x), ty(w.end.y));
       ctx.stroke();
+    }
 
-      // Snapped-position label near the wall midpoint
-      const mx = (wall.start.x + wall.end.x) / 2;
-      const my = (wall.start.y + wall.end.y) / 2;
+    // Label — Δm and, on failure, the reason
+    const primary = groupWalls[0] ?? plan.walls.find((w) => w.id === wallDrag.wallId);
+    if (primary) {
+      const mx = (primary.start.x + primary.end.x) / 2;
+      const my = (primary.start.y + primary.end.y) / 2;
       const delta = wallDrag.current - wallDrag.original;
       const sign = delta > 0 ? "+" : "";
-      const label = `${sign}${delta.toFixed(3)} m`;
+      const kindTag = wallDrag.kind === "apt_boundary" ? "Apt-Grenze" : "Trennwand";
+      const base = `${kindTag}  ${sign}${delta.toFixed(3)} m`;
+      const label = !wallDrag.valid && wallDrag.invalidReason
+        ? `${base}  ✗ ${wallDrag.invalidReason}`
+        : base;
       ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -1532,12 +1705,16 @@ function applyWallDragOnPlan(
   basePlan: FloorPlan,
   drag: WallDragState,
   newPos: number,
-): { plan: FloorPlan; valid: boolean } {
-  const { wallId, axis, original, affectedRoomIds } = drag;
+): { plan: FloorPlan; valid: boolean; invalidReason?: string } {
+  const { affectedWallIds, axis, original, affectedRoomIds, kind } = drag;
   const key: "x" | "y" = axis;
+  const wallGroup = new Set(affectedWallIds);
 
+  // Move every wall in the drag group (partition: just one; apt_boundary:
+  // every bearing_cross segment on the same axis — e.g. south + north of
+  // the corridor).
   const wallsNext = basePlan.walls.map((w) => {
-    if (w.id !== wallId) return w;
+    if (!wallGroup.has(w.id)) return w;
     return {
       ...w,
       start: { ...w.start, [key]: newPos } as Point2D,
@@ -1547,6 +1724,7 @@ function applyWallDragOnPlan(
 
   const affectedSet = new Set(affectedRoomIds);
   let valid = true;
+  let invalidReason: string | undefined;
 
   const updateRoom = (room: FloorPlanRoom): FloorPlanRoom => {
     if (!affectedSet.has(room.id)) return room;
@@ -1558,7 +1736,12 @@ function applyWallDragOnPlan(
     });
     const newArea = polygonArea(newPoly);
     const minArea = MIN_ROOM_AREA_SQM[room.room_type] ?? 0;
-    if (newArea < minArea - 0.001) valid = false;
+    if (newArea < minArea - 0.001) {
+      valid = false;
+      if (!invalidReason) {
+        invalidReason = `${room.label || room.room_type}: ${newArea.toFixed(1)}m² < ${minArea.toFixed(1)}m²`;
+      }
+    }
     return { ...room, polygon: newPoly, area_sqm: newArea };
   };
 
@@ -1568,9 +1751,32 @@ function applyWallDragOnPlan(
     rooms: apt.rooms.map(updateRoom),
   }));
 
+  // Apt-boundary drags: ensure each affected apartment retains at least
+  // MIN_APARTMENT_WIDTH_M along the drag axis (i.e. no apartment collapses
+  // below one narrow bay).
+  if (kind === "apt_boundary") {
+    for (const apt of apartmentsNext) {
+      // Only check apartments whose rooms were touched
+      const touched = apt.rooms.some((r) => affectedSet.has(r.id));
+      if (!touched) continue;
+      const allAlong = apt.rooms.flatMap((r) =>
+        r.polygon.map((p) => (axis === "x" ? p.x : p.y))
+      );
+      if (allAlong.length === 0) continue;
+      const span = Math.max(...allAlong) - Math.min(...allAlong);
+      if (span < MIN_APARTMENT_WIDTH_M - 0.001) {
+        valid = false;
+        if (!invalidReason) {
+          invalidReason = `Apt ${apt.unit_number || apt.id.slice(0, 3)}: ${span.toFixed(2)}m < ${MIN_APARTMENT_WIDTH_M.toFixed(2)}m`;
+        }
+      }
+    }
+  }
+
   return {
     plan: { ...basePlan, walls: wallsNext, rooms: roomsNext, apartments: apartmentsNext },
     valid,
+    invalidReason,
   };
 }
 

@@ -43,13 +43,23 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 ## Last Request
 **Status:** DONE
 **Date:** 2026-04-18
-**Request:** Phase 3.6a — Partition wall dragging
-**Progress:** Edit mode + draggable partition walls implemented in `floor-plan-viewer.tsx`. Non-bearing partition walls highlight in emerald on hover, drag along their perpendicular axis with 62.5cm grid snap, and translate adjacent room polygon vertices live. Red preview + area badges show when a drag would violate DIN 18011 minimums; invalid drops revert to the pre-drag snapshot. Reset button restores the server copy. Esc cancels an active drag or exits edit mode. Build + typecheck clean.
+**Request:** Phase 3.6b — Apartment boundary adjustment
+**Progress:** Wall-drag system extended to apartment-separation (bearing_cross) walls. Ganghaus-split wall groups drag together, snap to structural-grid bay axes, and validate that every touched apartment retains ≥1 bay (3.125m) plus DIN room minimums. Amber vs. emerald palette distinguishes apt boundaries from partitions; invalidReason shows the specific failure in the drag label. Build + typecheck clean.
 
 ## Current State
 **Last updated:** 2026-04-18
 
 ### Recently completed
+- **Phase 3.6b: Apartment boundary adjustment** (2026-04-18):
+  - Wall classification: new `getWallDragKind()` runtime classifier checks whether rooms on opposite sides of a wall belong to different apartments — returns `"apt_boundary"` for bearing_cross walls between apartments, `"partition"` for the 3.6a case. (Backend emits `WallType.BEARING_CROSS` split at the Ganghaus corridor, not `APT_SEPARATION` — so the separator is detected geometrically.)
+  - Wall grouping: `startWallDrag` groups all co-axis `bearing_cross` segments (the north/south halves split by the corridor) into `affectedWallIds` so the whole apartment boundary translates as one during a drag.
+  - Axis snapping: `snapForDrag` replaces 3.6a's `snapToGrid`. For `apt_boundary` + x-axis drags, snaps to the nearest interior `grid.axis_positions_x` entry (excluding the building endpoints). Partition drags keep the 62.5cm grid snap.
+  - Validation: `applyWallDragOnPlan` now returns an `invalidReason` string. For apt_boundary kind, each touched apartment's span is recomputed from its rooms' min/max X and rejected if `< MIN_APARTMENT_WIDTH_M` (3.125m = one bay). DIN room-minimum check stays on top.
+  - Visual palette: apt boundaries render amber (`#f59e0b66` base / `#f59e0b` hover / `#b45309` active) vs partitions emerald from 3.6a. Drag label shows "Apt-Grenze" vs "Trennwand" and surfaces `invalidReason` on failure.
+  - Pre-drag safety pad: kind-aware — 1.0m for partition, 3.125m for apt_boundary so the clamp range never forces a sub-bay width.
+  - Files changed: `frontend/src/components/floorplan/floor-plan-viewer.tsx` (+~250 lines)
+  - Typecheck clean; `next build` green; lint back to pre-existing 4 issues (0 introduced).
+  - Still pending: 3.6c door/window manipulation, 3.6d room relabeling, 3.6e real-time per-apartment validation overlay, 3.7 persistence + undo/redo.
 - **Phase 3.6a: Partition wall dragging** (2026-04-18):
   - Edit-mode toggle added to the viewer toolbar (emerald button). While active, every draggable partition wall (`wall_type === "partition"`, non-bearing, non-exterior) renders with a dashed emerald hint; hover strengthens it and shows an `ew-resize`/`ns-resize` cursor.
   - Drag hit-test: axis-classifies the wall (horizontal vs vertical), identifies the rooms whose polygon vertices sit exactly on that wall (left-side max-edge or right-side min-edge within 5cm tolerance), and computes a `minPos`/`maxPos` clamp from the neighboring rooms' far edges with a 1.0m safety pad.
@@ -118,8 +128,9 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **Phase 3.6 interactive editing (continued)** — 3.6a shipped (partition wall drag). Still to do: 3.6b apartment boundary drag, 3.6c door/window manipulation, 3.6d room type reassign, 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
-- **Wall-drag known limitation** — only handles axis-aligned partition walls shared by exactly two neighboring rooms. T-junctions (a partition wall ending mid-room) will find no match on one side; in that case the single affected room translates its vertices fine but the wall may no longer meet the perpendicular wall exactly. For the current Goldbeck generator output this is non-issue (all partitions span corridor-to-corridor or gable-to-gable), but revisit if 3.6b introduces new wall topologies.
+- **Phase 3.6 interactive editing (continued)** — 3.6a + 3.6b shipped (partition + apartment boundary drag). Still to do: 3.6c door/window manipulation, 3.6d room type reassign, 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
+- **Wall-drag known limitation** — only handles axis-aligned walls shared by neighboring rooms. T-junctions (a wall ending mid-room) will find no match on one side; the single affected room translates its vertices fine but the wall may no longer meet the perpendicular wall exactly. For the current Goldbeck generator output this is non-issue (all partitions span corridor-to-corridor or gable-to-gable, all apt boundaries are full-building bearing_cross), but revisit if 3.6d introduces new wall topologies.
+- **Apt boundary drag — openings don't follow** — doors/windows sitting on a dragged apt-boundary wall keep their original x-coord; they re-sit on the wall fine in most cases because bearing_cross drags are small (one bay) but a multi-bay drag may leave an opening orphaned. 3.6c door/window drag will give the user a manual fix; long-term a "move openings with the wall" pass belongs on the apt_boundary commit path.
 - **Rhino plugin still not compiled** — `.NET SDK` is not installed on this machine (only the runtime). `dotnet build` fails with "No .NET SDKs were found". User needs to install Visual Studio 2022 with .NET desktop workload, or the standalone .NET SDK, before the plugin can be built. BUILD.md has the one-line build command once SDK is present.
 - **WFS health check from Railway** — After the next backend deploy, hit `/api/v1/cadastral/diagnostics/wfs-health` on the Railway URL to verify all 16-state endpoints are live. Not known locally — the URL is assigned by Railway.
 - **Unrelated pre-existing test failure** — `test_financial_calculator.py::TestFinancialCalculatorZeroGuards::test_zero_total_dev_cost_edge` asserts `roi_pct == 0` but gets `-100.0` when there are zero units/revenue but nonzero debt service. Not related to floor plan work — separate fix.
