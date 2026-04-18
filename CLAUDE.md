@@ -43,6 +43,12 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 ## Last Request
 **Status:** DONE
 **Date:** 2026-04-18
+**Request:** Phase 3.6e — Real-time validation overlay
+**Progress:** `validatePlan()` runs on every plan change via `useMemo`. Per-room checks: DIN minimum area (error) and habitable room aspect ratio > 3:1 (warn). Per-apartment checks: missing bathroom (error), no living/kitchen (error), and declared `{N}_room` vs composition (warn). Circular count badges overlay offending rooms and apartments (red errors / amber warnings, filled with white stroke + drop shadow, offset toward the top-right corner of the scope). Collapsible bottom-right `ValidationPanel` shows either a green "Validierung OK" pill or a red/amber count pill; when opened, issues are grouped by apartment (error-first), each row clickable to flash the room on the canvas + open the inspector. New `validation` layer key toggles the overlay via the Layers dropdown. Typecheck + lint + build all clean.
+
+## Previous Request
+**Status:** DONE
+**Date:** 2026-04-18
 **Request:** Phase 3.6d — Room type reassignment
 **Progress:** New "Rooms" edit mode added to the viewer toolbar (violet). Click any reassignable room (living/bedroom/kitchen/bathroom/hallway/storage) to open a popover offering the six DIN-valid types. Types whose minimum area exceeds the clicked room's area are disabled with a tooltip showing the required minimum. Applying a new type updates the room label, renumbers bedrooms left-to-right by centroid X inside the owning apartment, and recomputes `apartment_type = ${N}_room` where N = bedroom count + (hasLiving ? 1 : 0), capped at [1,5] to match the backend enum. Typecheck + lint + build all clean.
 
@@ -50,6 +56,17 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 **Last updated:** 2026-04-18
 
 ### Recently completed
+- **Phase 3.6e: Real-time validation overlay** (2026-04-18):
+  - Module-scope `validatePlan(plan)` returns `{ issues, byRoom, byApartment, byApartmentAll, errorCount, warnCount }`. Recomputed via `useMemo([plan])` on every edit — O(rooms + apartments), trivially cheap for typical floors.
+  - Per-room checks: `area_sqm < MIN_ROOM_AREA_SQM[type]` (error, message includes both actual and required m²), plus habitable-room (living/bedroom/kitchen) bounding-box aspect ratio > 3:1 (warn, "schwer möblierbar").
+  - Per-apartment checks: missing bathroom (error, checks both `apt.bathroom.area_sqm > 0` and any `bathroom`-type room), missing both living and kitchen (error), and declared `apartment_type` ("3_room" etc.) vs live composition `bedrooms + (hasLiving ? 1 : 0)` — mismatch emits a warn ("3-Zimmer deklariert, tatsächlich 2-Zimmer").
+  - Canvas overlay: `drawValidationOverlay()` draws small filled circular badges (r=10px) — red for error-containing scope, amber for warn-only. Count centered in white. Positioned at 65% from room centroid toward top-right bounding-box corner so the badge doesn't clobber the room label. Apartment-level issues get a badge at the combined rooms' top-right. Drop shadow keeps it legible against any room fill.
+  - `ValidationPanel` React component (bottom-right, z-20): collapsed pill is green ("Validierung OK"), red ("N Fehler") or amber ("N Hinweise"); expanded shows a scrollable issue list (max 60% viewport height) grouped by apartment, error-first sort, each row clicks to `focusRoom` (flash the offending room with a dashed amber outline for 1.8s + open the Inspector on it) or `focusApartment` (selects it via `onApartmentSelect`). Apartment group header is also clickable to jump to the apartment.
+  - New `validation` layer in the Layers dropdown — on by default in Architect mode, off in Presentation mode (via `applyViewMode`).
+  - Focus flash uses a `focusedRoomId` state + timer ref; draw effect renders an amber dashed outline while active. Timer cleared on remount or subsequent focus.
+  - Files changed: `frontend/src/components/floorplan/floor-plan-viewer.tsx` (+~380 lines incl. the panel, overlay helper, and validator)
+  - Typecheck clean; `next build` green; lint back to pre-existing 4 issues (0 introduced).
+  - Still pending: 3.7 persistence + undo/redo.
 - **Phase 3.6d: Room type reassignment** (2026-04-18):
   - New "Rooms" edit-mode toolbar button (violet when active) — mutually exclusive with "Edit" (wall) and "Openings" modes. Enter-the-mode dims every reassignable room with a faint dashed violet outline; hover brightens the outline; the room whose popover is open gets a solid violet outline + light fill.
   - Hit-test: `findRoomAtClick()` picks the innermost containing room (smallest-area tiebreaker) via `isPointInPolygon` — screen-space point projected back through the current zoom/pan transform.
@@ -152,7 +169,9 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **Phase 3.6 interactive editing (continued)** — 3.6a + 3.6b + 3.6c + 3.6d shipped (partition drag, apartment-boundary drag, door/window manipulation, room type reassignment). Still to do: 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
+- **Phase 3.6 interactive editing — COMPLETE** — 3.6a + 3.6b + 3.6c + 3.6d + 3.6e shipped (partition drag, apartment-boundary drag, door/window manipulation, room type reassignment, real-time validation). Remaining Phase 3 work: 3.7 persistence + undo/redo.
+- **Validation — window-presence check deferred** — 3.6e covers DIN minimum areas + aspect ratios + apartment composition, but does NOT yet verify that each habitable room actually has a window (DIN 5034 natural-light requirement). A future rule needs a "window belongs to room" test — one approach is `isPointInPolygon(window.position, room.polygon, inflate=0.2m)` since windows sit on the exterior edge. Add when users can create/delete windows freely (currently 3.6c only allows move/resize/delete — a deleted window is the obvious trigger).
+- **Validation — no fire-egress check** — the IMPLEMENTATION_PLAN mentioned "Fire egress distance exceeded for apt B03" as an example. Skipped because true egress calculation needs a graph from every apartment entrance to the nearest staircase through corridor polygons — significantly more work than a per-room check and rarely violated by the generator. Track separately if needed.
 - **Room reassignment — no Wohnküche-split / kitchen-merge** — 3.6d treats each room as a sealed polygon and swaps only its type + label. It does NOT split a large Wohnküche into "living + kitchen" or merge an adjacent kitchen into a living room. Users who want that topology change must first adjust partitions via 3.6a, then reassign. A future 3.6d.2 could offer a "split at partition" action.
 - **Room reassignment — apartment_type cap** — backend enum is "1_room" … "5_room". A reassignment that pushes N above 5 (e.g. turning every room into a bedroom in a large apartment) is silently clamped to 5. If the user then regenerates or exports IFC, the exported apartment carries the clamped label. Rare in practice (backend-generated apartments are 1–4 rooms) but worth noting.
 - **Wall-drag known limitation** — only handles axis-aligned walls shared by neighboring rooms. T-junctions (a wall ending mid-room) will find no match on one side; the single affected room translates its vertices fine but the wall may no longer meet the perpendicular wall exactly. For the current Goldbeck generator output this is non-issue (all partitions span corridor-to-corridor or gable-to-gable, all apt boundaries are full-building bearing_cross), but revisit if 3.6d introduces new wall topologies.

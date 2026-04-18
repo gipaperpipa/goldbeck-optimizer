@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import type {
   FloorPlan,
   FloorPlanApartment,
@@ -160,6 +160,42 @@ const ROOM_TYPE_LABELS: Record<(typeof REASSIGNABLE_ROOM_TYPES)[number], string>
   storage: "Abstellraum",
 };
 
+// ── Real-time validation (Phase 3.6e) ─────────────────────────────────────
+
+/** Habitable room types — require natural light, relaxed aspect ratio rules,
+ *  and contribute to the apartment's room count. */
+const HABITABLE_ROOM_TYPES: ReadonlyArray<string> = ["living", "bedroom", "kitchen"];
+
+/** Maximum aspect ratio (long / short) for habitable rooms before a warning
+ *  is raised — corridor-shaped rooms are uncomfortable to furnish. */
+const MAX_HABITABLE_ASPECT_RATIO = 3.0;
+
+type IssueSeverity = "error" | "warn";
+
+interface ValidationIssue {
+  severity: IssueSeverity;
+  code: string;
+  message: string;
+  /** Present for room-scoped issues. */
+  roomId?: string;
+  /** Present for apartment-scoped issues. */
+  apartmentId?: string;
+}
+
+interface ValidationResult {
+  issues: ValidationIssue[];
+  /** Room id → issues on this room. */
+  byRoom: Map<string, ValidationIssue[]>;
+  /** Apartment id → issues attached directly to the apartment. */
+  byApartment: Map<string, ValidationIssue[]>;
+  /** Apartment id → union of apartment-level + all its rooms' issues
+   *  (used to colour the apartment indicator). */
+  byApartmentAll: Map<string, ValidationIssue[]>;
+  /** Counts for the summary badge. */
+  errorCount: number;
+  warnCount: number;
+}
+
 interface OpeningDragState {
   kind: OpeningKind;
   id: string;
@@ -208,6 +244,7 @@ export function FloorPlanViewer({
     labels: true,
     dimensions: true,
     annotations: true, // north arrow, scale bar, title
+    validation: true,  // per-room/apartment issue badges (Phase 3.6e)
   });
   const [showLayerPanel, setShowLayerPanel] = useState(false);
   const toggleLayer = (k: keyof typeof layers) =>
@@ -273,6 +310,27 @@ export function FloorPlanViewer({
   // Every render-path below reads `plan`, not the raw prop, so edits are live.
   const plan = editedPlan;
 
+  // ── Live validation (Phase 3.6e) ─────────────────────────────────────────
+  // Recomputed on every plan change (incl. every drag commit / room type
+  // flip). Cheap — O(rooms + apartments) for a handful of each per floor.
+  const validation = useMemo(() => validatePlan(plan), [plan]);
+  const [validationPanelOpen, setValidationPanelOpen] = useState(false);
+  const [focusedRoomId, setFocusedRoomId] = useState<string | null>(null);
+  const focusTimerRef = useRef<number | null>(null);
+  /** Focus a room: flash its outline, open the inspector on it. */
+  const focusRoom = useCallback((roomId: string) => {
+    setFocusedRoomId(roomId);
+    const room = plan.rooms.find((r) => r.id === roomId);
+    if (room) setInspected({ kind: "room", data: room });
+    if (focusTimerRef.current !== null) {
+      window.clearTimeout(focusTimerRef.current);
+    }
+    focusTimerRef.current = window.setTimeout(() => {
+      setFocusedRoomId(null);
+      focusTimerRef.current = null;
+    }, 1800);
+  }, [plan]);
+
   // View mode — Architect (technical, all layers, crisp black linework) vs
   // Presentation (client-facing, hides grid/dimensions, clean white background).
   const [viewMode, setViewMode] = useState<"architect" | "presentation">("architect");
@@ -281,13 +339,13 @@ export function FloorPlanViewer({
     if (mode === "architect") {
       setLayers({
         grid: true, rooms: true, walls: true, openings: true,
-        labels: true, dimensions: true, annotations: true,
+        labels: true, dimensions: true, annotations: true, validation: true,
       });
     } else {
       // Presentation: hide technical layers, keep rooms + walls + openings + labels
       setLayers({
         grid: false, rooms: true, walls: true, openings: true,
-        labels: true, dimensions: false, annotations: true,
+        labels: true, dimensions: false, annotations: true, validation: false,
       });
     }
   };
@@ -1340,6 +1398,30 @@ export function FloorPlanViewer({
       );
     }
 
+    // --- 15e. Validation overlay (Phase 3.6e) ---
+    if (layers.validation && validation.issues.length > 0) {
+      drawValidationOverlay(ctx, plan, validation, tx, ty);
+    }
+    // Focused room flash (triggered by clicking a validation panel row)
+    if (focusedRoomId) {
+      const r = plan.rooms.find((x) => x.id === focusedRoomId);
+      if (r && r.polygon.length >= 3) {
+        ctx.save();
+        ctx.beginPath();
+        r.polygon.forEach((p, i) => {
+          if (i === 0) ctx.moveTo(tx(p.x), ty(p.y));
+          else ctx.lineTo(tx(p.x), ty(p.y));
+        });
+        ctx.closePath();
+        ctx.strokeStyle = "#f59e0b";
+        ctx.lineWidth = 3;
+        ctx.setLineDash([6, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+      }
+    }
+
     // --- 16. Title and metadata ---
     if (!layers.annotations) return;
     ctx.fillStyle = "#2b2520";
@@ -1384,6 +1466,8 @@ export function FloorPlanViewer({
     selectedOpening,
     hoveredRoomId,
     roomEditor,
+    validation,
+    focusedRoomId,
   ]);
 
   const handleMeasureToggle = () => {
@@ -1458,6 +1542,7 @@ export function FloorPlanViewer({
                 ["labels", "Room labels"],
                 ["dimensions", "Dimensions"],
                 ["annotations", "North / scale / title"],
+                ["validation", "Validation issues"],
               ] as const).map(([key, label]) => (
                 <label
                   key={key}
@@ -1633,6 +1718,19 @@ export function FloorPlanViewer({
           />
         );
       })()}
+      {layers.validation && (
+        <ValidationPanel
+          plan={plan}
+          validation={validation}
+          open={validationPanelOpen}
+          onToggle={() => setValidationPanelOpen((v) => !v)}
+          onFocusRoom={focusRoom}
+          onFocusApartment={(aptId) => {
+            const apt = plan.apartments.find((a) => a.id === aptId);
+            if (apt && onApartmentSelect) onApartmentSelect(apt);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1839,6 +1937,174 @@ function RoomTypePopover({
             </button>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+// ── Validation summary panel (Phase 3.6e) ─────────────────────────────────
+
+/**
+ * Collapsible panel anchored bottom-right. Collapsed: shows a single pill
+ * with the error + warning counts, colour-coded (green when all-clear).
+ * Expanded: scrollable list of issues grouped by apartment, click a row to
+ * focus (flash) the offending room on the canvas and open the inspector.
+ */
+function ValidationPanel({
+  plan,
+  validation,
+  open,
+  onToggle,
+  onFocusRoom,
+  onFocusApartment,
+}: {
+  plan: FloorPlan;
+  validation: ValidationResult;
+  open: boolean;
+  onToggle: () => void;
+  onFocusRoom: (roomId: string) => void;
+  onFocusApartment: (apartmentId: string) => void;
+}) {
+  const { errorCount, warnCount, issues } = validation;
+  const total = errorCount + warnCount;
+  const allClear = total === 0;
+
+  // Collapsed pill
+  if (!open) {
+    const pillColor = allClear
+      ? "bg-emerald-600 hover:bg-emerald-700"
+      : errorCount > 0
+        ? "bg-rose-600 hover:bg-rose-700"
+        : "bg-amber-500 hover:bg-amber-600";
+    return (
+      <button
+        onClick={onToggle}
+        className={`absolute bottom-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full shadow-lg text-white text-sm font-medium transition-colors z-20 ${pillColor}`}
+        title={
+          allClear
+            ? "Validierung: Alle Prüfungen bestanden"
+            : `${errorCount} Fehler, ${warnCount} Hinweise — klicken für Details`
+        }
+      >
+        <span
+          className="inline-block w-2 h-2 rounded-full bg-white"
+          aria-hidden
+        />
+        <span>
+          {allClear
+            ? "Validierung OK"
+            : `${errorCount > 0 ? `${errorCount} Fehler` : ""}${
+                errorCount > 0 && warnCount > 0 ? " · " : ""
+              }${warnCount > 0 ? `${warnCount} Hinweise` : ""}`}
+        </span>
+      </button>
+    );
+  }
+
+  // Grouped by apartment, with an "unassigned" bucket for rooms with no apt
+  const grouped: { apartmentId: string | null; issues: ValidationIssue[] }[] = [];
+  const byApt = new Map<string | null, ValidationIssue[]>();
+  for (const i of issues) {
+    const key = i.apartmentId ?? null;
+    const arr = byApt.get(key) ?? [];
+    arr.push(i);
+    byApt.set(key, arr);
+  }
+  for (const [apartmentId, list] of byApt) {
+    grouped.push({ apartmentId, issues: list });
+  }
+  // Sort: error-first apartments on top
+  grouped.sort((a, b) => {
+    const aErr = a.issues.some((i) => i.severity === "error") ? 0 : 1;
+    const bErr = b.issues.some((i) => i.severity === "error") ? 0 : 1;
+    if (aErr !== bErr) return aErr - bErr;
+    return b.issues.length - a.issues.length;
+  });
+
+  const aptLabel = (apartmentId: string | null) => {
+    if (apartmentId === null) return "Nicht zugeordnet";
+    const apt = plan.apartments.find((a) => a.id === apartmentId);
+    return apt ? `Wohnung ${apt.unit_number} (${apt.apartment_type})` : apartmentId;
+  };
+
+  return (
+    <div
+      className="absolute bottom-2 right-2 w-80 max-h-[60%] bg-white/98 backdrop-blur border rounded-lg shadow-xl text-sm z-20 flex flex-col"
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between px-3 py-2 border-b bg-neutral-50 rounded-t-lg">
+        <div className="flex items-center gap-2">
+          <span
+            className={`inline-block w-2.5 h-2.5 rounded-full ${
+              allClear
+                ? "bg-emerald-500"
+                : errorCount > 0
+                  ? "bg-rose-500"
+                  : "bg-amber-500"
+            }`}
+          />
+          <span className="font-semibold text-neutral-800 text-xs uppercase tracking-wide">
+            {allClear
+              ? "Validierung"
+              : `${errorCount} Fehler · ${warnCount} Hinweise`}
+          </span>
+        </div>
+        <button
+          onClick={onToggle}
+          className="text-neutral-400 hover:text-neutral-700 leading-none text-lg"
+          title="Schließen"
+        >
+          ×
+        </button>
+      </div>
+      <div className="overflow-y-auto flex-1">
+        {allClear ? (
+          <div className="px-3 py-4 text-center text-neutral-500 text-xs">
+            Alle DIN-Minimalwerte eingehalten, Zusammensetzung schlüssig.
+          </div>
+        ) : (
+          grouped.map(({ apartmentId, issues: aptIssues }) => (
+            <div key={apartmentId ?? "_unassigned"} className="border-b last:border-b-0">
+              <button
+                onClick={() => apartmentId && onFocusApartment(apartmentId)}
+                className="w-full px-3 py-1.5 bg-neutral-50 text-left text-[11px] font-semibold text-neutral-600 uppercase tracking-wide hover:bg-neutral-100 transition-colors"
+                disabled={!apartmentId}
+                title={apartmentId ? "Zur Wohnung springen" : undefined}
+              >
+                {aptLabel(apartmentId)}
+              </button>
+              <ul>
+                {aptIssues.map((issue, idx) => (
+                  <li key={idx}>
+                    <button
+                      onClick={() => {
+                        if (issue.roomId) onFocusRoom(issue.roomId);
+                        else if (issue.apartmentId) onFocusApartment(issue.apartmentId);
+                      }}
+                      className="w-full flex items-start gap-2 px-3 py-2 text-left hover:bg-amber-50 transition-colors"
+                      title={issue.roomId ? "Raum markieren" : "Wohnung auswählen"}
+                    >
+                      <span
+                        className={`mt-1 inline-block w-1.5 h-1.5 rounded-full shrink-0 ${
+                          issue.severity === "error" ? "bg-rose-500" : "bg-amber-500"
+                        }`}
+                      />
+                      <span
+                        className={`text-xs ${
+                          issue.severity === "error"
+                            ? "text-rose-800"
+                            : "text-amber-800"
+                        }`}
+                      >
+                        {issue.message}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))
+        )}
       </div>
     </div>
   );
@@ -2828,6 +3094,241 @@ function drawRoomEditOverlay(
       ctx.setLineDash([]);
     }
   }
+  ctx.restore();
+}
+
+// ── Validation (Phase 3.6e) ───────────────────────────────────────────────
+
+/**
+ * Runs all live validation rules on a plan and returns a structured result.
+ *
+ * Rules:
+ *   • Room area < DIN minimum (`MIN_ROOM_AREA_SQM`) → error
+ *   • Habitable room aspect ratio > `MAX_HABITABLE_ASPECT_RATIO` → warn
+ *   • Apartment has no bathroom → error
+ *   • Apartment has neither living nor kitchen → error
+ *   • Apartment declared `{N}_room` but composition (bedrooms + hasLiving)
+ *     disagrees → warn
+ */
+function validatePlan(plan: FloorPlan): ValidationResult {
+  const issues: ValidationIssue[] = [];
+  const byRoom = new Map<string, ValidationIssue[]>();
+  const byApartment = new Map<string, ValidationIssue[]>();
+  const byApartmentAll = new Map<string, ValidationIssue[]>();
+
+  const pushRoomIssue = (
+    roomId: string,
+    apartmentId: string | undefined,
+    issue: Omit<ValidationIssue, "roomId" | "apartmentId">,
+  ) => {
+    const i: ValidationIssue = { ...issue, roomId, apartmentId };
+    issues.push(i);
+    const arr = byRoom.get(roomId) ?? [];
+    arr.push(i);
+    byRoom.set(roomId, arr);
+    if (apartmentId) {
+      const all = byApartmentAll.get(apartmentId) ?? [];
+      all.push(i);
+      byApartmentAll.set(apartmentId, all);
+    }
+  };
+  const pushApartmentIssue = (
+    apartmentId: string,
+    issue: Omit<ValidationIssue, "roomId" | "apartmentId">,
+  ) => {
+    const i: ValidationIssue = { ...issue, apartmentId };
+    issues.push(i);
+    const arr = byApartment.get(apartmentId) ?? [];
+    arr.push(i);
+    byApartment.set(apartmentId, arr);
+    const all = byApartmentAll.get(apartmentId) ?? [];
+    all.push(i);
+    byApartmentAll.set(apartmentId, all);
+  };
+
+  // ── Per-room checks ─────────────────────────────────────────────────────
+  for (const r of plan.rooms) {
+    const minArea = MIN_ROOM_AREA_SQM[r.room_type];
+    if (minArea !== undefined && r.area_sqm < minArea) {
+      pushRoomIssue(r.id, r.apartment_id, {
+        severity: "error",
+        code: "area_below_min",
+        message: `${r.label || r.room_type}: ${r.area_sqm.toFixed(1)} m² < ${minArea.toFixed(1)} m² (DIN-Minimum)`,
+      });
+    }
+
+    if (HABITABLE_ROOM_TYPES.includes(r.room_type) && r.polygon.length >= 3) {
+      // Axis-aligned bounding box aspect ratio. For the Goldbeck generator's
+      // rectangular rooms this is exact; for future irregular polygons it's
+      // a conservative proxy.
+      const xs = r.polygon.map((p) => p.x);
+      const ys = r.polygon.map((p) => p.y);
+      const w = Math.max(...xs) - Math.min(...xs);
+      const h = Math.max(...ys) - Math.min(...ys);
+      const short = Math.min(w, h);
+      const long = Math.max(w, h);
+      if (short > 0) {
+        const ratio = long / short;
+        if (ratio > MAX_HABITABLE_ASPECT_RATIO) {
+          pushRoomIssue(r.id, r.apartment_id, {
+            severity: "warn",
+            code: "aspect_ratio",
+            message: `${r.label || r.room_type}: Seitenverhältnis ${ratio.toFixed(1)}:1 > ${MAX_HABITABLE_ASPECT_RATIO.toFixed(1)}:1 (schwer möblierbar)`,
+          });
+        }
+      }
+    }
+  }
+
+  // ── Per-apartment checks ────────────────────────────────────────────────
+  for (const apt of plan.apartments) {
+    const types = new Set(apt.rooms.map((r) => r.room_type));
+    const bedroomCount = apt.rooms.filter((r) => r.room_type === "bedroom").length;
+    const hasLiving = types.has("living");
+    const hasKitchen = types.has("kitchen");
+    const hasBathroom = types.has("bathroom") || (apt.bathroom && apt.bathroom.area_sqm > 0);
+
+    if (!hasBathroom) {
+      pushApartmentIssue(apt.id, {
+        severity: "error",
+        code: "no_bathroom",
+        message: `Wohnung ${apt.unit_number}: kein Badezimmer`,
+      });
+    }
+    if (!hasLiving && !hasKitchen) {
+      pushApartmentIssue(apt.id, {
+        severity: "error",
+        code: "no_living_or_kitchen",
+        message: `Wohnung ${apt.unit_number}: weder Wohnraum noch Küche`,
+      });
+    }
+
+    // Composition vs declared apartment_type (e.g. "3_room")
+    const declared = parseInt(apt.apartment_type, 10);
+    if (!Number.isNaN(declared)) {
+      const implied = Math.max(1, Math.min(5, bedroomCount + (hasLiving ? 1 : 0)));
+      if (implied !== declared) {
+        pushApartmentIssue(apt.id, {
+          severity: "warn",
+          code: "composition_mismatch",
+          message: `Wohnung ${apt.unit_number}: ${declared}-Zimmer deklariert, tatsächlich ${implied}-Zimmer`,
+        });
+      }
+    }
+  }
+
+  const errorCount = issues.filter((i) => i.severity === "error").length;
+  const warnCount = issues.filter((i) => i.severity === "warn").length;
+
+  return { issues, byRoom, byApartment, byApartmentAll, errorCount, warnCount };
+}
+
+/** Compute an approximate centroid of a polygon (mean of its vertices).
+ *  Good enough for placing a badge indicator. */
+function polygonCentroid(poly: Point2D[]): Point2D {
+  if (poly.length === 0) return { x: 0, y: 0 };
+  let sx = 0;
+  let sy = 0;
+  for (const p of poly) {
+    sx += p.x;
+    sy += p.y;
+  }
+  return { x: sx / poly.length, y: sy / poly.length };
+}
+
+/**
+ * Draws a small severity badge near each room that has issues, plus apartment-
+ * level issue summaries placed near the apartment's rooms' bounding-box top-right.
+ *
+ * Badge radius 9px; red for any error in scope, amber for warnings only.
+ * Text: total issue count for that scope.
+ */
+function drawValidationOverlay(
+  ctx: CanvasRenderingContext2D,
+  plan: FloorPlan,
+  validation: ValidationResult,
+  tx: (x: number) => number,
+  ty: (y: number) => number,
+) {
+  ctx.save();
+  ctx.font = "600 10px system-ui, -apple-system, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  // Per-room badges
+  for (const [roomId, list] of validation.byRoom) {
+    if (list.length === 0) continue;
+    const room = plan.rooms.find((r) => r.id === roomId);
+    if (!room || room.polygon.length < 3) continue;
+    const c = polygonCentroid(room.polygon);
+    // Place badge offset from the centroid toward the top-right corner of
+    // the room's bounding box, so it doesn't overlap the room label.
+    const xs = room.polygon.map((p) => p.x);
+    const ys = room.polygon.map((p) => p.y);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    // Interpolate 75% from centroid toward top-right corner
+    const bx = tx(c.x + (maxX - c.x) * 0.65);
+    const by = ty(c.y + (minY - c.y) * 0.65);
+    const hasError = list.some((i) => i.severity === "error");
+    drawIssueBadge(ctx, bx, by, list.length, hasError ? "error" : "warn");
+  }
+
+  // Per-apartment badges — placed at the apartment's rooms' combined
+  // top-right, but only if the apartment has apartment-level issues
+  // (room-only issues are already covered by per-room badges).
+  for (const apt of plan.apartments) {
+    const aptIssues = validation.byApartment.get(apt.id) ?? [];
+    if (aptIssues.length === 0) continue;
+    if (apt.rooms.length === 0) continue;
+    // Combined bounding box of all the apartment's rooms
+    let maxX = -Infinity;
+    let minY = Infinity;
+    for (const r of apt.rooms) {
+      for (const p of r.polygon) {
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+      }
+    }
+    if (!Number.isFinite(maxX)) continue;
+    const bx = tx(maxX) - 14;
+    const by = ty(minY) + 14;
+    const hasError = aptIssues.some((i) => i.severity === "error");
+    drawIssueBadge(ctx, bx, by, aptIssues.length, hasError ? "error" : "warn");
+  }
+
+  ctx.restore();
+}
+
+/** Filled pill-shaped badge with a white stroke and the count centered. */
+function drawIssueBadge(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  count: number,
+  severity: "error" | "warn",
+) {
+  const r = 10;
+  const fill = severity === "error" ? "#ef4444" : "#f59e0b";
+  ctx.save();
+  // Drop shadow for contrast against room fills
+  ctx.shadowColor = "rgba(0,0,0,0.25)";
+  ctx.shadowBlur = 4;
+  ctx.shadowOffsetY = 1;
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetY = 0;
+  // White outer ring
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  // Count label
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(String(count), x, y + 0.5);
   ctx.restore();
 }
 
