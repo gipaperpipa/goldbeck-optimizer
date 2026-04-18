@@ -160,6 +160,11 @@ const ROOM_TYPE_LABELS: Record<(typeof REASSIGNABLE_ROOM_TYPES)[number], string>
   storage: "Abstellraum",
 };
 
+// ── Undo/redo history (Phase 3.7a) ────────────────────────────────────────
+/** Maximum number of commits retained in the undo/redo stack. Older entries
+ *  are evicted from the front when the stack would exceed this. */
+const MAX_HISTORY = 20;
+
 // ── Real-time validation (Phase 3.6e) ─────────────────────────────────────
 
 /** Habitable room types — require natural light, relaxed aspect ratio rules,
@@ -269,6 +274,44 @@ export function FloorPlanViewer({
   // Edits live in a local copy of the FloorPlan; the prop is never mutated.
   const [editMode, setEditMode] = useState<"none" | "wall" | "opening" | "room">("none");
   const [editedPlan, setEditedPlan] = useState<FloorPlan>(floorPlan);
+  // ── Undo/redo history (Phase 3.7a) ───────────────────────────────────────
+  // A bounded stack of FloorPlan snapshots, one per discrete commit (wall
+  // drag, opening drag, opening delete, room type change). Intermediate drag
+  // frames never push — only the final post-commit plan does. The effect
+  // below syncs `editedPlan` when the index moves (undo/redo/reset).
+  const [history, setHistory] = useState<{ stack: FloorPlan[]; index: number }>({
+    stack: [floorPlan],
+    index: 0,
+  });
+  useEffect(() => {
+    setEditedPlan(history.stack[history.index]);
+  }, [history]);
+  /** Always points at the latest editedPlan — used by mouseup commit handlers
+   *  so the useCallback doesn't have to re-bind on every drag frame. */
+  const editedPlanRef = useRef(editedPlan);
+  useEffect(() => {
+    editedPlanRef.current = editedPlan;
+  }, [editedPlan]);
+  const commitEdit = useCallback((plan: FloorPlan) => {
+    setHistory((prev) => {
+      const truncated = prev.stack.slice(0, prev.index + 1);
+      const appended = [...truncated, plan];
+      if (appended.length > MAX_HISTORY) {
+        return { stack: appended.slice(-MAX_HISTORY), index: MAX_HISTORY - 1 };
+      }
+      return { stack: appended, index: appended.length - 1 };
+    });
+  }, []);
+  const undo = useCallback(() => {
+    setHistory((prev) => (prev.index === 0 ? prev : { ...prev, index: prev.index - 1 }));
+  }, []);
+  const redo = useCallback(() => {
+    setHistory((prev) =>
+      prev.index >= prev.stack.length - 1 ? prev : { ...prev, index: prev.index + 1 },
+    );
+  }, []);
+  const canUndo = history.index > 0;
+  const canRedo = history.index < history.stack.length - 1;
   const [wallDrag, setWallDrag] = useState<WallDragState | null>(null);
   const [hoveredWallId, setHoveredWallId] = useState<string | null>(null);
   /** Snapshot of editedPlan taken at drag start, used to revert on invalid/cancel. */
@@ -297,7 +340,9 @@ export function FloorPlanViewer({
   const [lastSyncedPlan, setLastSyncedPlan] = useState<FloorPlan>(floorPlan);
   if (floorPlan !== lastSyncedPlan) {
     setLastSyncedPlan(floorPlan);
-    setEditedPlan(floorPlan);
+    // Clear history — the new server plan is the only entry. editedPlan is
+    // synced by the history useEffect above.
+    setHistory({ stack: [floorPlan], index: 0 });
     setWallDrag(null);
     setHoveredWallId(null);
     setSelectedOpening(null);
@@ -970,6 +1015,9 @@ export function FloorPlanViewer({
       const moved = Math.abs(wallDrag.current - wallDrag.original) > 0.001;
       if (!wallDrag.valid || !moved) {
         if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+      } else {
+        // Valid & moved → push the final plan onto the undo/redo stack.
+        commitEdit(editedPlanRef.current);
       }
       preDragPlanRef.current = null;
       setWallDrag(null);
@@ -981,11 +1029,13 @@ export function FloorPlanViewer({
       const changed = posMoved || widthChanged;
       if (!openingDrag.valid || !changed) {
         if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+      } else {
+        commitEdit(editedPlanRef.current);
       }
       preDragPlanRef.current = null;
       setOpeningDrag(null);
     }
-  }, [wallDrag, openingDrag]);
+  }, [wallDrag, openingDrag, commitEdit]);
 
   // Handle mouse move for hover and snap detection (rAF-throttled)
   const handleMouseMove = useCallback(
@@ -1233,12 +1283,12 @@ export function FloorPlanViewer({
         !openingDrag
       ) {
         e.preventDefault();
-        setEditedPlan((prev) => {
-          if (selectedOpening.kind === "window") {
-            return { ...prev, windows: prev.windows.filter((w) => w.id !== selectedOpening.id) };
-          }
-          return { ...prev, doors: prev.doors.filter((d) => d.id !== selectedOpening.id) };
-        });
+        const prev = editedPlanRef.current;
+        const next: FloorPlan =
+          selectedOpening.kind === "window"
+            ? { ...prev, windows: prev.windows.filter((w) => w.id !== selectedOpening.id) }
+            : { ...prev, doors: prev.doors.filter((d) => d.id !== selectedOpening.id) };
+        commitEdit(next);
         setSelectedOpening(null);
         setHoveredOpening(null);
       }
@@ -1249,11 +1299,27 @@ export function FloorPlanViewer({
       if (e.key === "c" || e.key === "C") {
         setMeasurePoints([]);
       }
+      // Undo / redo (Phase 3.7a) — only when no drag is active. Ctrl+Shift+Z
+      // also triggers redo to match most editors' expectation.
+      const ctrl = e.ctrlKey || e.metaKey;
+      if (ctrl && !wallDrag && !openingDrag) {
+        if (e.key === "z" || e.key === "Z") {
+          e.preventDefault();
+          if (e.shiftKey) {
+            redo();
+          } else {
+            undo();
+          }
+        } else if (e.key === "y" || e.key === "Y") {
+          e.preventDefault();
+          redo();
+        }
+      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening, roomEditor]);
+  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening, roomEditor, undo, redo, commitEdit]);
 
   // Main draw effect
   useEffect(() => {
@@ -1560,6 +1626,36 @@ export function FloorPlanViewer({
             </div>
           )}
         </div>
+        {/* Undo / Redo (Phase 3.7a) */}
+        <div className="inline-flex rounded overflow-hidden border border-neutral-300 text-sm font-medium">
+          <button
+            onClick={undo}
+            disabled={!canUndo || !!wallDrag || !!openingDrag}
+            className={`px-2.5 py-1.5 transition-colors ${
+              canUndo && !wallDrag && !openingDrag
+                ? "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                : "bg-gray-50 text-gray-300 cursor-not-allowed"
+            }`}
+            title={`Rückgängig (Ctrl+Z)${canUndo ? ` — ${history.index} Schritt${history.index === 1 ? "" : "e"} verfügbar` : ""}`}
+            aria-label="Undo"
+          >
+            {/* Undo arrow glyph */}
+            <span aria-hidden>↶</span>
+          </button>
+          <button
+            onClick={redo}
+            disabled={!canRedo || !!wallDrag || !!openingDrag}
+            className={`px-2.5 py-1.5 transition-colors border-l border-neutral-300 ${
+              canRedo && !wallDrag && !openingDrag
+                ? "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                : "bg-gray-50 text-gray-300 cursor-not-allowed"
+            }`}
+            title={`Wiederherstellen (Ctrl+Y / Ctrl+Shift+Z)${canRedo ? ` — ${history.stack.length - 1 - history.index} Schritt${history.stack.length - 1 - history.index === 1 ? "" : "e"} verfügbar` : ""}`}
+            aria-label="Redo"
+          >
+            <span aria-hidden>↷</span>
+          </button>
+        </div>
         <button
           onClick={() => {
             setEditMode((prev) => {
@@ -1647,12 +1743,12 @@ export function FloorPlanViewer({
         {editedPlan !== floorPlan && (
           <button
             onClick={() => {
-              setEditedPlan(floorPlan);
+              setHistory({ stack: [floorPlan], index: 0 });
               setWallDrag(null);
               setHoveredWallId(null);
             }}
             className="px-3 py-1.5 rounded text-sm font-medium bg-gray-200 text-gray-800 hover:bg-gray-300 transition-colors"
-            title="Alle Wand-Änderungen zurücksetzen"
+            title="Alle Änderungen verwerfen (Verlauf löschen)"
           >
             Reset
           </button>
@@ -1712,7 +1808,7 @@ export function FloorPlanViewer({
             onClose={() => setRoomEditor(null)}
             onApply={(newType) => {
               const nextPlan = applyRoomTypeChangeOnPlan(editedPlan, room.id, newType);
-              setEditedPlan(nextPlan);
+              commitEdit(nextPlan);
               setRoomEditor(null);
             }}
           />

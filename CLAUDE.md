@@ -43,6 +43,12 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 ## Last Request
 **Status:** DONE
 **Date:** 2026-04-18
+**Request:** Phase 3.7a — Undo / redo history
+**Progress:** Bounded 20-step history stack (`{ stack: FloorPlan[]; index: number }`). `commitEdit(plan)` pushes onto history, truncating any existing redo tail. Undo/redo just move the index; an effect syncs `editedPlan` to `history.stack[history.index]` on every history change. Live drag frames still use `setEditedPlan` directly (no history pollution); only the final valid commit on mouseup calls `commitEdit`. Same for opening deletion (Delete/Backspace) and room type reassignment. Keyboard: Ctrl+Z (undo), Ctrl+Y / Ctrl+Shift+Z (redo), no-ops during an active drag. New segmented Undo/Redo button group in the toolbar (↶ / ↷ glyphs) with disabled state + step counter in the title tooltip. Reset button now clears history to `{ [floorPlan], 0 }`. New plan prop resets the stack too. Typecheck + lint + build all clean.
+
+## Previous Request
+**Status:** DONE
+**Date:** 2026-04-18
 **Request:** Phase 3.6e — Real-time validation overlay
 **Progress:** `validatePlan()` runs on every plan change via `useMemo`. Per-room checks: DIN minimum area (error) and habitable room aspect ratio > 3:1 (warn). Per-apartment checks: missing bathroom (error), no living/kitchen (error), and declared `{N}_room` vs composition (warn). Circular count badges overlay offending rooms and apartments (red errors / amber warnings, filled with white stroke + drop shadow, offset toward the top-right corner of the scope). Collapsible bottom-right `ValidationPanel` shows either a green "Validierung OK" pill or a red/amber count pill; when opened, issues are grouped by apartment (error-first), each row clickable to flash the room on the canvas + open the inspector. New `validation` layer key toggles the overlay via the Layers dropdown. Typecheck + lint + build all clean.
 
@@ -56,6 +62,18 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 **Last updated:** 2026-04-18
 
 ### Recently completed
+- **Phase 3.7a: Undo / redo history** (2026-04-18):
+  - Bounded stack of `FloorPlan` snapshots (`MAX_HISTORY = 20`). State shape is a single `{ stack, index }` object so `setHistory` updates both atomically; going past MAX_HISTORY evicts from the front.
+  - `commitEdit(plan)` is the single entry point for committing discrete edits. It slices off any redo tail (`stack.slice(0, index + 1)`), appends the new plan, and advances the index. Called from: wall-drag mouseup (valid & moved), opening-drag mouseup (valid & changed), opening Delete/Backspace, and RoomTypePopover `onApply`.
+  - `undo()` / `redo()` just move the index (clamped to `[0, stack.length - 1]`). An effect `useEffect(() => setEditedPlan(history.stack[history.index]), [history])` syncs `editedPlan` to whatever slot the index points at. Live drag frames still call `setEditedPlan` directly without touching history — same design as before — and the effect no-ops when `history` doesn't change.
+  - `editedPlanRef` keeps the latest editedPlan accessible to `handleMouseUp` / the keydown handler without adding it to the useCallback deps (would cause recreation on every drag frame).
+  - Keyboard: `Ctrl+Z` (or `Cmd+Z` on mac) → undo, `Ctrl+Shift+Z` / `Ctrl+Y` → redo. `preventDefault()` called so the browser's built-in undo doesn't also fire. Suppressed while a drag is active (consistent with the existing Esc-first rule).
+  - Toolbar: new segmented Undo/Redo button group (↶ / ↷ glyphs) placed between the Layers dropdown and the Edit mode button. Disabled state when at stack endpoints or during a drag. Tooltips show the remaining step count ("N Schritte verfügbar").
+  - Reset button reworked to reset history (`setHistory({ stack: [floorPlan], index: 0 })`) rather than just `setEditedPlan(floorPlan)`, so the user can't undo-back-into already-discarded edits.
+  - Plan-prop change path also resets history via the same pattern — the new server plan becomes the sole history entry.
+  - Files changed: `frontend/src/components/floorplan/floor-plan-viewer.tsx` (+~90 lines)
+  - Typecheck clean; `next build` green; lint back to pre-existing 4 issues (0 introduced).
+  - Still pending: 3.7b persistence (user_overrides on FloorPlan + optimizer-rerun preservation).
 - **Phase 3.6e: Real-time validation overlay** (2026-04-18):
   - Module-scope `validatePlan(plan)` returns `{ issues, byRoom, byApartment, byApartmentAll, errorCount, warnCount }`. Recomputed via `useMemo([plan])` on every edit — O(rooms + apartments), trivially cheap for typical floors.
   - Per-room checks: `area_sqm < MIN_ROOM_AREA_SQM[type]` (error, message includes both actual and required m²), plus habitable-room (living/bedroom/kitchen) bounding-box aspect ratio > 3:1 (warn, "schwer möblierbar").
@@ -169,7 +187,8 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **Phase 3.6 interactive editing — COMPLETE** — 3.6a + 3.6b + 3.6c + 3.6d + 3.6e shipped (partition drag, apartment-boundary drag, door/window manipulation, room type reassignment, real-time validation). Remaining Phase 3 work: 3.7 persistence + undo/redo.
+- **Phase 3.6 interactive editing — COMPLETE** — 3.6a + 3.6b + 3.6c + 3.6d + 3.6e shipped (partition drag, apartment-boundary drag, door/window manipulation, room type reassignment, real-time validation).
+- **Phase 3.7 status** — 3.7a (undo/redo) shipped. 3.7b (persistence) still to do: needs backend `user_overrides` field on `FloorPlan`, an `save_overrides` endpoint, hydration on project reload, and a merge strategy for preserve-vs-clear when the optimizer re-runs. 3.7a is fully client-side — no backend changes.
 - **Validation — window-presence check deferred** — 3.6e covers DIN minimum areas + aspect ratios + apartment composition, but does NOT yet verify that each habitable room actually has a window (DIN 5034 natural-light requirement). A future rule needs a "window belongs to room" test — one approach is `isPointInPolygon(window.position, room.polygon, inflate=0.2m)` since windows sit on the exterior edge. Add when users can create/delete windows freely (currently 3.6c only allows move/resize/delete — a deleted window is the obvious trigger).
 - **Validation — no fire-egress check** — the IMPLEMENTATION_PLAN mentioned "Fire egress distance exceeded for apt B03" as an example. Skipped because true egress calculation needs a graph from every apartment entrance to the nearest staircase through corridor polygons — significantly more work than a per-room check and rarely violated by the generator. Track separately if needed.
 - **Room reassignment — no Wohnküche-split / kitchen-merge** — 3.6d treats each room as a sealed polygon and swaps only its type + label. It does NOT split a large Wohnküche into "living + kitchen" or merge an adjacent kitchen into a living room. Users who want that topology change must first adjust partitions via 3.6a, then reassign. A future 3.6d.2 could offer a "split at partition" action.
