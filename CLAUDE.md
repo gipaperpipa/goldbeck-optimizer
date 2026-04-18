@@ -42,14 +42,25 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 
 ## Last Request
 **Status:** DONE
-**Date:** 2026-04-17
-**Request:** Phase 3 viewer upgrade (3.0–3.5)
-**Progress:** Six slices shipped in one session — responsive full-viewport viewer, DIN 1356 drawing conventions (poché walls, window mullions, proper door swings), DIN 406 dimension strings, layer visibility controls, Architect/Presentation dual mode, and click-to-inspect element panel. All committed + pushed. Remaining: 3.6 interactive editing (wall drag, etc.) + 3.7 persistence/undo — big enough to deserve their own session.
+**Date:** 2026-04-18
+**Request:** Phase 3.6a — Partition wall dragging
+**Progress:** Edit mode + draggable partition walls implemented in `floor-plan-viewer.tsx`. Non-bearing partition walls highlight in emerald on hover, drag along their perpendicular axis with 62.5cm grid snap, and translate adjacent room polygon vertices live. Red preview + area badges show when a drag would violate DIN 18011 minimums; invalid drops revert to the pre-drag snapshot. Reset button restores the server copy. Esc cancels an active drag or exits edit mode. Build + typecheck clean.
 
 ## Current State
-**Last updated:** 2026-04-17
+**Last updated:** 2026-04-18
 
 ### Recently completed
+- **Phase 3.6a: Partition wall dragging** (2026-04-18):
+  - Edit-mode toggle added to the viewer toolbar (emerald button). While active, every draggable partition wall (`wall_type === "partition"`, non-bearing, non-exterior) renders with a dashed emerald hint; hover strengthens it and shows an `ew-resize`/`ns-resize` cursor.
+  - Drag hit-test: axis-classifies the wall (horizontal vs vertical), identifies the rooms whose polygon vertices sit exactly on that wall (left-side max-edge or right-side min-edge within 5cm tolerance), and computes a `minPos`/`maxPos` clamp from the neighboring rooms' far edges with a 1.0m safety pad.
+  - Live preview applies the drag against a pre-drag snapshot (stored in a ref) on every mousemove: wall start/end updated, affected room polygon vertices translated, `area_sqm` recomputed via shoelace formula. Position snaps to the Goldbeck 62.5cm grid (`GRID_UNIT_M = 0.625`).
+  - Validation checks each affected room's area against `MIN_ROOM_AREA_SQM` (mirror of `ApartmentRules.MIN_ROOM_AREAS` in the backend: living 14.0, bedroom 8.0, kitchen 4.0, bathroom 2.5, hallway 1.5, storage 0.5). On violation the overlay switches to red + room area badge shows `< {min}` instead of the green checkmark.
+  - Mouseup commits the drag if valid + the wall actually moved; otherwise reverts to the snapshot. Esc cancels an active drag, exits edit mode, or deselects (priority in that order). Mouse-leave auto-commits to avoid orphaned drag state.
+  - A Reset button appears once the edited plan diverges from the server copy, one-click restore. New plan from props (via `floorPlan !== lastSyncedPlan` render-time check) auto-resets local edits.
+  - Internal refactor: `floorPlan` prop renamed to `plan` alias throughout interaction + drawing paths; `plan` reads from new `editedPlan` state. Prop is never mutated.
+  - Files changed: `frontend/src/components/floorplan/floor-plan-viewer.tsx` (+~320 lines)
+  - Typecheck clean; `next build` green; lint back to pre-existing 4 issues (0 introduced).
+  - Still pending: 3.6b apartment boundary adjustment, 3.6c door/window manipulation, 3.6d room relabeling, 3.6e real-time validation overlay, 3.7 persistence + undo/redo.
 - **Phase 3.0–3.5: Viewer upgrade** (2026-04-17):
   - **3.0 Full viewport** — viewer now fills available viewport via `ResizeObserver`; sidebar scrolls independently alongside, stacks below at <lg. Commit `345fbd9`.
   - **3.1 Drawing conventions** — DIN 1356: exterior bearing walls solid black, interior bearing get diagonal poché hatch, non-bearing partitions light fill + outline. Windows redrawn with two parallel wall-face lines + centered glass line + jamb caps + interior sill tick. Doors drawn at 90° open position with quarter-circle swing, hinge dot, jamb lines. Commit `6757603`.
@@ -107,7 +118,8 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **Phase 3.6 interactive editing** — 3.0–3.5 shipped (viewport, drawing conventions, dimensions, layers, dual mode, inspection). Still to do: 3.6a-e (wall drag, door move, room relabel, real-time validation) + 3.7 persistence/undo-redo. Biggest frontend epic remaining — give it its own session.
+- **Phase 3.6 interactive editing (continued)** — 3.6a shipped (partition wall drag). Still to do: 3.6b apartment boundary drag, 3.6c door/window manipulation, 3.6d room type reassign, 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
+- **Wall-drag known limitation** — only handles axis-aligned partition walls shared by exactly two neighboring rooms. T-junctions (a partition wall ending mid-room) will find no match on one side; in that case the single affected room translates its vertices fine but the wall may no longer meet the perpendicular wall exactly. For the current Goldbeck generator output this is non-issue (all partitions span corridor-to-corridor or gable-to-gable), but revisit if 3.6b introduces new wall topologies.
 - **Rhino plugin still not compiled** — `.NET SDK` is not installed on this machine (only the runtime). `dotnet build` fails with "No .NET SDKs were found". User needs to install Visual Studio 2022 with .NET desktop workload, or the standalone .NET SDK, before the plugin can be built. BUILD.md has the one-line build command once SDK is present.
 - **WFS health check from Railway** — After the next backend deploy, hit `/api/v1/cadastral/diagnostics/wfs-health` on the Railway URL to verify all 16-state endpoints are live. Not known locally — the URL is assigned by Railway.
 - **Unrelated pre-existing test failure** — `test_financial_calculator.py::TestFinancialCalculatorZeroGuards::test_zero_total_dev_cost_edge` asserts `roi_pct == 0` but gets `-100.0` when there are zero units/revenue but nonzero debt service. Not related to floor plan work — separate fix.

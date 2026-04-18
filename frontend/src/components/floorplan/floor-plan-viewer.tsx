@@ -65,6 +65,46 @@ const ROOM_BORDER_COLORS: Record<string, string> = {
  */
 const SNAP_RADIUS = 0.3;
 
+/**
+ * Goldbeck structural grid unit — partition walls snap to 62.5cm increments
+ * during interactive drag. Matches Schottwand panel spacing.
+ */
+const GRID_UNIT_M = 0.625;
+
+/**
+ * DIN 18011 / Wohnflächenverordnung minimum room areas (m²) — mirrors
+ * `ApartmentRules.MIN_ROOM_AREAS` in the backend. Used to validate
+ * partition-wall drags: if a drag would shrink a room below its minimum,
+ * the preview turns red and the drag is rejected on release.
+ */
+const MIN_ROOM_AREA_SQM: Record<string, number> = {
+  living: 14.0,
+  bedroom: 8.0,
+  kitchen: 4.0,
+  bathroom: 2.5,
+  hallway: 1.5,
+  storage: 0.5,
+};
+
+/** Tolerance for matching room polygon vertices to a wall axis (meters). */
+const VERTEX_MATCH_TOL = 0.05;
+
+/** Maximum skew (meters) to still treat a wall as axis-aligned. */
+const AXIS_ALIGN_TOL = 0.01;
+
+type WallAxis = "x" | "y";
+
+interface WallDragState {
+  wallId: string;
+  axis: WallAxis;              // which plan axis the wall moves along
+  original: number;            // original wall position on that axis
+  current: number;             // snapped current position (updated during drag)
+  minPos: number;              // min allowed position (from adjacent rooms)
+  maxPos: number;              // max allowed position
+  affectedRoomIds: string[];   // rooms whose vertices move with the wall
+  valid: boolean;              // false if any affected room < DIN minimum
+}
+
 export function FloorPlanViewer({
   floorPlan,
   width = 900,
@@ -102,6 +142,31 @@ export function FloorPlanViewer({
     | null;
   const [inspected, setInspected] = useState<Inspected>(null);
 
+  // ── Edit mode (Phase 3.6a: partition wall dragging) ──────────────────────
+  // When editMode is "wall", partition walls become drag-highlighted on hover
+  // and can be dragged along their perpendicular axis. Edits live in a local
+  // copy of the FloorPlan; the prop is never mutated.
+  const [editMode, setEditMode] = useState<"none" | "wall">("none");
+  const [editedPlan, setEditedPlan] = useState<FloorPlan>(floorPlan);
+  const [wallDrag, setWallDrag] = useState<WallDragState | null>(null);
+  const [hoveredWallId, setHoveredWallId] = useState<string | null>(null);
+  /** Snapshot of editedPlan taken at drag start, used to revert on invalid/cancel. */
+  const preDragPlanRef = useRef<FloorPlan | null>(null);
+
+  // Re-sync local copy whenever a new plan arrives from the server. Done
+  // during render (React's recommended "reset state on prop change" pattern)
+  // rather than in an effect to avoid a cascading re-render.
+  const [lastSyncedPlan, setLastSyncedPlan] = useState<FloorPlan>(floorPlan);
+  if (floorPlan !== lastSyncedPlan) {
+    setLastSyncedPlan(floorPlan);
+    setEditedPlan(floorPlan);
+    setWallDrag(null);
+    setHoveredWallId(null);
+  }
+
+  // Every render-path below reads `plan`, not the raw prop, so edits are live.
+  const plan = editedPlan;
+
   // View mode — Architect (technical, all layers, crisp black linework) vs
   // Presentation (client-facing, hides grid/dimensions, clean white background).
   const [viewMode, setViewMode] = useState<"architect" | "presentation">("architect");
@@ -123,7 +188,7 @@ export function FloorPlanViewer({
 
   // Precompute transform
   const getTransform = useCallback(() => {
-    const grid = floorPlan.structural_grid;
+    const grid = plan.structural_grid;
     const bldgW = grid.building_length_m;
     const bldgH = grid.building_depth_m;
 
@@ -146,7 +211,140 @@ export function FloorPlanViewer({
       invTx: (screenX: number) => (screenX - offsetX) / scale,
       invTy: (screenY: number) => (height - screenY - offsetY) / scale,
     };
-  }, [floorPlan, width, height]);
+  }, [plan, width, height]);
+
+  // ── Partition-wall drag helpers (Phase 3.6a) ─────────────────────────────
+
+  /** True if the wall is a draggable interior partition. */
+  const isDraggablePartition = useCallback((wall: WallSegment): boolean => {
+    if (wall.is_bearing) return false;
+    if (wall.is_exterior) return false;
+    // Only "partition" wall_type — not corridor walls, not apartment separation
+    return wall.wall_type === "partition";
+  }, []);
+
+  /** Axis-classify an axis-aligned wall; returns null if the wall is skewed. */
+  const classifyWallAxis = useCallback(
+    (wall: WallSegment): { axis: WallAxis; pos: number; min: number; max: number } | null => {
+      const dx = Math.abs(wall.end.x - wall.start.x);
+      const dy = Math.abs(wall.end.y - wall.start.y);
+      if (dx < AXIS_ALIGN_TOL && dy > AXIS_ALIGN_TOL) {
+        // Vertical wall — moves along X
+        return {
+          axis: "x",
+          pos: (wall.start.x + wall.end.x) / 2,
+          min: Math.min(wall.start.y, wall.end.y),
+          max: Math.max(wall.start.y, wall.end.y),
+        };
+      }
+      if (dy < AXIS_ALIGN_TOL && dx > AXIS_ALIGN_TOL) {
+        // Horizontal wall — moves along Y
+        return {
+          axis: "y",
+          pos: (wall.start.y + wall.end.y) / 2,
+          min: Math.min(wall.start.x, wall.end.x),
+          max: Math.max(wall.start.x, wall.end.x),
+        };
+      }
+      return null;
+    },
+    []
+  );
+
+  /**
+   * Hit-test: given plan-space cursor coords, return the topmost draggable
+   * partition wall under the cursor (within thickness/2 + 0.08m tolerance).
+   */
+  const wallAtPoint = useCallback(
+    (planX: number, planY: number): WallSegment | null => {
+      for (const wall of plan.walls) {
+        if (!isDraggablePartition(wall)) continue;
+        const sx = wall.start.x, sy = wall.start.y;
+        const ex = wall.end.x, ey = wall.end.y;
+        const dx = ex - sx, dy = ey - sy;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq < 1e-6) continue;
+        const t = Math.max(0, Math.min(1, ((planX - sx) * dx + (planY - sy) * dy) / lenSq));
+        const projX = sx + t * dx, projY = sy + t * dy;
+        const dist = Math.hypot(planX - projX, planY - projY);
+        const tol = (wall.thickness_m || 0.08) / 2 + 0.08;
+        if (dist <= tol) return wall;
+      }
+      return null;
+    },
+    [plan.walls, isDraggablePartition]
+  );
+
+  /**
+   * Begin a wall drag: identifies rooms whose polygons share a vertex on the
+   * wall axis (within VERTEX_MATCH_TOL), and precomputes the allowed drag
+   * range so we can clamp cursor motion to valid positions.
+   */
+  const startWallDrag = useCallback(
+    (wall: WallSegment): WallDragState | null => {
+      const cls = classifyWallAxis(wall);
+      if (!cls) return null;
+
+      const affectedRoomIds: string[] = [];
+      // "Left" side: rooms whose max-on-axis equals wall pos (they grow smaller as wall moves toward their side)
+      // "Right" side: rooms whose min-on-axis equals wall pos
+      let leftNeighborMinEdge = -Infinity;   // farthest "other" edge of rooms whose max edge is on the wall
+      let rightNeighborMaxEdge = Infinity;   // closest "other" edge of rooms whose min edge is on the wall
+
+      for (const room of plan.rooms) {
+        if (room.polygon.length < 3) continue;
+        // Only consider rooms that span the wall's perpendicular range
+        const perp = cls.axis === "x" ? room.polygon.map((p) => p.y) : room.polygon.map((p) => p.x);
+        const perpMin = Math.min(...perp);
+        const perpMax = Math.max(...perp);
+        // Room must overlap the wall's extent perpendicular to its axis
+        if (perpMax < cls.min - VERTEX_MATCH_TOL) continue;
+        if (perpMin > cls.max + VERTEX_MATCH_TOL) continue;
+
+        const alongRoom = cls.axis === "x" ? room.polygon.map((p) => p.x) : room.polygon.map((p) => p.y);
+        const alongMin = Math.min(...alongRoom);
+        const alongMax = Math.max(...alongRoom);
+
+        const onRightSide = Math.abs(alongMin - cls.pos) < VERTEX_MATCH_TOL;
+        const onLeftSide = Math.abs(alongMax - cls.pos) < VERTEX_MATCH_TOL;
+
+        if (onLeftSide) {
+          affectedRoomIds.push(room.id);
+          // Left room's "other" edge is alongMin → clamp wall so it doesn't pass that
+          if (alongMin > leftNeighborMinEdge) leftNeighborMinEdge = alongMin;
+        } else if (onRightSide) {
+          affectedRoomIds.push(room.id);
+          if (alongMax < rightNeighborMaxEdge) rightNeighborMaxEdge = alongMax;
+        }
+      }
+
+      if (affectedRoomIds.length === 0) return null;
+
+      // Leave ≥ 1.0m breathing room so validation can still refine with DIN minimums
+      const pad = 1.0;
+      const minPos = Number.isFinite(leftNeighborMinEdge) ? leftNeighborMinEdge + pad : cls.pos - 10;
+      const maxPos = Number.isFinite(rightNeighborMaxEdge) ? rightNeighborMaxEdge - pad : cls.pos + 10;
+
+      return {
+        wallId: wall.id,
+        axis: cls.axis,
+        original: cls.pos,
+        current: cls.pos,
+        minPos,
+        maxPos,
+        affectedRoomIds,
+        valid: true,
+      };
+    },
+    [plan.rooms, classifyWallAxis]
+  );
+
+  // applyWallDragOnPlan is a pure helper defined at module scope (below).
+
+  /** Snap a plan-space position to the nearest 62.5cm grid increment. */
+  const snapToGrid = useCallback((pos: number): number => {
+    return Math.round(pos / GRID_UNIT_M) * GRID_UNIT_M;
+  }, []);
 
   // Handle click
   const handleClick = useCallback(
@@ -171,20 +369,23 @@ export function FloorPlanViewer({
         return;
       }
 
+      // In edit mode, clicks are absorbed — drag is handled by mousedown/up.
+      if (editMode === "wall") return;
+
       // --- Element inspection (priority: opening → wall → room) ---
       const planX = invTx(mx);
       const planY = invTy(my);
 
       // 1. Windows / doors — hit if within half-width along the host wall + ~0.35m across
       const OPENING_TOL = 0.35;
-      for (const win of floorPlan.windows) {
+      for (const win of plan.windows) {
         const d = Math.hypot(planX - win.position.x, planY - win.position.y);
         if (d <= Math.max(win.width_m / 2, OPENING_TOL)) {
           setInspected({ kind: "window", data: win });
           return;
         }
       }
-      for (const door of floorPlan.doors) {
+      for (const door of plan.doors) {
         const d = Math.hypot(planX - door.position.x, planY - door.position.y);
         if (d <= Math.max(door.width_m / 2, OPENING_TOL)) {
           setInspected({ kind: "door", data: door });
@@ -193,7 +394,7 @@ export function FloorPlanViewer({
       }
 
       // 2. Walls — hit if perpendicular distance to segment < thickness/2 + 0.08m tolerance
-      for (const wall of floorPlan.walls) {
+      for (const wall of plan.walls) {
         const sx = wall.start.x, sy = wall.start.y;
         const ex = wall.end.x, ey = wall.end.y;
         const dx = ex - sx, dy = ey - sy;
@@ -214,7 +415,7 @@ export function FloorPlanViewer({
       let selectedApt: FloorPlanApartment | null = null;
       let selectedRoom: FloorPlanRoom | null = null;
       let smallestArea = Infinity;
-      for (const apt of floorPlan.apartments) {
+      for (const apt of plan.apartments) {
         for (const room of apt.rooms) {
           if (isPointInPolygon(mx, my, room.polygon, invTx, invTy)) {
             const aptArea = apt.rooms.reduce((sum, r) => sum + r.area_sqm, 0);
@@ -238,8 +439,44 @@ export function FloorPlanViewer({
         onApartmentSelect(selectedApt);
       }
     },
-    [floorPlan, onApartmentSelect, getTransform, measureMode, measurePoints, snapPoint]
+    [plan, onApartmentSelect, getTransform, measureMode, measurePoints, snapPoint, editMode]
   );
+
+  // ── Mouse down — start a partition wall drag (edit mode only) ─────────────
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (editMode !== "wall") return;
+      if (e.button !== 0) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const { invTx, invTy } = getTransform();
+      const planX = invTx(e.clientX - rect.left);
+      const planY = invTy(e.clientY - rect.top);
+      const wall = wallAtPoint(planX, planY);
+      if (!wall) return;
+      const drag = startWallDrag(wall);
+      if (!drag) return;
+      preDragPlanRef.current = editedPlan;   // snapshot for revert
+      setWallDrag(drag);
+      setInspected(null);
+      e.preventDefault();
+    },
+    [editMode, getTransform, wallAtPoint, startWallDrag, editedPlan]
+  );
+
+  // ── Mouse up — commit (valid) or revert (invalid) a drag ──────────────────
+  const handleMouseUp = useCallback(() => {
+    if (!wallDrag) return;
+    // editedPlan is already live-updated during mousemove; revert if invalid
+    // or if the wall never moved off its original position.
+    const moved = Math.abs(wallDrag.current - wallDrag.original) > 0.001;
+    if (!wallDrag.valid || !moved) {
+      if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+    }
+    preDragPlanRef.current = null;
+    setWallDrag(null);
+  }, [wallDrag]);
 
   // Handle mouse move for hover and snap detection (rAF-throttled)
   const handleMouseMove = useCallback(
@@ -260,6 +497,32 @@ export function FloorPlanViewer({
       const planX = invTx(mx);
       const planY = invTy(my);
 
+      // Active wall drag — live-update editedPlan so the preview redraws
+      if (wallDrag) {
+        const base = preDragPlanRef.current ?? plan;
+        const raw = wallDrag.axis === "x" ? planX : planY;
+        const clamped = Math.max(wallDrag.minPos, Math.min(wallDrag.maxPos, raw));
+        const snapped = snapToGrid(clamped);
+        if (Math.abs(snapped - wallDrag.current) > 1e-6) {
+          const { plan: nextPlan, valid } = applyWallDragOnPlan(base, wallDrag, snapped);
+          setEditedPlan(nextPlan);
+          setWallDrag({ ...wallDrag, current: snapped, valid });
+        }
+        canvas.style.cursor = wallDrag.axis === "x" ? "ew-resize" : "ns-resize";
+        return;
+      }
+
+      // Edit-mode hover — highlight draggable partition under cursor
+      if (editMode === "wall") {
+        const w = wallAtPoint(planX, planY);
+        const id = w ? w.id : null;
+        if (id !== hoveredWallId) setHoveredWallId(id);
+        canvas.style.cursor = w
+          ? (classifyWallAxis(w)?.axis === "x" ? "ew-resize" : "ns-resize")
+          : "default";
+        return;
+      }
+
       if (measureMode) {
         canvas.style.cursor = "crosshair";
 
@@ -268,7 +531,7 @@ export function FloorPlanViewer({
         let closestDist = SNAP_RADIUS;
 
         // Check wall endpoints
-        for (const wall of floorPlan.walls) {
+        for (const wall of plan.walls) {
           const dist1 = Math.hypot(planX - wall.start.x, planY - wall.start.y);
           if (dist1 < closestDist) {
             closestSnap = wall.start;
@@ -282,7 +545,7 @@ export function FloorPlanViewer({
         }
 
         // Check room corners
-        for (const room of floorPlan.rooms) {
+        for (const room of plan.rooms) {
           for (const pt of room.polygon) {
             const dist = Math.hypot(planX - pt.x, planY - pt.y);
             if (dist < closestDist) {
@@ -293,7 +556,7 @@ export function FloorPlanViewer({
         }
 
         // Check grid intersections
-        const grid = floorPlan.structural_grid;
+        const grid = plan.structural_grid;
         const yPositions = grid.axis_positions_y || [
           grid.outer_wall_south_y || 0,
           grid.corridor_y_start_m || 0,
@@ -320,7 +583,7 @@ export function FloorPlanViewer({
       let hoveredApt: FloorPlanApartment | null = null;
       let smallestArea = Infinity;
 
-      for (const apt of floorPlan.apartments) {
+      for (const apt of plan.apartments) {
         for (const room of apt.rooms) {
           if (isPointInPolygon(mx, my, room.polygon, invTx, invTy)) {
             const aptArea = apt.rooms.reduce((sum, r) => sum + r.area_sqm, 0);
@@ -342,14 +605,22 @@ export function FloorPlanViewer({
       }
       }); // end rAF callback
     },
-    [floorPlan, hoveredAptId, getTransform, measureMode]
+    [plan, hoveredAptId, getTransform, measureMode, editMode, wallDrag, hoveredWallId, wallAtPoint, classifyWallAxis, snapToGrid]
   );
 
   // Keyboard shortcuts (L10)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        if (measureMode) {
+        if (wallDrag) {
+          // Cancel active drag — revert to pre-drag snapshot
+          if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+          preDragPlanRef.current = null;
+          setWallDrag(null);
+        } else if (editMode === "wall") {
+          setEditMode("none");
+          setHoveredWallId(null);
+        } else if (measureMode) {
           setMeasureMode(false);
           setMeasurePoints([]);
         } else if (onApartmentSelect) {
@@ -367,7 +638,7 @@ export function FloorPlanViewer({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [measureMode, onApartmentSelect]);
+  }, [measureMode, onApartmentSelect, editMode, wallDrag]);
 
   // Main draw effect
   useEffect(() => {
@@ -382,7 +653,7 @@ export function FloorPlanViewer({
     ctx.scale(dpr, dpr);
 
     const { tx, ty, ts, scale } = getTransform();
-    const grid = floorPlan.structural_grid;
+    const grid = plan.structural_grid;
     const bldgW = grid.building_length_m;
     const bldgH = grid.building_depth_m;
 
@@ -411,7 +682,7 @@ export function FloorPlanViewer({
     }
 
     // --- 5. Rooms (filled polygons) ---
-    const allRooms = [...floorPlan.rooms];
+    const allRooms = [...plan.rooms];
     if (layers.rooms) {
       for (const room of allRooms) {
         drawRoom(ctx, room, tx, ty, hoveredAptId, selectedApartmentId);
@@ -420,7 +691,7 @@ export function FloorPlanViewer({
 
     // --- 6. Apartment outlines (trace actual apartment boundary) ---
     if (layers.rooms) {
-      for (const apt of floorPlan.apartments) {
+      for (const apt of plan.apartments) {
         const isSelected = apt.id === selectedApartmentId;
         const isHovered = apt.id === hoveredAptId;
         if (isSelected || isHovered) {
@@ -431,21 +702,21 @@ export function FloorPlanViewer({
 
     // --- 7. Walls (filled rectangles with proper thickness) ---
     if (layers.walls) {
-      for (const wall of floorPlan.walls) {
+      for (const wall of plan.walls) {
         drawWall(ctx, wall, tx, ty, ts);
       }
     }
 
     // --- 8. Windows (architectural symbols — oriented along host wall) ---
     if (layers.openings) {
-      for (const win of floorPlan.windows) {
-        const hostWall = findNearestWall2D(win.position, floorPlan.walls);
+      for (const win of plan.windows) {
+        const hostWall = findNearestWall2D(win.position, plan.walls);
         drawWindow(ctx, win, hostWall, tx, ty, ts);
       }
 
       // --- 9. Doors (architectural swing arcs — oriented along host wall) ---
-      for (const door of floorPlan.doors) {
-        const hostWall = findNearestWall2D(door.position, floorPlan.walls);
+      for (const door of plan.doors) {
+        const hostWall = findNearestWall2D(door.position, plan.walls);
         drawDoor(ctx, door, hostWall, tx, ty, ts);
       }
     }
@@ -481,16 +752,21 @@ export function FloorPlanViewer({
       ctx.fill();
     }
 
+    // --- 15b. Edit-mode overlays (draggable partitions + drag preview) ---
+    if (editMode === "wall") {
+      drawEditOverlay(ctx, plan, wallDrag, hoveredWallId, tx, ty);
+    }
+
     // --- 16. Title and metadata ---
     if (!layers.annotations) return;
     ctx.fillStyle = "#2b2520";
     ctx.font = "bold 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     ctx.textAlign = "left";
     ctx.fillText(
-      `${floorPlan.floor_index === 0 ? "EG" : `${floorPlan.floor_index}. OG`} \u2022 ${floorPlan.num_apartments} Wohnungen \u2022 ${
-        floorPlan.access_type === "ganghaus"
+      `${plan.floor_index === 0 ? "EG" : `${plan.floor_index}. OG`} \u2022 ${plan.num_apartments} Wohnungen \u2022 ${
+        plan.access_type === "ganghaus"
           ? "Central Corridor"
-          : floorPlan.access_type === "laubengang"
+          : plan.access_type === "laubengang"
             ? "External Gallery"
             : "Direct Access"
       }`,
@@ -501,11 +777,11 @@ export function FloorPlanViewer({
     ctx.fillStyle = "#7a7066";
     ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     ctx.fillText(
-      `Gross: ${floorPlan.gross_area_sqm.toFixed(1)}m\u00B2 | Net: ${floorPlan.net_area_sqm.toFixed(1)}m\u00B2`,
+      `Gross: ${plan.gross_area_sqm.toFixed(1)}m\u00B2 | Net: ${plan.net_area_sqm.toFixed(1)}m\u00B2`,
       12,
       height - 8
     );
-  }, [floorPlan, width, height, hoveredAptId, selectedApartmentId, getTransform, measurePoints, snapPoint, measureMode, layers, viewMode]);
+  }, [plan, width, height, hoveredAptId, selectedApartmentId, getTransform, measurePoints, snapPoint, measureMode, layers, viewMode, editMode, wallDrag, hoveredWallId]);
 
   const handleMeasureToggle = () => {
     setMeasureMode(!measureMode);
@@ -524,8 +800,11 @@ export function FloorPlanViewer({
         className="border rounded-lg bg-white cursor-default"
         tabIndex={0}
         role="img"
-        aria-label={`Grundriss ${floorPlan.floor_index === 0 ? "EG" : `${floorPlan.floor_index}. OG`} — ${floorPlan.apartments.length} Wohnungen`}
+        aria-label={`Grundriss ${plan.floor_index === 0 ? "EG" : `${plan.floor_index}. OG`} — ${plan.apartments.length} Wohnungen`}
         onClick={handleClick}
+        onMouseDown={handleMouseDown}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
         onMouseMove={handleMouseMove}
       />
       <div className="absolute top-2 right-2 flex gap-2">
@@ -594,6 +873,41 @@ export function FloorPlanViewer({
           )}
         </div>
         <button
+          onClick={() => {
+            setEditMode((prev) => {
+              const next = prev === "wall" ? "none" : "wall";
+              if (next === "wall" && measureMode) {
+                setMeasureMode(false);
+                setMeasurePoints([]);
+              }
+              return next;
+            });
+            setWallDrag(null);
+            setHoveredWallId(null);
+          }}
+          className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+            editMode === "wall"
+              ? "bg-emerald-600 text-white hover:bg-emerald-700"
+              : "bg-gray-200 text-gray-800 hover:bg-gray-300"
+          }`}
+          title="Trennwände verschieben — Rasterung 62.5cm (Esc zum Beenden)"
+        >
+          {editMode === "wall" ? "Editing..." : "Edit"}
+        </button>
+        {editedPlan !== floorPlan && (
+          <button
+            onClick={() => {
+              setEditedPlan(floorPlan);
+              setWallDrag(null);
+              setHoveredWallId(null);
+            }}
+            className="px-3 py-1.5 rounded text-sm font-medium bg-gray-200 text-gray-800 hover:bg-gray-300 transition-colors"
+            title="Alle Wand-Änderungen zurücksetzen"
+          >
+            Reset
+          </button>
+        )}
+        <button
           onClick={handleMeasureToggle}
           className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
             measureMode
@@ -609,7 +923,7 @@ export function FloorPlanViewer({
             const canvas = canvasRef.current;
             if (!canvas) return;
             const link = document.createElement("a");
-            link.download = `grundriss_${floorPlan.floor_index === 0 ? "EG" : `${floorPlan.floor_index}OG`}.png`;
+            link.download = `grundriss_${plan.floor_index === 0 ? "EG" : `${plan.floor_index}OG`}.png`;
             link.href = canvas.toDataURL("image/png");
             link.click();
           }}
@@ -1075,6 +1389,189 @@ function isPointInPolygon(
 
 function sum(arr: number[]): number {
   return arr.reduce((a, b) => a + b, 0);
+}
+
+/**
+ * Edit-mode overlay. Draws:
+ *   • a soft emerald band along every draggable partition wall (hint that
+ *     the wall is grabbable)
+ *   • a brighter emerald band on the hovered wall
+ *   • during an active drag: red/green tinted rectangles over the affected
+ *     rooms with live area badges (value + DIN-minimum threshold)
+ *   • a solid ghost line at the wall's current snapped position
+ */
+function drawEditOverlay(
+  ctx: CanvasRenderingContext2D,
+  plan: FloorPlan,
+  wallDrag: WallDragState | null,
+  hoveredWallId: string | null,
+  tx: (x: number) => number,
+  ty: (y: number) => number,
+) {
+  ctx.save();
+
+  // Highlight all draggable partitions
+  for (const wall of plan.walls) {
+    if (wall.is_bearing || wall.is_exterior) continue;
+    if (wall.wall_type !== "partition") continue;
+
+    const sx = tx(wall.start.x), sy = ty(wall.start.y);
+    const ex = tx(wall.end.x),   ey = ty(wall.end.y);
+    const isHover = wall.id === hoveredWallId;
+    const isDragging = wallDrag?.wallId === wall.id;
+    const stroke = isDragging ? "#059669" : isHover ? "#10b981" : "#10b98166";
+
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = isHover || isDragging ? 3 : 2;
+    ctx.setLineDash(isDragging ? [] : [4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Active drag preview — tint affected rooms + show area badges
+  if (wallDrag) {
+    const affected = new Set(wallDrag.affectedRoomIds);
+    const tint = wallDrag.valid ? "rgba(16,185,129,0.18)" : "rgba(220,38,38,0.22)";
+    const stroke = wallDrag.valid ? "#059669" : "#dc2626";
+
+    for (const room of plan.rooms) {
+      if (!affected.has(room.id)) continue;
+      if (room.polygon.length < 3) continue;
+
+      ctx.fillStyle = tint;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      room.polygon.forEach((p, i) => {
+        if (i === 0) ctx.moveTo(tx(p.x), ty(p.y));
+        else ctx.lineTo(tx(p.x), ty(p.y));
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      // Area badge centered on the room
+      const cx = room.polygon.reduce((a, p) => a + p.x, 0) / room.polygon.length;
+      const cy = room.polygon.reduce((a, p) => a + p.y, 0) / room.polygon.length;
+      const minArea = MIN_ROOM_AREA_SQM[room.room_type] ?? 0;
+      const ok = room.area_sqm >= minArea - 0.001;
+      const text = `${room.area_sqm.toFixed(1)} m² ${ok ? "✓" : `< ${minArea.toFixed(1)}`}`;
+
+      ctx.font = "bold 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      const metrics = ctx.measureText(text);
+      const padX = 6;
+      const boxW = metrics.width + 2 * padX;
+      const boxH = 18;
+      const boxX = tx(cx) - boxW / 2;
+      const boxY = ty(cy) - boxH / 2;
+
+      ctx.fillStyle = ok ? "#059669" : "#dc2626";
+      ctx.fillRect(boxX, boxY, boxW, boxH);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(text, tx(cx), ty(cy) + 1);
+    }
+
+    // Ghost line at current snapped wall position — solid + end caps
+    const wall = plan.walls.find((w) => w.id === wallDrag.wallId);
+    if (wall) {
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(tx(wall.start.x), ty(wall.start.y));
+      ctx.lineTo(tx(wall.end.x), ty(wall.end.y));
+      ctx.stroke();
+
+      // Snapped-position label near the wall midpoint
+      const mx = (wall.start.x + wall.end.x) / 2;
+      const my = (wall.start.y + wall.end.y) / 2;
+      const delta = wallDrag.current - wallDrag.original;
+      const sign = delta > 0 ? "+" : "";
+      const label = `${sign}${delta.toFixed(3)} m`;
+      ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = stroke;
+      const lm = ctx.measureText(label);
+      const lbx = tx(mx) - lm.width / 2 - 4;
+      const lby = ty(my) - 9;
+      ctx.fillRect(lbx, lby, lm.width + 8, 18);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, tx(mx), ty(my));
+    }
+  }
+
+  ctx.restore();
+}
+
+/** Signed polygon area via the shoelace formula; returns absolute m². */
+function polygonArea(poly: Point2D[]): number {
+  if (poly.length < 3) return 0;
+  let s = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    s += (poly[j].x + poly[i].x) * (poly[j].y - poly[i].y);
+  }
+  return Math.abs(s) / 2;
+}
+
+/**
+ * Pure version of wall-drag application. Takes a base FloorPlan and produces
+ * a new one with the wall moved to `newPos`, all affected room polygon
+ * vertices translated, areas recomputed, and a boolean `valid` flag that is
+ * false if any affected room drops below its DIN minimum area.
+ *
+ * This lives at module scope so it can be called from mousemove against the
+ * pre-drag snapshot (not the live edited plan, which already reflects the
+ * previous frame's delta).
+ */
+function applyWallDragOnPlan(
+  basePlan: FloorPlan,
+  drag: WallDragState,
+  newPos: number,
+): { plan: FloorPlan; valid: boolean } {
+  const { wallId, axis, original, affectedRoomIds } = drag;
+  const key: "x" | "y" = axis;
+
+  const wallsNext = basePlan.walls.map((w) => {
+    if (w.id !== wallId) return w;
+    return {
+      ...w,
+      start: { ...w.start, [key]: newPos } as Point2D,
+      end: { ...w.end, [key]: newPos } as Point2D,
+    };
+  });
+
+  const affectedSet = new Set(affectedRoomIds);
+  let valid = true;
+
+  const updateRoom = (room: FloorPlanRoom): FloorPlanRoom => {
+    if (!affectedSet.has(room.id)) return room;
+    const newPoly = room.polygon.map((p) => {
+      if (Math.abs(p[key] - original) < VERTEX_MATCH_TOL) {
+        return { ...p, [key]: newPos } as Point2D;
+      }
+      return p;
+    });
+    const newArea = polygonArea(newPoly);
+    const minArea = MIN_ROOM_AREA_SQM[room.room_type] ?? 0;
+    if (newArea < minArea - 0.001) valid = false;
+    return { ...room, polygon: newPoly, area_sqm: newArea };
+  };
+
+  const roomsNext = basePlan.rooms.map(updateRoom);
+  const apartmentsNext = basePlan.apartments.map((apt) => ({
+    ...apt,
+    rooms: apt.rooms.map(updateRoom),
+  }));
+
+  return {
+    plan: { ...basePlan, walls: wallsNext, rooms: roomsNext, apartments: apartmentsNext },
+    valid,
+  };
 }
 
 function adjustBrightness(hex: string, amount: number): string {
