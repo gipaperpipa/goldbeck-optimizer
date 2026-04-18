@@ -43,13 +43,26 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 ## Last Request
 **Status:** DONE
 **Date:** 2026-04-18
-**Request:** Phase 3.6b — Apartment boundary adjustment
-**Progress:** Wall-drag system extended to apartment-separation (bearing_cross) walls. Ganghaus-split wall groups drag together, snap to structural-grid bay axes, and validate that every touched apartment retains ≥1 bay (3.125m) plus DIN room minimums. Amber vs. emerald palette distinguishes apt boundaries from partitions; invalidReason shows the specific failure in the drag label. Build + typecheck clean.
+**Request:** Phase 3.6c — Door and window manipulation
+**Progress:** New "Openings" edit mode added to the viewer toolbar. Doors & windows become selectable, drag along host wall with 6.25cm snap, windows get amber resize handles at each edge, Delete/Backspace removes the selected opening. Validation rejects drops that collide with another opening on the same wall, come too close to the wall end (<15cm), or fall outside window width range [0.60m, 4.00m]; invalid drop reverts to pre-drag snapshot with a red ghost + reason label. Typecheck + lint + build all clean.
 
 ## Current State
 **Last updated:** 2026-04-18
 
 ### Recently completed
+- **Phase 3.6c: Door & window manipulation** (2026-04-18):
+  - New "Openings" edit-mode toolbar button (sky-blue when active) — mutually exclusive with "Edit" (wall) mode. Each opening-edit session draws soft sky-blue dashed halos around every door/window in the plan as a grabbability hint; hover strengthens the halo.
+  - Hit-test: `openingAtPoint()` projects the cursor onto the opening's host wall axis (identified via the existing `findNearestWall2D`) and checks along-axis distance ≤ `width/2` + perpendicular distance ≤ 0.30m. Windows take priority over doors (mirrors the read-only inspection handler).
+  - Selection + move: mousedown on an opening selects it (amber ring appears) and starts a move drag. The cursor position is clamped to the host wall's interior `[wallMin + 0.15, wallMax - 0.15]m` (15cm `MIN_OPENING_EDGE_M`), and snapped to 6.25cm (`OPENING_SNAP_M` = 1/10 of the Goldbeck grid) for smooth but precise positioning.
+  - Window resize: selected windows get two amber circular resize handles at their along-axis edges. Dragging a handle holds the window's center fixed and moves one edge. Width is clamped to `[0.60m, 4.00m]` and to the available interior space.
+  - Collision: other openings on the same host wall pre-populate a `forbidden: [min, max][]` list (including a `MIN_OPENING_GAP_M = 0.10m` padding). Any drag that produces an opening interval intersecting a forbidden interval fails validation; the overlay tints red and the reason label reads "Kollision mit anderer Öffnung".
+  - Delete: with an opening selected and no active drag, `Delete` / `Backspace` removes it from `editedPlan`. (The existing Reset button restores the server copy, including deleted openings.)
+  - Pure application helper: `applyOpeningDragOnPlan(basePlan, drag, alongCursor, snap)` returns the next plan + new position + width + valid flag + reason string. Matches the wall-drag pattern — module-scope, takes the pre-drag snapshot as `basePlan` so drag state never references stale live plan.
+  - Overlay: `drawOpeningEditOverlay()` renders (1) soft halo on every opening, (2) brighter halo on hover, (3) amber selection ring + resize handles for the selected window, (4) green (valid) / red (invalid) drag ghost with a reason label positioned above the opening. Footer hint text explains the controls when nothing is selected.
+  - Esc priority in opening mode: cancel active drag → deselect → exit opening mode.
+  - Files changed: `frontend/src/components/floorplan/floor-plan-viewer.tsx` (+~410 lines)
+  - Typecheck clean; `next build` green; lint back to pre-existing 4 issues (0 introduced).
+  - Still pending: 3.6d room relabeling, 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo.
 - **Phase 3.6b: Apartment boundary adjustment** (2026-04-18):
   - Wall classification: new `getWallDragKind()` runtime classifier checks whether rooms on opposite sides of a wall belong to different apartments — returns `"apt_boundary"` for bearing_cross walls between apartments, `"partition"` for the 3.6a case. (Backend emits `WallType.BEARING_CROSS` split at the Ganghaus corridor, not `APT_SEPARATION` — so the separator is detected geometrically.)
   - Wall grouping: `startWallDrag` groups all co-axis `bearing_cross` segments (the north/south halves split by the corridor) into `affectedWallIds` so the whole apartment boundary translates as one during a drag.
@@ -128,9 +141,11 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **Phase 3.6 interactive editing (continued)** — 3.6a + 3.6b shipped (partition + apartment boundary drag). Still to do: 3.6c door/window manipulation, 3.6d room type reassign, 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
+- **Phase 3.6 interactive editing (continued)** — 3.6a + 3.6b + 3.6c shipped (partition drag, apartment-boundary drag, door/window manipulation). Still to do: 3.6d room type reassign, 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
 - **Wall-drag known limitation** — only handles axis-aligned walls shared by neighboring rooms. T-junctions (a wall ending mid-room) will find no match on one side; the single affected room translates its vertices fine but the wall may no longer meet the perpendicular wall exactly. For the current Goldbeck generator output this is non-issue (all partitions span corridor-to-corridor or gable-to-gable, all apt boundaries are full-building bearing_cross), but revisit if 3.6d introduces new wall topologies.
-- **Apt boundary drag — openings don't follow** — doors/windows sitting on a dragged apt-boundary wall keep their original x-coord; they re-sit on the wall fine in most cases because bearing_cross drags are small (one bay) but a multi-bay drag may leave an opening orphaned. 3.6c door/window drag will give the user a manual fix; long-term a "move openings with the wall" pass belongs on the apt_boundary commit path.
+- **Apt boundary drag — openings don't follow** — doors/windows sitting on a dragged apt-boundary wall keep their original x-coord; they re-sit on the wall fine in most cases because bearing_cross drags are small (one bay) but a multi-bay drag may leave an opening orphaned. 3.6c now gives the user a manual fix (drag opening back onto the wall); long-term a "move openings with the wall" pass still belongs on the apt_boundary commit path.
+- **Opening edit — no "add new" yet** — 3.6c covers move / resize (windows) / delete but not creation. The IMPLEMENTATION_PLAN 3.6c scope also mentions "Add new door/window: select wall → place element" which is deferred. Add-new would need a wall-selection UI + default width logic (1.20m window, 0.95m door) + auto-apartment-assignment for doors.
+- **Opening edit — resize for doors** — Doors have a fixed width; only windows get resize handles. This matches BauO NRW practice (door widths are prescriptive: 0.875m standard, 0.95m barrier-free) but if the backend ever emits non-standard door widths we may need to expose it.
 - **Rhino plugin still not compiled** — `.NET SDK` is not installed on this machine (only the runtime). `dotnet build` fails with "No .NET SDKs were found". User needs to install Visual Studio 2022 with .NET desktop workload, or the standalone .NET SDK, before the plugin can be built. BUILD.md has the one-line build command once SDK is present.
 - **WFS health check from Railway** — After the next backend deploy, hit `/api/v1/cadastral/diagnostics/wfs-health` on the Railway URL to verify all 16-state endpoints are live. Not known locally — the URL is assigned by Railway.
 - **Unrelated pre-existing test failure** — `test_financial_calculator.py::TestFinancialCalculatorZeroGuards::test_zero_total_dev_cost_edge` asserts `roi_pct == 0` but gets `-100.0` when there are zero units/revenue but nonzero debt service. Not related to floor plan work — separate fix.

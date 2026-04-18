@@ -123,6 +123,48 @@ interface WallDragState {
  *  the building length when an apt-boundary wall is dragged. */
 const MIN_APARTMENT_WIDTH_M = 3.125;  // narrowest Goldbeck bay
 
+// ── Opening drag (Phase 3.6c) ─────────────────────────────────────────────
+/** Minimum distance (m) from an opening edge to the end of its host wall. */
+const MIN_OPENING_EDGE_M = 0.15;
+/** Minimum gap (m) between two openings on the same host wall. */
+const MIN_OPENING_GAP_M = 0.10;
+/** Snap increment (m) while dragging/resizing openings — 6.25cm = 1/10 grid. */
+const OPENING_SNAP_M = 0.0625;
+/** Window width range (m) — enforced on resize. */
+const MIN_WINDOW_WIDTH_M = 0.60;
+const MAX_WINDOW_WIDTH_M = 4.00;
+/** Hit-test tolerance (m) perpendicular to a wall for opening pick. */
+const OPENING_HIT_TOL_PERP_M = 0.30;
+/** Hit-test radius (screen px) for window resize handles. */
+const RESIZE_HANDLE_RADIUS_PX = 7;
+
+type OpeningKind = "door" | "window";
+
+interface OpeningDragState {
+  kind: OpeningKind;
+  id: string;
+  /** "move" translates along wall; "resize_left"/"resize_right" scale width
+   *  by moving one edge of a window. Doors never use resize modes. */
+  mode: "move" | "resize_left" | "resize_right";
+  hostWallId: string;
+  /** Axis the wall runs along (openings move along this). */
+  axis: WallAxis;
+  /** Along-axis extent of the host wall (min, max). */
+  wallMin: number;
+  wallMax: number;
+  /** Snapshot of opening's center position and width at drag start. */
+  originalPos: number;
+  originalWidth: number;
+  /** Live values after snap/clamp/validate. */
+  currentPos: number;
+  currentWidth: number;
+  /** Forbidden zones from other openings on the same wall — pairs [min, max]
+   *  of along-axis intervals (including MIN_OPENING_GAP_M padding). */
+  forbidden: Array<[number, number]>;
+  valid: boolean;
+  invalidReason?: string;
+}
+
 export function FloorPlanViewer({
   floorPlan,
   width = 900,
@@ -162,14 +204,25 @@ export function FloorPlanViewer({
 
   // ── Edit mode (Phase 3.6a: partition wall dragging) ──────────────────────
   // When editMode is "wall", partition walls become drag-highlighted on hover
-  // and can be dragged along their perpendicular axis. Edits live in a local
-  // copy of the FloorPlan; the prop is never mutated.
-  const [editMode, setEditMode] = useState<"none" | "wall">("none");
+  // and can be dragged along their perpendicular axis.
+  // When editMode is "opening", doors and windows become selectable/draggable
+  // along their host wall (3.6c). Edits live in a local copy of the FloorPlan;
+  // the prop is never mutated.
+  const [editMode, setEditMode] = useState<"none" | "wall" | "opening">("none");
   const [editedPlan, setEditedPlan] = useState<FloorPlan>(floorPlan);
   const [wallDrag, setWallDrag] = useState<WallDragState | null>(null);
   const [hoveredWallId, setHoveredWallId] = useState<string | null>(null);
   /** Snapshot of editedPlan taken at drag start, used to revert on invalid/cancel. */
   const preDragPlanRef = useRef<FloorPlan | null>(null);
+
+  // ── Opening edit state (Phase 3.6c) ──────────────────────────────────────
+  const [selectedOpening, setSelectedOpening] = useState<
+    { kind: OpeningKind; id: string } | null
+  >(null);
+  const [hoveredOpening, setHoveredOpening] = useState<
+    { kind: OpeningKind; id: string } | null
+  >(null);
+  const [openingDrag, setOpeningDrag] = useState<OpeningDragState | null>(null);
 
   // Re-sync local copy whenever a new plan arrives from the server. Done
   // during render (React's recommended "reset state on prop change" pattern)
@@ -180,6 +233,9 @@ export function FloorPlanViewer({
     setEditedPlan(floorPlan);
     setWallDrag(null);
     setHoveredWallId(null);
+    setSelectedOpening(null);
+    setHoveredOpening(null);
+    setOpeningDrag(null);
   }
 
   // Every render-path below reads `plan`, not the raw prop, so edits are live.
@@ -473,6 +529,167 @@ export function FloorPlanViewer({
     [plan.structural_grid.axis_positions_x]
   );
 
+  // ── Opening drag helpers (Phase 3.6c) ────────────────────────────────────
+
+  /** Axis-classify the host wall's running direction. All Goldbeck walls are
+   *  axis-aligned, so we return just the axis + along-axis extent. */
+  const classifyHostWall = useCallback(
+    (wall: WallSegment): { axis: WallAxis; min: number; max: number } | null => {
+      const dx = Math.abs(wall.end.x - wall.start.x);
+      const dy = Math.abs(wall.end.y - wall.start.y);
+      if (dy < AXIS_ALIGN_TOL && dx > AXIS_ALIGN_TOL) {
+        // Horizontal wall — openings move along X
+        return { axis: "x", min: Math.min(wall.start.x, wall.end.x), max: Math.max(wall.start.x, wall.end.x) };
+      }
+      if (dx < AXIS_ALIGN_TOL && dy > AXIS_ALIGN_TOL) {
+        // Vertical wall — openings move along Y
+        return { axis: "y", min: Math.min(wall.start.y, wall.end.y), max: Math.max(wall.start.y, wall.end.y) };
+      }
+      return null;
+    },
+    []
+  );
+
+  /**
+   * Hit-test an opening. In opening-edit mode, returns the opening whose
+   * on-wall footprint contains (planX, planY) within a perpendicular
+   * tolerance. Windows are prioritised over doors (same convention as the
+   * regular inspection click handler). Returns null if none.
+   */
+  const openingAtPoint = useCallback(
+    (planX: number, planY: number): { kind: OpeningKind; id: string; hostWall: WallSegment } | null => {
+      const testOne = (
+        kind: OpeningKind,
+        id: string,
+        position: Point2D,
+        width_m: number,
+      ): { kind: OpeningKind; id: string; hostWall: WallSegment } | null => {
+        const hostWall = findNearestWall2D(position, plan.walls);
+        if (!hostWall) return null;
+        const cls = classifyHostWall(hostWall);
+        if (!cls) return null;
+        // Along-axis distance from cursor projected onto wall to opening center
+        const alongCursor = cls.axis === "x" ? planX : planY;
+        const alongCenter = cls.axis === "x" ? position.x : position.y;
+        const perpCursor = cls.axis === "x" ? planY : planX;
+        const perpCenter = cls.axis === "x" ? position.y : position.x;
+        if (Math.abs(alongCursor - alongCenter) > width_m / 2) return null;
+        if (Math.abs(perpCursor - perpCenter) > OPENING_HIT_TOL_PERP_M) return null;
+        return { kind, id, hostWall };
+      };
+      // Windows first (same priority as element inspection)
+      for (const win of plan.windows) {
+        const r = testOne("window", win.id, win.position, win.width_m);
+        if (r) return r;
+      }
+      for (const door of plan.doors) {
+        const r = testOne("door", door.id, door.position, door.width_m);
+        if (r) return r;
+      }
+      return null;
+    },
+    [plan.walls, plan.windows, plan.doors, classifyHostWall]
+  );
+
+  /**
+   * Return "resize_left" / "resize_right" if (planX, planY) is inside a
+   * resize handle of the currently selected window (rendered at its two
+   * along-axis edges). Doors have no resize handles. Uses screen-space
+   * radius so the hit zone stays stable across zoom levels.
+   */
+  const resizeHandleAtPoint = useCallback(
+    (planX: number, planY: number): "resize_left" | "resize_right" | null => {
+      if (!selectedOpening || selectedOpening.kind !== "window") return null;
+      const win = plan.windows.find((w) => w.id === selectedOpening.id);
+      if (!win) return null;
+      const hostWall = findNearestWall2D(win.position, plan.walls);
+      if (!hostWall) return null;
+      const cls = classifyHostWall(hostWall);
+      if (!cls) return null;
+      const { scale } = getTransform();
+      const tolPlan = RESIZE_HANDLE_RADIUS_PX / Math.max(scale, 1e-6);
+      const half = win.width_m / 2;
+      const cx = win.position.x;
+      const cy = win.position.y;
+      if (cls.axis === "x") {
+        const perpOk = Math.abs(planY - cy) <= tolPlan + 0.1;
+        if (!perpOk) return null;
+        if (Math.abs(planX - (cx - half)) <= tolPlan) return "resize_left";
+        if (Math.abs(planX - (cx + half)) <= tolPlan) return "resize_right";
+      } else {
+        const perpOk = Math.abs(planX - cx) <= tolPlan + 0.1;
+        if (!perpOk) return null;
+        if (Math.abs(planY - (cy - half)) <= tolPlan) return "resize_left";
+        if (Math.abs(planY - (cy + half)) <= tolPlan) return "resize_right";
+      }
+      return null;
+    },
+    [selectedOpening, plan.windows, plan.walls, classifyHostWall, getTransform]
+  );
+
+  /** Build a drag state for an opening. */
+  const startOpeningDrag = useCallback(
+    (
+      kind: OpeningKind,
+      id: string,
+      mode: "move" | "resize_left" | "resize_right",
+    ): OpeningDragState | null => {
+      const opening =
+        kind === "window"
+          ? plan.windows.find((w) => w.id === id)
+          : plan.doors.find((d) => d.id === id);
+      if (!opening) return null;
+      const hostWall = findNearestWall2D(opening.position, plan.walls);
+      if (!hostWall) return null;
+      const cls = classifyHostWall(hostWall);
+      if (!cls) return null;
+
+      const originalPos = cls.axis === "x" ? opening.position.x : opening.position.y;
+      const originalWidth = opening.width_m;
+
+      // Collect along-axis forbidden intervals from other openings on same
+      // host wall (padded by MIN_OPENING_GAP_M so widths don't abut).
+      const forbidden: Array<[number, number]> = [];
+      const collect = (
+        ownId: string,
+        items: Array<{ id: string; position: Point2D; width_m: number }>,
+      ) => {
+        for (const it of items) {
+          if (it.id === ownId) continue;
+          const hw = findNearestWall2D(it.position, plan.walls);
+          if (!hw || hw.id !== hostWall.id) continue;
+          const p = cls.axis === "x" ? it.position.x : it.position.y;
+          forbidden.push([p - it.width_m / 2 - MIN_OPENING_GAP_M, p + it.width_m / 2 + MIN_OPENING_GAP_M]);
+        }
+      };
+      collect(kind === "window" ? id : "__none__", plan.windows);
+      collect(kind === "door" ? id : "__none__", plan.doors);
+
+      return {
+        kind,
+        id,
+        mode,
+        hostWallId: hostWall.id,
+        axis: cls.axis,
+        wallMin: cls.min,
+        wallMax: cls.max,
+        originalPos,
+        originalWidth,
+        currentPos: originalPos,
+        currentWidth: originalWidth,
+        forbidden,
+        valid: true,
+      };
+    },
+    [plan.walls, plan.windows, plan.doors, classifyHostWall]
+  );
+
+  /** Snap an opening along-axis coordinate to OPENING_SNAP_M. */
+  const snapOpeningCoord = useCallback(
+    (v: number): number => Math.round(v / OPENING_SNAP_M) * OPENING_SNAP_M,
+    []
+  );
+
   // Handle click
   const handleClick = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -496,8 +713,9 @@ export function FloorPlanViewer({
         return;
       }
 
-      // In edit mode, clicks are absorbed — drag is handled by mousedown/up.
-      if (editMode === "wall") return;
+      // In edit modes, clicks are absorbed — drag/selection is handled by
+      // mousedown/up.
+      if (editMode === "wall" || editMode === "opening") return;
 
       // --- Element inspection (priority: opening → wall → room) ---
       const planX = invTx(mx);
@@ -569,10 +787,9 @@ export function FloorPlanViewer({
     [plan, onApartmentSelect, getTransform, measureMode, measurePoints, snapPoint, editMode]
   );
 
-  // ── Mouse down — start a partition wall drag (edit mode only) ─────────────
+  // ── Mouse down — start a partition wall drag or opening drag ──────────────
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (editMode !== "wall") return;
       if (e.button !== 0) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -580,30 +797,86 @@ export function FloorPlanViewer({
       const { invTx, invTy } = getTransform();
       const planX = invTx(e.clientX - rect.left);
       const planY = invTy(e.clientY - rect.top);
-      const wall = wallAtPoint(planX, planY);
-      if (!wall) return;
-      const drag = startWallDrag(wall);
-      if (!drag) return;
-      preDragPlanRef.current = editedPlan;   // snapshot for revert
-      setWallDrag(drag);
-      setInspected(null);
-      e.preventDefault();
+
+      if (editMode === "wall") {
+        const wall = wallAtPoint(planX, planY);
+        if (!wall) return;
+        const drag = startWallDrag(wall);
+        if (!drag) return;
+        preDragPlanRef.current = editedPlan;
+        setWallDrag(drag);
+        setInspected(null);
+        e.preventDefault();
+        return;
+      }
+
+      if (editMode === "opening") {
+        // Priority 1: if a window is already selected, test its resize handles
+        const handle = resizeHandleAtPoint(planX, planY);
+        if (handle && selectedOpening && selectedOpening.kind === "window") {
+          const drag = startOpeningDrag("window", selectedOpening.id, handle);
+          if (drag) {
+            preDragPlanRef.current = editedPlan;
+            setOpeningDrag(drag);
+            e.preventDefault();
+            return;
+          }
+        }
+        // Priority 2: any opening under cursor → select + start move drag
+        const hit = openingAtPoint(planX, planY);
+        if (hit) {
+          setSelectedOpening({ kind: hit.kind, id: hit.id });
+          const drag = startOpeningDrag(hit.kind, hit.id, "move");
+          if (drag) {
+            preDragPlanRef.current = editedPlan;
+            setOpeningDrag(drag);
+            e.preventDefault();
+            return;
+          }
+        } else {
+          // Click empty space → deselect
+          setSelectedOpening(null);
+        }
+        return;
+      }
     },
-    [editMode, getTransform, wallAtPoint, startWallDrag, editedPlan]
+    [
+      editMode,
+      getTransform,
+      wallAtPoint,
+      startWallDrag,
+      editedPlan,
+      resizeHandleAtPoint,
+      selectedOpening,
+      startOpeningDrag,
+      openingAtPoint,
+    ]
   );
 
   // ── Mouse up — commit (valid) or revert (invalid) a drag ──────────────────
   const handleMouseUp = useCallback(() => {
-    if (!wallDrag) return;
-    // editedPlan is already live-updated during mousemove; revert if invalid
-    // or if the wall never moved off its original position.
-    const moved = Math.abs(wallDrag.current - wallDrag.original) > 0.001;
-    if (!wallDrag.valid || !moved) {
-      if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+    if (wallDrag) {
+      // editedPlan is already live-updated during mousemove; revert if
+      // invalid or if the wall never moved off its original position.
+      const moved = Math.abs(wallDrag.current - wallDrag.original) > 0.001;
+      if (!wallDrag.valid || !moved) {
+        if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+      }
+      preDragPlanRef.current = null;
+      setWallDrag(null);
+      return;
     }
-    preDragPlanRef.current = null;
-    setWallDrag(null);
-  }, [wallDrag]);
+    if (openingDrag) {
+      const posMoved = Math.abs(openingDrag.currentPos - openingDrag.originalPos) > 0.001;
+      const widthChanged = Math.abs(openingDrag.currentWidth - openingDrag.originalWidth) > 0.001;
+      const changed = posMoved || widthChanged;
+      if (!openingDrag.valid || !changed) {
+        if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+      }
+      preDragPlanRef.current = null;
+      setOpeningDrag(null);
+    }
+  }, [wallDrag, openingDrag]);
 
   // Handle mouse move for hover and snap detection (rAF-throttled)
   const handleMouseMove = useCallback(
@@ -639,6 +912,33 @@ export function FloorPlanViewer({
         return;
       }
 
+      // Active opening drag — live-update editedPlan and validate against
+      // host-wall edges, width limits, and other openings' forbidden intervals
+      if (openingDrag) {
+        const base = preDragPlanRef.current ?? plan;
+        const along = openingDrag.axis === "x" ? planX : planY;
+        const {
+          plan: nextPlan,
+          currentPos,
+          currentWidth,
+          valid,
+          invalidReason,
+        } = applyOpeningDragOnPlan(base, openingDrag, along, snapOpeningCoord);
+        if (
+          Math.abs(currentPos - openingDrag.currentPos) > 1e-6 ||
+          Math.abs(currentWidth - openingDrag.currentWidth) > 1e-6 ||
+          valid !== openingDrag.valid
+        ) {
+          setEditedPlan(nextPlan);
+          setOpeningDrag({ ...openingDrag, currentPos, currentWidth, valid, invalidReason });
+        }
+        canvas.style.cursor =
+          openingDrag.mode === "move"
+            ? (openingDrag.axis === "x" ? "ew-resize" : "ns-resize")
+            : (openingDrag.axis === "x" ? "ew-resize" : "ns-resize");
+        return;
+      }
+
       // Edit-mode hover — highlight draggable partition under cursor
       if (editMode === "wall") {
         const w = wallAtPoint(planX, planY);
@@ -647,6 +947,24 @@ export function FloorPlanViewer({
         canvas.style.cursor = w
           ? (classifyWallAxis(w)?.axis === "x" ? "ew-resize" : "ns-resize")
           : "default";
+        return;
+      }
+
+      // Opening-edit hover — highlight openings under cursor + resize handles
+      if (editMode === "opening") {
+        const handle = resizeHandleAtPoint(planX, planY);
+        if (handle) {
+          canvas.style.cursor = "ew-resize";
+          if (hoveredOpening) setHoveredOpening(null);
+          return;
+        }
+        const hit = openingAtPoint(planX, planY);
+        const nextHover = hit ? { kind: hit.kind, id: hit.id } : null;
+        const differs =
+          (nextHover?.id ?? null) !== (hoveredOpening?.id ?? null) ||
+          (nextHover?.kind ?? null) !== (hoveredOpening?.kind ?? null);
+        if (differs) setHoveredOpening(nextHover);
+        canvas.style.cursor = hit ? "grab" : "default";
         return;
       }
 
@@ -732,7 +1050,23 @@ export function FloorPlanViewer({
       }
       }); // end rAF callback
     },
-    [plan, hoveredAptId, getTransform, measureMode, editMode, wallDrag, hoveredWallId, wallAtPoint, classifyWallAxis, snapForDrag]
+    [
+      plan,
+      hoveredAptId,
+      getTransform,
+      measureMode,
+      editMode,
+      wallDrag,
+      hoveredWallId,
+      wallAtPoint,
+      classifyWallAxis,
+      snapForDrag,
+      openingDrag,
+      hoveredOpening,
+      openingAtPoint,
+      resizeHandleAtPoint,
+      snapOpeningCoord,
+    ]
   );
 
   // Keyboard shortcuts (L10)
@@ -744,15 +1078,43 @@ export function FloorPlanViewer({
           if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
           preDragPlanRef.current = null;
           setWallDrag(null);
+        } else if (openingDrag) {
+          if (preDragPlanRef.current) setEditedPlan(preDragPlanRef.current);
+          preDragPlanRef.current = null;
+          setOpeningDrag(null);
         } else if (editMode === "wall") {
           setEditMode("none");
           setHoveredWallId(null);
+        } else if (editMode === "opening") {
+          if (selectedOpening) {
+            setSelectedOpening(null);
+          } else {
+            setEditMode("none");
+            setHoveredOpening(null);
+          }
         } else if (measureMode) {
           setMeasureMode(false);
           setMeasurePoints([]);
         } else if (onApartmentSelect) {
           onApartmentSelect(null); // Deselect apartment
         }
+      }
+      // Delete selected opening
+      if (
+        (e.key === "Delete" || e.key === "Backspace") &&
+        editMode === "opening" &&
+        selectedOpening &&
+        !openingDrag
+      ) {
+        e.preventDefault();
+        setEditedPlan((prev) => {
+          if (selectedOpening.kind === "window") {
+            return { ...prev, windows: prev.windows.filter((w) => w.id !== selectedOpening.id) };
+          }
+          return { ...prev, doors: prev.doors.filter((d) => d.id !== selectedOpening.id) };
+        });
+        setSelectedOpening(null);
+        setHoveredOpening(null);
       }
       if (e.key === "m" || e.key === "M") {
         setMeasureMode((prev) => !prev);
@@ -765,7 +1127,7 @@ export function FloorPlanViewer({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [measureMode, onApartmentSelect, editMode, wallDrag]);
+  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening]);
 
   // Main draw effect
   useEffect(() => {
@@ -884,6 +1246,20 @@ export function FloorPlanViewer({
       drawEditOverlay(ctx, plan, wallDrag, hoveredWallId, tx, ty);
     }
 
+    // --- 15c. Opening-edit overlay (Phase 3.6c) ---
+    if (editMode === "opening") {
+      drawOpeningEditOverlay(
+        ctx,
+        plan,
+        openingDrag,
+        hoveredOpening,
+        selectedOpening,
+        tx,
+        ty,
+        ts,
+      );
+    }
+
     // --- 16. Title and metadata ---
     if (!layers.annotations) return;
     ctx.fillStyle = "#2b2520";
@@ -908,7 +1284,25 @@ export function FloorPlanViewer({
       12,
       height - 8
     );
-  }, [plan, width, height, hoveredAptId, selectedApartmentId, getTransform, measurePoints, snapPoint, measureMode, layers, viewMode, editMode, wallDrag, hoveredWallId]);
+  }, [
+    plan,
+    width,
+    height,
+    hoveredAptId,
+    selectedApartmentId,
+    getTransform,
+    measurePoints,
+    snapPoint,
+    measureMode,
+    layers,
+    viewMode,
+    editMode,
+    wallDrag,
+    hoveredWallId,
+    openingDrag,
+    hoveredOpening,
+    selectedOpening,
+  ]);
 
   const handleMeasureToggle = () => {
     setMeasureMode(!measureMode);
@@ -1011,6 +1405,10 @@ export function FloorPlanViewer({
             });
             setWallDrag(null);
             setHoveredWallId(null);
+            // Mutually exclusive with opening-edit mode
+            setSelectedOpening(null);
+            setHoveredOpening(null);
+            setOpeningDrag(null);
           }}
           className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
             editMode === "wall"
@@ -1020,6 +1418,32 @@ export function FloorPlanViewer({
           title="Trennwände verschieben — Rasterung 62.5cm (Esc zum Beenden)"
         >
           {editMode === "wall" ? "Editing..." : "Edit"}
+        </button>
+        <button
+          onClick={() => {
+            setEditMode((prev) => {
+              const next = prev === "opening" ? "none" : "opening";
+              if (next === "opening" && measureMode) {
+                setMeasureMode(false);
+                setMeasurePoints([]);
+              }
+              return next;
+            });
+            // Mutually exclusive with wall-edit mode
+            setWallDrag(null);
+            setHoveredWallId(null);
+            setSelectedOpening(null);
+            setHoveredOpening(null);
+            setOpeningDrag(null);
+          }}
+          className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+            editMode === "opening"
+              ? "bg-sky-600 text-white hover:bg-sky-700"
+              : "bg-gray-200 text-gray-800 hover:bg-gray-300"
+          }`}
+          title="Türen & Fenster bearbeiten — verschieben, Breite ändern, Entf-Taste zum Löschen"
+        >
+          {editMode === "opening" ? "Openings..." : "Openings"}
         </button>
         {editedPlan !== floorPlan && (
           <button
@@ -1679,6 +2103,316 @@ function drawEditOverlay(
   }
 
   ctx.restore();
+}
+
+/**
+ * Pure version of opening-drag application (Phase 3.6c). Takes a base
+ * FloorPlan and produces a new one with the opening's position and/or width
+ * updated, plus a validity flag and reason string.
+ *
+ * The semantics depend on `drag.mode`:
+ *  - "move": newCenter = clamp(snap(alongCursor), …); width unchanged
+ *  - "resize_right": right edge follows the cursor; width = 2 *
+ *    (newRightEdge - originalCenter). The opening stays centred on its
+ *    original center while one side grows.
+ *  - "resize_left": mirror of resize_right for the left edge.
+ *
+ * Validation:
+ *  - Opening extent [center - w/2, center + w/2] must fit inside
+ *    [wallMin + MIN_OPENING_EDGE_M, wallMax - MIN_OPENING_EDGE_M].
+ *  - Window width clamped to [MIN_WINDOW_WIDTH_M, MAX_WINDOW_WIDTH_M].
+ *  - Opening must not overlap any `forbidden` interval.
+ */
+function applyOpeningDragOnPlan(
+  basePlan: FloorPlan,
+  drag: OpeningDragState,
+  alongCursor: number,
+  snap: (v: number) => number,
+): {
+  plan: FloorPlan;
+  currentPos: number;
+  currentWidth: number;
+  valid: boolean;
+  invalidReason?: string;
+} {
+  let currentPos = drag.originalPos;
+  let currentWidth = drag.originalWidth;
+
+  const innerMin = drag.wallMin + MIN_OPENING_EDGE_M;
+  const innerMax = drag.wallMax - MIN_OPENING_EDGE_M;
+
+  if (drag.mode === "move") {
+    const half = currentWidth / 2;
+    const lo = innerMin + half;
+    const hi = innerMax - half;
+    const snapped = snap(alongCursor);
+    currentPos = Math.max(lo, Math.min(hi, snapped));
+  } else {
+    // Resize — hold originalPos fixed, move one edge to follow the cursor.
+    const snapped = snap(alongCursor);
+    const center = drag.originalPos;
+    let halfWidth: number;
+    if (drag.mode === "resize_right") {
+      halfWidth = snapped - center;
+    } else {
+      halfWidth = center - snapped;
+    }
+    // Clamp half-width so the opening stays within wall interior + width range
+    const maxHalf = Math.min(center - innerMin, innerMax - center, MAX_WINDOW_WIDTH_M / 2);
+    const minHalf = MIN_WINDOW_WIDTH_M / 2;
+    halfWidth = Math.max(minHalf, Math.min(maxHalf, halfWidth));
+    currentPos = center;
+    currentWidth = halfWidth * 2;
+  }
+
+  // Validate against forbidden intervals from other openings.
+  let valid = true;
+  let invalidReason: string | undefined;
+  const half = currentWidth / 2;
+  const openLo = currentPos - half;
+  const openHi = currentPos + half;
+  for (const [fLo, fHi] of drag.forbidden) {
+    // Overlap if intervals intersect
+    if (openHi > fLo && openLo < fHi) {
+      valid = false;
+      invalidReason = "Kollision mit anderer Öffnung";
+      break;
+    }
+  }
+  if (valid && (openLo < innerMin - 0.001 || openHi > innerMax + 0.001)) {
+    valid = false;
+    invalidReason = "Zu nah am Wandende";
+  }
+  if (valid && drag.kind === "window") {
+    if (currentWidth < MIN_WINDOW_WIDTH_M - 0.001) {
+      valid = false;
+      invalidReason = `Breite < ${MIN_WINDOW_WIDTH_M.toFixed(2)} m`;
+    } else if (currentWidth > MAX_WINDOW_WIDTH_M + 0.001) {
+      valid = false;
+      invalidReason = `Breite > ${MAX_WINDOW_WIDTH_M.toFixed(2)} m`;
+    }
+  }
+
+  // Apply to the plan
+  const newPosPoint: Point2D =
+    drag.axis === "x"
+      ? { x: currentPos, y: basePlanOpeningPerp(basePlan, drag) }
+      : { x: basePlanOpeningPerp(basePlan, drag), y: currentPos };
+
+  let nextPlan: FloorPlan = basePlan;
+  if (drag.kind === "window") {
+    nextPlan = {
+      ...basePlan,
+      windows: basePlan.windows.map((w) =>
+        w.id === drag.id
+          ? { ...w, position: newPosPoint, width_m: currentWidth }
+          : w,
+      ),
+    };
+  } else {
+    nextPlan = {
+      ...basePlan,
+      doors: basePlan.doors.map((d) =>
+        d.id === drag.id
+          ? { ...d, position: newPosPoint, width_m: currentWidth }
+          : d,
+      ),
+    };
+  }
+
+  return { plan: nextPlan, currentPos, currentWidth, valid, invalidReason };
+}
+
+/** Helper: look up the opening's perpendicular coordinate from the base
+ *  plan (the along-axis coord is being updated by the drag). */
+function basePlanOpeningPerp(plan: FloorPlan, drag: OpeningDragState): number {
+  const src =
+    drag.kind === "window"
+      ? plan.windows.find((w) => w.id === drag.id)
+      : plan.doors.find((d) => d.id === drag.id);
+  if (!src) return 0;
+  return drag.axis === "x" ? src.position.y : src.position.x;
+}
+
+/**
+ * Opening-edit overlay (Phase 3.6c). Renders:
+ *  - a soft sky-blue halo around every opening (hint that they're grabbable)
+ *  - a brighter halo on the hovered opening
+ *  - a selection ring (amber) around the selected opening
+ *  - for selected windows: two circular resize handles at the opening edges
+ *  - during an active drag: invalid/valid tint + reason label
+ */
+function drawOpeningEditOverlay(
+  ctx: CanvasRenderingContext2D,
+  plan: FloorPlan,
+  openingDrag: OpeningDragState | null,
+  hoveredOpening: { kind: OpeningKind; id: string } | null,
+  selectedOpening: { kind: OpeningKind; id: string } | null,
+  tx: (x: number) => number,
+  ty: (y: number) => number,
+  ts: (s: number) => number,
+) {
+  ctx.save();
+
+  const drawHalo = (
+    center: Point2D,
+    widthM: number,
+    hostWall: WallSegment,
+    color: string,
+    lineWidth: number,
+    dashed: boolean,
+  ) => {
+    const sx = tx(hostWall.start.x);
+    const sy = ty(hostWall.start.y);
+    const ex = tx(hostWall.end.x);
+    const ey = ty(hostWall.end.y);
+    const angle = Math.atan2(ey - sy, ex - sx);
+    const cx = tx(center.x);
+    const cy = ty(center.y);
+    const w = ts(widthM);
+    const wallTh = ts((hostWall.thickness_m ?? 0.2));
+    const h = wallTh + 6;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.setLineDash(dashed ? [3, 3] : []);
+    ctx.strokeRect(-w / 2 - 2, -h / 2, w + 4, h);
+    ctx.setLineDash([]);
+    ctx.restore();
+  };
+
+  const allOpenings: Array<
+    { kind: OpeningKind; id: string; position: Point2D; width_m: number }
+  > = [
+    ...plan.windows.map((w) => ({ kind: "window" as OpeningKind, id: w.id, position: w.position, width_m: w.width_m })),
+    ...plan.doors.map((d) => ({ kind: "door" as OpeningKind, id: d.id, position: d.position, width_m: d.width_m })),
+  ];
+
+  // 1. Soft base halo on every opening (always visible in edit mode)
+  for (const op of allOpenings) {
+    const host = findNearestWall2D(op.position, plan.walls);
+    if (!host) continue;
+    const isHover = hoveredOpening?.kind === op.kind && hoveredOpening?.id === op.id;
+    const isSel = selectedOpening?.kind === op.kind && selectedOpening?.id === op.id;
+    const isDrag = openingDrag?.kind === op.kind && openingDrag?.id === op.id;
+    if (isSel || isDrag) continue;   // drawn later with stronger style
+    drawHalo(
+      op.position,
+      op.width_m,
+      host,
+      isHover ? "#0ea5e9" : "#0ea5e966",
+      isHover ? 2 : 1.2,
+      true,
+    );
+  }
+
+  // 2. Selected opening — amber ring
+  if (selectedOpening && (!openingDrag || openingDrag.id !== selectedOpening.id)) {
+    const list = selectedOpening.kind === "window" ? plan.windows : plan.doors;
+    const sel = list.find((o) => o.id === selectedOpening.id);
+    if (sel) {
+      const host = findNearestWall2D(sel.position, plan.walls);
+      if (host) {
+        drawHalo(sel.position, sel.width_m, host, "#f59e0b", 2.4, false);
+        // Resize handles (windows only)
+        if (selectedOpening.kind === "window") {
+          drawResizeHandles(ctx, sel.position, sel.width_m, host, tx, ty);
+        }
+      }
+    }
+  }
+
+  // 3. Active drag — valid green / invalid red ghost + reason label
+  if (openingDrag) {
+    const list = openingDrag.kind === "window" ? plan.windows : plan.doors;
+    const op = list.find((o) => o.id === openingDrag.id);
+    if (op) {
+      const host = plan.walls.find((w) => w.id === openingDrag.hostWallId)
+        ?? findNearestWall2D(op.position, plan.walls);
+      if (host) {
+        const color = openingDrag.valid ? "#059669" : "#dc2626";
+        drawHalo(op.position, op.width_m, host, color, 2.6, false);
+        if (openingDrag.kind === "window") {
+          drawResizeHandles(ctx, op.position, op.width_m, host, tx, ty);
+        }
+
+        // Reason label above the opening
+        const kindTag = openingDrag.kind === "window" ? "Fenster" : "Tür";
+        const modeTag =
+          openingDrag.mode === "move"
+            ? "verschieben"
+            : "Breite ändern";
+        const delta = openingDrag.currentPos - openingDrag.originalPos;
+        const sign = delta > 0 ? "+" : "";
+        const dims =
+          openingDrag.mode === "move"
+            ? `${sign}${delta.toFixed(3)} m`
+            : `${openingDrag.currentWidth.toFixed(2)} m`;
+        const base = `${kindTag} ${modeTag}  ${dims}`;
+        const label =
+          !openingDrag.valid && openingDrag.invalidReason
+            ? `${base}  ✗ ${openingDrag.invalidReason}`
+            : base;
+        ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const lm = ctx.measureText(label);
+        const lbx = tx(op.position.x) - lm.width / 2 - 4;
+        const lby = ty(op.position.y) - 22;
+        ctx.fillStyle = color;
+        ctx.fillRect(lbx, lby, lm.width + 8, 18);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(label, tx(op.position.x), lby + 9);
+      }
+    }
+  }
+
+  // Hint for empty selection — "Click an opening" (only if nothing selected)
+  if (!selectedOpening && !openingDrag) {
+    ctx.font = "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#0369a1";
+    ctx.fillText(
+      "Öffnungen bearbeiten — anklicken, ziehen, Breite mit Handles ändern, Entf zum Löschen",
+      12,
+      38,
+    );
+  }
+
+  ctx.restore();
+}
+
+/** Draw two circular resize handles at the along-axis edges of a window. */
+function drawResizeHandles(
+  ctx: CanvasRenderingContext2D,
+  center: Point2D,
+  widthM: number,
+  hostWall: WallSegment,
+  tx: (x: number) => number,
+  ty: (y: number) => number,
+) {
+  const dx = hostWall.end.x - hostWall.start.x;
+  const dy = hostWall.end.y - hostWall.start.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return;
+  const ux = dx / len;
+  const uy = dy / len;
+  const half = widthM / 2;
+  const leftPlan: Point2D = { x: center.x - ux * half, y: center.y - uy * half };
+  const rightPlan: Point2D = { x: center.x + ux * half, y: center.y + uy * half };
+  for (const p of [leftPlan, rightPlan]) {
+    ctx.fillStyle = "#f59e0b";
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(tx(p.x), ty(p.y), RESIZE_HANDLE_RADIUS_PX, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
 }
 
 /** Signed polygon area via the shoelace formula; returns absolute m². */
