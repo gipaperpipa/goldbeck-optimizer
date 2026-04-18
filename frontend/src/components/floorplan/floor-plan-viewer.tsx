@@ -140,6 +140,26 @@ const RESIZE_HANDLE_RADIUS_PX = 7;
 
 type OpeningKind = "door" | "window";
 
+// ── Room reassignment (Phase 3.6d) ────────────────────────────────────────
+/** Room types the user can assign via the reassignment popover. Structural
+ *  / common-area types (corridor, staircase, elevator, shaft, balcony) are
+ *  intentionally omitted — they carry positional / architectural semantics
+ *  that aren't meaningful to flip arbitrarily. */
+const REASSIGNABLE_ROOM_TYPES: ReadonlyArray<
+  "living" | "bedroom" | "kitchen" | "bathroom" | "hallway" | "storage"
+> = ["living", "bedroom", "kitchen", "bathroom", "hallway", "storage"];
+
+/** Mapping of the reassignable types to their German-leaning display labels
+ *  (the popover UI uses these). */
+const ROOM_TYPE_LABELS: Record<(typeof REASSIGNABLE_ROOM_TYPES)[number], string> = {
+  living: "Wohnen",
+  bedroom: "Schlafen",
+  kitchen: "Küche",
+  bathroom: "Bad",
+  hallway: "Flur",
+  storage: "Abstellraum",
+};
+
 interface OpeningDragState {
   kind: OpeningKind;
   id: string;
@@ -206,9 +226,11 @@ export function FloorPlanViewer({
   // When editMode is "wall", partition walls become drag-highlighted on hover
   // and can be dragged along their perpendicular axis.
   // When editMode is "opening", doors and windows become selectable/draggable
-  // along their host wall (3.6c). Edits live in a local copy of the FloorPlan;
-  // the prop is never mutated.
-  const [editMode, setEditMode] = useState<"none" | "wall" | "opening">("none");
+  // along their host wall (3.6c).
+  // When editMode is "room", reassignable rooms get a subtle tint and a click
+  // opens a popover to change the room type (3.6d).
+  // Edits live in a local copy of the FloorPlan; the prop is never mutated.
+  const [editMode, setEditMode] = useState<"none" | "wall" | "opening" | "room">("none");
   const [editedPlan, setEditedPlan] = useState<FloorPlan>(floorPlan);
   const [wallDrag, setWallDrag] = useState<WallDragState | null>(null);
   const [hoveredWallId, setHoveredWallId] = useState<string | null>(null);
@@ -224,6 +246,14 @@ export function FloorPlanViewer({
   >(null);
   const [openingDrag, setOpeningDrag] = useState<OpeningDragState | null>(null);
 
+  // ── Room edit state (Phase 3.6d) ─────────────────────────────────────────
+  // When `roomEditor` is set, a popover is rendered at (screenX, screenY)
+  // anchored near the clicked room, offering reassignment options.
+  const [roomEditor, setRoomEditor] = useState<
+    { roomId: string; screenX: number; screenY: number } | null
+  >(null);
+  const [hoveredRoomId, setHoveredRoomId] = useState<string | null>(null);
+
   // Re-sync local copy whenever a new plan arrives from the server. Done
   // during render (React's recommended "reset state on prop change" pattern)
   // rather than in an effect to avoid a cascading re-render.
@@ -236,6 +266,8 @@ export function FloorPlanViewer({
     setSelectedOpening(null);
     setHoveredOpening(null);
     setOpeningDrag(null);
+    setRoomEditor(null);
+    setHoveredRoomId(null);
   }
 
   // Every render-path below reads `plan`, not the raw prop, so edits are live.
@@ -714,8 +746,8 @@ export function FloorPlanViewer({
       }
 
       // In edit modes, clicks are absorbed — drag/selection is handled by
-      // mousedown/up.
-      if (editMode === "wall" || editMode === "opening") return;
+      // mousedown/up (or by the room-edit popover).
+      if (editMode === "wall" || editMode === "opening" || editMode === "room") return;
 
       // --- Element inspection (priority: opening → wall → room) ---
       const planX = invTx(mx);
@@ -839,6 +871,24 @@ export function FloorPlanViewer({
         }
         return;
       }
+
+      if (editMode === "room") {
+        // Click inside a reassignable room → anchor the popover here.
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const hitRoom = findRoomAtClick(plan, mx, my, invTx, invTy);
+        if (hitRoom && isRoomReassignable(hitRoom)) {
+          setRoomEditor({
+            roomId: hitRoom.id,
+            screenX: mx,
+            screenY: my,
+          });
+        } else {
+          setRoomEditor(null);
+        }
+        e.preventDefault();
+        return;
+      }
     },
     [
       editMode,
@@ -850,6 +900,7 @@ export function FloorPlanViewer({
       selectedOpening,
       startOpeningDrag,
       openingAtPoint,
+      plan,
     ]
   );
 
@@ -968,6 +1019,15 @@ export function FloorPlanViewer({
         return;
       }
 
+      // Room-edit hover — highlight reassignable rooms
+      if (editMode === "room") {
+        const hit = findRoomAtClick(plan, mx, my, invTx, invTy);
+        const id = hit && isRoomReassignable(hit) ? hit.id : null;
+        if (id !== hoveredRoomId) setHoveredRoomId(id);
+        canvas.style.cursor = id ? "pointer" : "default";
+        return;
+      }
+
       if (measureMode) {
         canvas.style.cursor = "crosshair";
 
@@ -1066,6 +1126,7 @@ export function FloorPlanViewer({
       openingAtPoint,
       resizeHandleAtPoint,
       snapOpeningCoord,
+      hoveredRoomId,
     ]
   );
 
@@ -1091,6 +1152,13 @@ export function FloorPlanViewer({
           } else {
             setEditMode("none");
             setHoveredOpening(null);
+          }
+        } else if (editMode === "room") {
+          if (roomEditor) {
+            setRoomEditor(null);
+          } else {
+            setEditMode("none");
+            setHoveredRoomId(null);
           }
         } else if (measureMode) {
           setMeasureMode(false);
@@ -1127,7 +1195,7 @@ export function FloorPlanViewer({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening]);
+  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening, roomEditor]);
 
   // Main draw effect
   useEffect(() => {
@@ -1260,6 +1328,18 @@ export function FloorPlanViewer({
       );
     }
 
+    // --- 15d. Room-edit overlay (Phase 3.6d) ---
+    if (editMode === "room") {
+      drawRoomEditOverlay(
+        ctx,
+        plan,
+        hoveredRoomId,
+        roomEditor,
+        tx,
+        ty,
+      );
+    }
+
     // --- 16. Title and metadata ---
     if (!layers.annotations) return;
     ctx.fillStyle = "#2b2520";
@@ -1302,6 +1382,8 @@ export function FloorPlanViewer({
     openingDrag,
     hoveredOpening,
     selectedOpening,
+    hoveredRoomId,
+    roomEditor,
   ]);
 
   const handleMeasureToggle = () => {
@@ -1405,10 +1487,12 @@ export function FloorPlanViewer({
             });
             setWallDrag(null);
             setHoveredWallId(null);
-            // Mutually exclusive with opening-edit mode
+            // Mutually exclusive with other edit modes
             setSelectedOpening(null);
             setHoveredOpening(null);
             setOpeningDrag(null);
+            setRoomEditor(null);
+            setHoveredRoomId(null);
           }}
           className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
             editMode === "wall"
@@ -1429,12 +1513,14 @@ export function FloorPlanViewer({
               }
               return next;
             });
-            // Mutually exclusive with wall-edit mode
+            // Mutually exclusive with other edit modes
             setWallDrag(null);
             setHoveredWallId(null);
             setSelectedOpening(null);
             setHoveredOpening(null);
             setOpeningDrag(null);
+            setRoomEditor(null);
+            setHoveredRoomId(null);
           }}
           className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
             editMode === "opening"
@@ -1444,6 +1530,34 @@ export function FloorPlanViewer({
           title="Türen & Fenster bearbeiten — verschieben, Breite ändern, Entf-Taste zum Löschen"
         >
           {editMode === "opening" ? "Openings..." : "Openings"}
+        </button>
+        <button
+          onClick={() => {
+            setEditMode((prev) => {
+              const next = prev === "room" ? "none" : "room";
+              if (next === "room" && measureMode) {
+                setMeasureMode(false);
+                setMeasurePoints([]);
+              }
+              return next;
+            });
+            // Mutually exclusive with other edit modes
+            setWallDrag(null);
+            setHoveredWallId(null);
+            setSelectedOpening(null);
+            setHoveredOpening(null);
+            setOpeningDrag(null);
+            setRoomEditor(null);
+            setHoveredRoomId(null);
+          }}
+          className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+            editMode === "room"
+              ? "bg-violet-600 text-white hover:bg-violet-700"
+              : "bg-gray-200 text-gray-800 hover:bg-gray-300"
+          }`}
+          title="Räume umwidmen — auf einen Raum klicken, um den Typ zu ändern"
+        >
+          {editMode === "room" ? "Rooms..." : "Rooms"}
         </button>
         {editedPlan !== floorPlan && (
           <button
@@ -1502,6 +1616,23 @@ export function FloorPlanViewer({
       {inspected && (
         <InspectorPanel inspected={inspected} onClose={() => setInspected(null)} />
       )}
+      {editMode === "room" && roomEditor && (() => {
+        const room = plan.rooms.find((r) => r.id === roomEditor.roomId);
+        if (!room) return null;
+        return (
+          <RoomTypePopover
+            room={room}
+            anchorX={roomEditor.screenX}
+            anchorY={roomEditor.screenY}
+            onClose={() => setRoomEditor(null)}
+            onApply={(newType) => {
+              const nextPlan = applyRoomTypeChangeOnPlan(editedPlan, room.id, newType);
+              setEditedPlan(nextPlan);
+              setRoomEditor(null);
+            }}
+          />
+        );
+      })()}
     </div>
   );
 }
@@ -1582,6 +1713,132 @@ function InspectorPanel({
             </span>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Room-type reassignment popover (Phase 3.6d) ───────────────────────────
+
+/**
+ * Floating popover anchored near the clicked room. Offers the six reassignable
+ * room types; disables any whose DIN minimum area exceeds the clicked room's
+ * area. The currently-assigned type is marked with a violet ring and skipped
+ * on apply (closes without change). Auto-closes on outside click via the
+ * parent's canvas mouse handler (which resets `roomEditor` when the click
+ * doesn't hit a reassignable room).
+ */
+function RoomTypePopover({
+  room,
+  anchorX,
+  anchorY,
+  onClose,
+  onApply,
+}: {
+  room: FloorPlanRoom;
+  anchorX: number;
+  anchorY: number;
+  onClose: () => void;
+  onApply: (newType: (typeof REASSIGNABLE_ROOM_TYPES)[number]) => void;
+}) {
+  // Popover card size: ~ 200 × 200 px. Nudge anchor so the card doesn't
+  // overflow the canvas on right / bottom edges — we clamp by subtracting
+  // from the anchor when the click is too close to the edge.
+  const CARD_W = 216;
+  const CARD_H = 250;
+  const PAD = 8;
+  const offsetX = 14;  // a bit to the right of the cursor
+  const offsetY = 14;  // and below it
+
+  // Rough clamp against canvas wrapper: we don't know the wrapper size here,
+  // so simply shift left/up if the anchor + offset would clearly overflow a
+  // minimum viewport assumption. This is best-effort; the card still renders
+  // even if partially clipped.
+  let left = anchorX + offsetX;
+  let top = anchorY + offsetY;
+  if (left + CARD_W + PAD > window.innerWidth) {
+    left = Math.max(PAD, anchorX - CARD_W - offsetX);
+  }
+  if (top + CARD_H + PAD > window.innerHeight) {
+    top = Math.max(PAD, anchorY - CARD_H - offsetY);
+  }
+
+  return (
+    <div
+      className="absolute bg-white/98 backdrop-blur border-2 border-violet-400 rounded-lg shadow-xl text-sm z-20"
+      style={{ left, top, width: CARD_W }}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between px-3 py-2 border-b border-violet-200 bg-violet-50 rounded-t-lg">
+        <span className="font-semibold text-violet-900 text-xs uppercase tracking-wide">
+          Raumtyp ändern
+        </span>
+        <button
+          onClick={onClose}
+          className="text-violet-400 hover:text-violet-700 leading-none text-lg"
+          title="Schließen (Esc)"
+        >
+          ×
+        </button>
+      </div>
+      <div className="px-3 py-2 border-b border-violet-100 bg-white">
+        <div className="text-[11px] text-neutral-500">Aktuell</div>
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-sm font-medium text-neutral-800 truncate">
+            {room.label || room.room_type}
+          </span>
+          <span className="text-[11px] font-mono text-neutral-500 shrink-0">
+            {room.area_sqm.toFixed(1)} m²
+          </span>
+        </div>
+      </div>
+      <div className="p-2 grid grid-cols-2 gap-1.5">
+        {REASSIGNABLE_ROOM_TYPES.map((t) => {
+          const isCurrent = room.room_type === t;
+          const minReq = MIN_ROOM_AREA_SQM[t] ?? 0;
+          const disabled = !isCurrent && room.area_sqm < minReq;
+          const title = disabled
+            ? `DIN-Minimum ${minReq.toFixed(1)} m² — Raum ist zu klein (${room.area_sqm.toFixed(1)} m²)`
+            : isCurrent
+              ? "Bereits zugewiesen"
+              : `Als ${ROOM_TYPE_LABELS[t]} markieren (min ${minReq.toFixed(1)} m²)`;
+          return (
+            <button
+              key={t}
+              onClick={() => {
+                if (disabled) return;
+                if (isCurrent) {
+                  onClose();
+                  return;
+                }
+                onApply(t);
+              }}
+              disabled={disabled}
+              title={title}
+              className={`px-2 py-1.5 rounded text-xs font-medium transition-colors border ${
+                isCurrent
+                  ? "bg-violet-600 text-white border-violet-600 ring-2 ring-violet-300 cursor-default"
+                  : disabled
+                    ? "bg-neutral-50 text-neutral-300 border-neutral-200 cursor-not-allowed"
+                    : "bg-white text-neutral-800 border-neutral-300 hover:bg-violet-50 hover:border-violet-400 cursor-pointer"
+              }`}
+            >
+              <div className="truncate">{ROOM_TYPE_LABELS[t]}</div>
+              <div
+                className={`text-[10px] font-mono ${
+                  isCurrent
+                    ? "text-violet-100"
+                    : disabled
+                      ? "text-neutral-300"
+                      : "text-neutral-400"
+                }`}
+              >
+                ≥ {minReq.toFixed(1)} m²
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -2413,6 +2670,165 @@ function drawResizeHandles(
     ctx.fill();
     ctx.stroke();
   }
+}
+
+// ── Room reassignment helpers (Phase 3.6d) ────────────────────────────────
+
+/** Hit-test: screen-space click → innermost containing room (if any). */
+function findRoomAtClick(
+  plan: FloorPlan,
+  screenX: number,
+  screenY: number,
+  invTx: (x: number) => number,
+  invTy: (y: number) => number,
+): FloorPlanRoom | null {
+  let hit: FloorPlanRoom | null = null;
+  let smallest = Infinity;
+  for (const r of plan.rooms) {
+    if (r.polygon.length < 3) continue;
+    if (!isPointInPolygon(screenX, screenY, r.polygon, invTx, invTy)) continue;
+    if (r.area_sqm < smallest) {
+      smallest = r.area_sqm;
+      hit = r;
+    }
+  }
+  return hit;
+}
+
+/** A room is reassignable iff its current type appears in the allow-list
+ *  (excludes balcony / corridor / staircase / elevator / shaft). */
+function isRoomReassignable(room: FloorPlanRoom): boolean {
+  return (REASSIGNABLE_ROOM_TYPES as readonly string[]).includes(room.room_type);
+}
+
+/**
+ * Pure application of a room type change. Returns a new plan with:
+ *   - room.room_type = newType
+ *   - room.label regenerated to match the new type, re-numbering bedrooms
+ *     inside the owning apartment (Bedroom, Bedroom 1, Bedroom 2, …)
+ *   - apartment.apartment_type recomputed from the edited room mix
+ */
+function applyRoomTypeChangeOnPlan(
+  basePlan: FloorPlan,
+  roomId: string,
+  newType: (typeof REASSIGNABLE_ROOM_TYPES)[number],
+): FloorPlan {
+  // 1. Update room_type + provisional label on the raw rooms list
+  const target = basePlan.rooms.find((r) => r.id === roomId);
+  if (!target) return basePlan;
+
+  const updateRoom = (r: FloorPlanRoom): FloorPlanRoom =>
+    r.id === roomId ? { ...r, room_type: newType, label: defaultLabelFor(newType) } : r;
+
+  const roomsNext = basePlan.rooms.map(updateRoom);
+  const apartmentsNext = basePlan.apartments.map((apt) => {
+    const aptRoomsUpdated = apt.rooms.map(updateRoom);
+    // Re-number bedrooms inside this apartment for deterministic labels
+    const bedrooms = aptRoomsUpdated.filter((r) => r.room_type === "bedroom");
+    // Sort bedrooms left-to-right along their centroid X so numbering is stable
+    const bedroomOrder = [...bedrooms].sort((a, b) => {
+      const ax = a.polygon.reduce((s, p) => s + p.x, 0) / Math.max(a.polygon.length, 1);
+      const bx = b.polygon.reduce((s, p) => s + p.x, 0) / Math.max(b.polygon.length, 1);
+      return ax - bx;
+    });
+    const bedIndex = new Map<string, number>();
+    bedroomOrder.forEach((b, i) => bedIndex.set(b.id, i + 1));
+    const relabeled = aptRoomsUpdated.map((r) => {
+      if (r.room_type !== "bedroom") return r;
+      const idx = bedIndex.get(r.id) ?? 1;
+      const label = bedrooms.length > 1 ? `Bedroom ${idx}` : "Bedroom";
+      return { ...r, label };
+    });
+    // Recompute apartment_type from the new bedroom count (+1 for Wohnküche)
+    const bedroomCount = relabeled.filter((r) => r.room_type === "bedroom").length;
+    const hasLiving = relabeled.some((r) => r.room_type === "living");
+    const zimmerCount = Math.max(1, Math.min(5, bedroomCount + (hasLiving ? 1 : 0)));
+    const apartment_type = `${zimmerCount}_room`;
+    return { ...apt, rooms: relabeled, apartment_type };
+  });
+
+  // Mirror the per-apartment renumbering onto the flat rooms list so the
+  // viewer's label rendering (which reads from `plan.rooms`) stays in sync.
+  const relabelMap = new Map<string, string>();
+  for (const apt of apartmentsNext) {
+    for (const r of apt.rooms) relabelMap.set(r.id, r.label);
+  }
+  const roomsNextLabeled = roomsNext.map((r) =>
+    relabelMap.has(r.id) ? { ...r, label: relabelMap.get(r.id)! } : r,
+  );
+
+  return { ...basePlan, rooms: roomsNextLabeled, apartments: apartmentsNext };
+}
+
+/** Default label for a freshly-assigned room type. Bedrooms get renumbered
+ *  later by the per-apartment pass; this is just the placeholder. */
+function defaultLabelFor(t: (typeof REASSIGNABLE_ROOM_TYPES)[number]): string {
+  switch (t) {
+    case "living":
+      return "Wohnküche";
+    case "bedroom":
+      return "Bedroom";
+    case "kitchen":
+      return "Kitchen";
+    case "bathroom":
+      return "Bathroom";
+    case "hallway":
+      return "Hallway";
+    case "storage":
+      return "Storage";
+  }
+}
+
+/**
+ * Room-edit overlay: faint tint on every reassignable room plus a brighter
+ * violet outline on hover, and a solid violet outline on the active
+ * (popover-anchored) room.
+ */
+function drawRoomEditOverlay(
+  ctx: CanvasRenderingContext2D,
+  plan: FloorPlan,
+  hoveredRoomId: string | null,
+  roomEditor: { roomId: string; screenX: number; screenY: number } | null,
+  tx: (x: number) => number,
+  ty: (y: number) => number,
+) {
+  ctx.save();
+  for (const room of plan.rooms) {
+    if (!isRoomReassignable(room)) continue;
+    if (room.polygon.length < 3) continue;
+    const isHover = room.id === hoveredRoomId;
+    const isActive = roomEditor?.roomId === room.id;
+
+    ctx.beginPath();
+    room.polygon.forEach((p, i) => {
+      if (i === 0) ctx.moveTo(tx(p.x), ty(p.y));
+      else ctx.lineTo(tx(p.x), ty(p.y));
+    });
+    ctx.closePath();
+
+    if (isActive) {
+      ctx.fillStyle = "rgba(139,92,246,0.16)";
+      ctx.fill();
+      ctx.strokeStyle = "#7c3aed";
+      ctx.lineWidth = 2.4;
+      ctx.setLineDash([]);
+      ctx.stroke();
+    } else if (isHover) {
+      ctx.fillStyle = "rgba(139,92,246,0.10)";
+      ctx.fill();
+      ctx.strokeStyle = "#7c3aed";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([]);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = "#7c3aed55";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  ctx.restore();
 }
 
 /** Signed polygon area via the shoelace formula; returns absolute m². */

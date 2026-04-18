@@ -43,13 +43,24 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 ## Last Request
 **Status:** DONE
 **Date:** 2026-04-18
-**Request:** Phase 3.6c — Door and window manipulation
-**Progress:** New "Openings" edit mode added to the viewer toolbar. Doors & windows become selectable, drag along host wall with 6.25cm snap, windows get amber resize handles at each edge, Delete/Backspace removes the selected opening. Validation rejects drops that collide with another opening on the same wall, come too close to the wall end (<15cm), or fall outside window width range [0.60m, 4.00m]; invalid drop reverts to pre-drag snapshot with a red ghost + reason label. Typecheck + lint + build all clean.
+**Request:** Phase 3.6d — Room type reassignment
+**Progress:** New "Rooms" edit mode added to the viewer toolbar (violet). Click any reassignable room (living/bedroom/kitchen/bathroom/hallway/storage) to open a popover offering the six DIN-valid types. Types whose minimum area exceeds the clicked room's area are disabled with a tooltip showing the required minimum. Applying a new type updates the room label, renumbers bedrooms left-to-right by centroid X inside the owning apartment, and recomputes `apartment_type = ${N}_room` where N = bedroom count + (hasLiving ? 1 : 0), capped at [1,5] to match the backend enum. Typecheck + lint + build all clean.
 
 ## Current State
 **Last updated:** 2026-04-18
 
 ### Recently completed
+- **Phase 3.6d: Room type reassignment** (2026-04-18):
+  - New "Rooms" edit-mode toolbar button (violet when active) — mutually exclusive with "Edit" (wall) and "Openings" modes. Enter-the-mode dims every reassignable room with a faint dashed violet outline; hover brightens the outline; the room whose popover is open gets a solid violet outline + light fill.
+  - Hit-test: `findRoomAtClick()` picks the innermost containing room (smallest-area tiebreaker) via `isPointInPolygon` — screen-space point projected back through the current zoom/pan transform.
+  - Reassignable set: `REASSIGNABLE_ROOM_TYPES = [living, bedroom, kitchen, bathroom, hallway, storage]`. Structural / shared types (corridor, staircase, elevator, shaft, balcony) intentionally excluded.
+  - Popover: `RoomTypePopover` component floats near the click anchor (clamped so it doesn't overflow the viewport). Header shows current label + area. Six option buttons in a 2-column grid use German labels (Wohnen / Schlafen / Küche / Bad / Flur / Abstellraum) and show the DIN minimum below each label. Current type gets a violet filled button with ring + "Bereits zugewiesen" tooltip. Options where `MIN_ROOM_AREA_SQM[type] > room.area_sqm` are disabled with a tooltip showing the required minimum (same DIN table as 3.6a: living 14, bedroom 8, kitchen 4, bathroom 2.5, hallway 1.5, storage 0.5 m²). × close button + Esc close.
+  - Pure application helper: `applyRoomTypeChangeOnPlan(basePlan, roomId, newType)` returns the next plan with (1) `room.room_type = newType` and a default label (`Wohnküche` / `Bedroom` / `Kitchen` / …) and (2) per-apartment bedroom re-numbering — bedrooms sorted left-to-right by centroid X so labels become `Bedroom 1`, `Bedroom 2`, … (single bedroom stays just "Bedroom"). The flat `plan.rooms` list is mirror-relabeled via a Map so the viewer's label rendering stays in sync.
+  - Apartment type recomputation: `bedroomCount + (hasLiving ? 1 : 0)` → `${zimmerCount}_room`, clamped to `[1,5]` to match the backend `apartment_type` enum. Fires automatically on every reassignment.
+  - Esc priority in room mode: close popover → exit room mode.
+  - Files changed: `frontend/src/components/floorplan/floor-plan-viewer.tsx` (+~310 lines including the popover component and overlay draw helper)
+  - Typecheck clean; `next build` green; lint back to pre-existing 4 issues (0 introduced).
+  - Still pending: 3.6e real-time per-apartment validation overlay, 3.7 persistence + undo/redo.
 - **Phase 3.6c: Door & window manipulation** (2026-04-18):
   - New "Openings" edit-mode toolbar button (sky-blue when active) — mutually exclusive with "Edit" (wall) mode. Each opening-edit session draws soft sky-blue dashed halos around every door/window in the plan as a grabbability hint; hover strengthens the halo.
   - Hit-test: `openingAtPoint()` projects the cursor onto the opening's host wall axis (identified via the existing `findNearestWall2D`) and checks along-axis distance ≤ `width/2` + perpendicular distance ≤ 0.30m. Windows take priority over doors (mirrors the read-only inspection handler).
@@ -141,7 +152,9 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 - **Validation suite**, **optimizer convergence overhaul**, **100-issue audit** — all previously completed
 
 ### Known issues / next up
-- **Phase 3.6 interactive editing (continued)** — 3.6a + 3.6b + 3.6c shipped (partition drag, apartment-boundary drag, door/window manipulation). Still to do: 3.6d room type reassign, 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
+- **Phase 3.6 interactive editing (continued)** — 3.6a + 3.6b + 3.6c + 3.6d shipped (partition drag, apartment-boundary drag, door/window manipulation, room type reassignment). Still to do: 3.6e real-time per-apartment validation, 3.7 persistence + undo/redo. Each deserves its own session.
+- **Room reassignment — no Wohnküche-split / kitchen-merge** — 3.6d treats each room as a sealed polygon and swaps only its type + label. It does NOT split a large Wohnküche into "living + kitchen" or merge an adjacent kitchen into a living room. Users who want that topology change must first adjust partitions via 3.6a, then reassign. A future 3.6d.2 could offer a "split at partition" action.
+- **Room reassignment — apartment_type cap** — backend enum is "1_room" … "5_room". A reassignment that pushes N above 5 (e.g. turning every room into a bedroom in a large apartment) is silently clamped to 5. If the user then regenerates or exports IFC, the exported apartment carries the clamped label. Rare in practice (backend-generated apartments are 1–4 rooms) but worth noting.
 - **Wall-drag known limitation** — only handles axis-aligned walls shared by neighboring rooms. T-junctions (a wall ending mid-room) will find no match on one side; the single affected room translates its vertices fine but the wall may no longer meet the perpendicular wall exactly. For the current Goldbeck generator output this is non-issue (all partitions span corridor-to-corridor or gable-to-gable, all apt boundaries are full-building bearing_cross), but revisit if 3.6d introduces new wall topologies.
 - **Apt boundary drag — openings don't follow** — doors/windows sitting on a dragged apt-boundary wall keep their original x-coord; they re-sit on the wall fine in most cases because bearing_cross drags are small (one bay) but a multi-bay drag may leave an opening orphaned. 3.6c now gives the user a manual fix (drag opening back onto the wall); long-term a "move openings with the wall" pass still belongs on the apt_boundary commit path.
 - **Opening edit — no "add new" yet** — 3.6c covers move / resize (windows) / delete but not creation. The IMPLEMENTATION_PLAN 3.6c scope also mentions "Add new door/window: select wall → place element" which is deferred. Add-new would need a wall-selection UI + default width logic (1.20m window, 0.95m door) + auto-apartment-assignment for doors.
