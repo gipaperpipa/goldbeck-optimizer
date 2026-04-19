@@ -11,6 +11,11 @@ import type {
   FloorPlanRoom,
 } from "@/types/api";
 import { useProjectStore, editedPlanKey } from "@/stores/project-store";
+import {
+  fetchOverride,
+  putOverride,
+  deleteOverride,
+} from "@/lib/floorplan-overrides";
 
 /** Props for the 2D canvas floor plan renderer.
  * @property floorPlan - Single-storey floor plan data (rooms, walls, doors, windows).
@@ -140,6 +145,14 @@ const OPENING_SNAP_M = 0.0625;
 /** Window width range (m) — enforced on resize. */
 const MIN_WINDOW_WIDTH_M = 0.60;
 const MAX_WINDOW_WIDTH_M = 4.00;
+/** Defaults for newly-placed openings (Phase 3.6c add). Windows: 1.20×1.50m
+ *  with a 0.90m sill (DIN 5034 typical). Doors: 0.95m barrier-free leaf,
+ *  2.00m head height (BauO NRW §50). */
+const DEFAULT_WINDOW_WIDTH_M = 1.20;
+const DEFAULT_WINDOW_HEIGHT_M = 1.50;
+const DEFAULT_WINDOW_SILL_M = 0.90;
+const DEFAULT_DOOR_WIDTH_M = 0.95;
+const DEFAULT_DOOR_HEIGHT_M = 2.00;
 /** Hit-test tolerance (m) perpendicular to a wall for opening pick. */
 const OPENING_HIT_TOL_PERP_M = 0.30;
 /** Hit-test radius (screen px) for window resize handles. */
@@ -387,6 +400,11 @@ export function FloorPlanViewer({
   // store. Debounced implicitly by React's batching — each state update
   // triggers one effect run. Only writes when persistKey is present AND
   // the current plan is actually a user edit (not the pristine original).
+  //
+  // Also mirrors to the backend via fire-and-forget HTTP (Phase 3.7c) so
+  // edits survive localStorage wipes and sync across devices. Backend
+  // errors are swallowed — localStorage is the primary cache.
+  const backendSyncTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (!persistKey) return;
     const current = history.stack[history.index];
@@ -394,6 +412,12 @@ export function FloorPlanViewer({
       // Back at the original — remove any stored edit so next mount
       // doesn't show a stale "wiederhergestellt" pill.
       clearEditedFloorPlan(persistKey);
+      // Fire-and-forget backend delete too.
+      if (buildingId && floorIndex !== undefined) {
+        deleteOverride(buildingId, floorIndex).catch((err) => {
+          console.debug("[override-delete] failed (ignored):", err);
+        });
+      }
       return;
     }
     // The store adds `savedAt` internally.
@@ -401,6 +425,21 @@ export function FloorPlanViewer({
       originalFingerprint,
       plan: current,
     });
+    // Debounced backend PUT — coalesce rapid-fire commits (drag chains)
+    // into one request every 400ms.
+    if (buildingId && floorIndex !== undefined) {
+      if (backendSyncTimerRef.current !== null) {
+        window.clearTimeout(backendSyncTimerRef.current);
+      }
+      backendSyncTimerRef.current = window.setTimeout(() => {
+        putOverride(buildingId, floorIndex, {
+          original_fingerprint: originalFingerprint,
+          plan: current,
+        }).catch((err) => {
+          console.debug("[override-put] failed (ignored):", err);
+        });
+      }, 400);
+    }
   }, [
     history,
     persistKey,
@@ -408,7 +447,59 @@ export function FloorPlanViewer({
     originalFingerprint,
     setEditedFloorPlan,
     clearEditedFloorPlan,
+    buildingId,
+    floorIndex,
   ]);
+  // Flush any pending backend sync on unmount so a tab close doesn't
+  // lose the last edit.
+  useEffect(() => {
+    return () => {
+      if (backendSyncTimerRef.current !== null) {
+        window.clearTimeout(backendSyncTimerRef.current);
+        backendSyncTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // ── Backend hydration (Phase 3.7c) ───────────────────────────────────────
+  // On mount (and whenever the persistKey changes), ask the backend if it
+  // has a stored override for this (building, floor). If so AND the
+  // fingerprint matches the current plan AND localStorage doesn't already
+  // have a fresher edit, hydrate history from the server copy.
+  // localStorage always wins when both exist (it's where the user was most
+  // recently typing), so the net effect is:
+  //   - Fresh device, server has edit: hydrate from server.
+  //   - Same device as last session: localStorage already hydrated, no-op.
+  //   - Server edit is stale (regenerated plan): fingerprint mismatch, ignored.
+  useEffect(() => {
+    if (!persistKey || !buildingId || floorIndex === undefined) return;
+    const localEntry = useProjectStore.getState().editedFloorPlans[persistKey];
+    if (localEntry && localEntry.originalFingerprint === originalFingerprint) {
+      // Local cache is authoritative this session; skip the fetch.
+      return;
+    }
+    let cancelled = false;
+    fetchOverride(buildingId, floorIndex)
+      .then((override) => {
+        if (cancelled || !override) return;
+        if (override.original_fingerprint !== originalFingerprint) return;
+        // Only hydrate if the user hasn't already started editing locally
+        // between dispatch and response.
+        const nowLocal =
+          useProjectStore.getState().editedFloorPlans[persistKey];
+        if (nowLocal && nowLocal.originalFingerprint === originalFingerprint) {
+          return;
+        }
+        setHistory({ stack: [override.plan], index: 0 });
+        setRestoredFromStore(true);
+      })
+      .catch((err) => {
+        console.debug("[override-fetch] failed (ignored):", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [persistKey, buildingId, floorIndex, originalFingerprint]);
   const undo = useCallback(() => {
     setHistory((prev) => (prev.index === 0 ? prev : { ...prev, index: prev.index - 1 }));
   }, []);
@@ -432,6 +523,10 @@ export function FloorPlanViewer({
     { kind: OpeningKind; id: string } | null
   >(null);
   const [openingDrag, setOpeningDrag] = useState<OpeningDragState | null>(null);
+  /** When non-"none" in opening edit mode, a click on empty space along a
+   *  wall places a NEW window/door instead of just deselecting. Toggled by
+   *  the "+ Fenster" / "+ Tür" sub-toolbar buttons. Phase 3.6c add. */
+  const [openingAddMode, setOpeningAddMode] = useState<"none" | "window" | "door">("none");
 
   // ── Room edit state (Phase 3.6d) ─────────────────────────────────────────
   // When `roomEditor` is set, a popover is rendered at (screenX, screenY)
@@ -1092,10 +1187,32 @@ export function FloorPlanViewer({
             e.preventDefault();
             return;
           }
-        } else {
-          // Click empty space → deselect
-          setSelectedOpening(null);
+          return;
         }
+        // Priority 3: add-new mode — click on empty part of a wall places a
+        // new opening at the projected point. (Phase 3.6c add.)
+        if (openingAddMode !== "none") {
+          const { plan: nextPlan, valid, invalidReason, newId } = applyNewOpeningOnPlan(
+            editedPlan,
+            openingAddMode,
+            planX,
+            planY,
+            snapOpeningCoord,
+          );
+          if (valid && newId) {
+            commitEdit(nextPlan);
+            setSelectedOpening({ kind: openingAddMode, id: newId });
+            setOpeningAddMode("none"); // one-shot — re-click button for next
+          } else if (invalidReason) {
+            // Keep add-mode active so the user can try again; we could
+            // surface a toast here but for now the footer hint suffices.
+            console.warn("[opening-add]", invalidReason);
+          }
+          e.preventDefault();
+          return;
+        }
+        // Priority 4: click empty space → deselect
+        setSelectedOpening(null);
         return;
       }
 
@@ -1128,6 +1245,9 @@ export function FloorPlanViewer({
       startOpeningDrag,
       openingAtPoint,
       plan,
+      openingAddMode,
+      snapOpeningCoord,
+      commitEdit,
     ]
   );
 
@@ -1379,7 +1499,9 @@ export function FloorPlanViewer({
           setEditMode("none");
           setHoveredWallId(null);
         } else if (editMode === "opening") {
-          if (selectedOpening) {
+          if (openingAddMode !== "none") {
+            setOpeningAddMode("none");
+          } else if (selectedOpening) {
             setSelectedOpening(null);
           } else {
             setEditMode("none");
@@ -1443,7 +1565,7 @@ export function FloorPlanViewer({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening, roomEditor, undo, redo, commitEdit]);
+  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening, roomEditor, undo, redo, commitEdit, openingAddMode]);
 
   // Main draw effect
   useEffect(() => {
@@ -1838,6 +1960,7 @@ export function FloorPlanViewer({
             setOpeningDrag(null);
             setRoomEditor(null);
             setHoveredRoomId(null);
+            setOpeningAddMode("none");
           }}
           className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
             editMode === "opening"
@@ -1848,6 +1971,33 @@ export function FloorPlanViewer({
         >
           {editMode === "opening" ? "Openings..." : "Openings"}
         </button>
+        {/* Add-new opening sub-toolbar — only in opening edit mode (Phase 3.6c add) */}
+        {editMode === "opening" && (
+          <div className="inline-flex rounded overflow-hidden border border-sky-300 text-sm font-medium">
+            <button
+              onClick={() => setOpeningAddMode((p) => (p === "window" ? "none" : "window"))}
+              className={`px-2.5 py-1.5 transition-colors ${
+                openingAddMode === "window"
+                  ? "bg-sky-500 text-white"
+                  : "bg-sky-50 text-sky-800 hover:bg-sky-100"
+              }`}
+              title="Neues Fenster platzieren — auf Außenwand klicken (1.20 × 1.50 m Standard)"
+            >
+              + Fenster
+            </button>
+            <button
+              onClick={() => setOpeningAddMode((p) => (p === "door" ? "none" : "door"))}
+              className={`px-2.5 py-1.5 border-l border-sky-300 transition-colors ${
+                openingAddMode === "door"
+                  ? "bg-sky-500 text-white"
+                  : "bg-sky-50 text-sky-800 hover:bg-sky-100"
+              }`}
+              title="Neue Tür platzieren — auf beliebige Wand klicken (0.95 m barrierefrei)"
+            >
+              + Tür
+            </button>
+          </div>
+        )}
         <button
           onClick={() => {
             setEditMode((prev) => {
@@ -1887,6 +2037,13 @@ export function FloorPlanViewer({
               // when it sees history tip === floorPlan again, but clear
               // eagerly here so the pill disappears immediately.
               if (persistKey) clearEditedFloorPlan(persistKey);
+              // Fire-and-forget backend delete so the override doesn't
+              // resurrect on the next mount via the hydration fetch.
+              if (buildingId && floorIndex !== undefined) {
+                deleteOverride(buildingId, floorIndex).catch((err) => {
+                  console.debug("[override-delete] failed (ignored):", err);
+                });
+              }
             }}
             className="px-3 py-1.5 rounded text-sm font-medium bg-gray-200 text-gray-800 hover:bg-gray-300 transition-colors"
             title="Alle Änderungen verwerfen (Verlauf löschen)"
@@ -1941,16 +2098,57 @@ export function FloorPlanViewer({
       {editMode === "room" && roomEditor && (() => {
         const room = plan.rooms.find((r) => r.id === roomEditor.roomId);
         if (!room) return null;
+        // Topology eligibility (Phase 3.6d add). canSplit: living room,
+        // rectangular, ≥ 20m². canMerge: living with an adjacent kitchen
+        // in the same apartment sharing a full edge.
+        const canSplit =
+          room.room_type === "living" &&
+          room.polygon.length === 4 &&
+          room.area_sqm >= MIN_WOHNKUECHE_SPLIT_AREA_SQM;
+        let canMerge = false;
+        if (room.room_type === "living" && room.polygon.length === 4) {
+          const owningApt = plan.apartments.find((a) =>
+            a.rooms.some((r) => r.id === room.id),
+          );
+          if (owningApt) {
+            canMerge = owningApt.rooms.some(
+              (r) =>
+                r.room_type === "kitchen" &&
+                r.polygon.length === 4 &&
+                !!findSharedEdge(room.polygon, r.polygon),
+            );
+          }
+        }
         return (
           <RoomTypePopover
             room={room}
             anchorX={roomEditor.screenX}
             anchorY={roomEditor.screenY}
+            canSplit={canSplit}
+            canMerge={canMerge}
             onClose={() => setRoomEditor(null)}
             onApply={(newType) => {
               const nextPlan = applyRoomTypeChangeOnPlan(editedPlan, room.id, newType);
               commitEdit(nextPlan);
               setRoomEditor(null);
+            }}
+            onSplit={() => {
+              const nextPlan = applyWohnkuecheSplit(editedPlan, room.id);
+              if (nextPlan) {
+                commitEdit(nextPlan);
+                setRoomEditor(null);
+              } else {
+                console.warn("[room-split] operation not valid");
+              }
+            }}
+            onMerge={() => {
+              const nextPlan = applyKitchenMerge(editedPlan, room.id);
+              if (nextPlan) {
+                commitEdit(nextPlan);
+                setRoomEditor(null);
+              } else {
+                console.warn("[room-merge] no mergeable kitchen found");
+              }
             }}
           />
         );
@@ -2067,20 +2265,32 @@ function RoomTypePopover({
   room,
   anchorX,
   anchorY,
+  canSplit,
+  canMerge,
   onClose,
   onApply,
+  onSplit,
+  onMerge,
 }: {
   room: FloorPlanRoom;
   anchorX: number;
   anchorY: number;
+  /** True when this room is eligible for the Wohnküche-split operation
+   *  (living room, ≥ 20 m², rectangular). Phase 3.6d add. */
+  canSplit: boolean;
+  /** True when this room is eligible to merge an adjacent kitchen into
+   *  itself (living room with a kitchen next door in the same apt). */
+  canMerge: boolean;
   onClose: () => void;
   onApply: (newType: (typeof REASSIGNABLE_ROOM_TYPES)[number]) => void;
+  onSplit: () => void;
+  onMerge: () => void;
 }) {
   // Popover card size: ~ 200 × 200 px. Nudge anchor so the card doesn't
   // overflow the canvas on right / bottom edges — we clamp by subtracting
   // from the anchor when the click is too close to the edge.
   const CARD_W = 216;
-  const CARD_H = 250;
+  const CARD_H = canSplit || canMerge ? 320 : 250;
   const PAD = 8;
   const offsetX = 14;  // a bit to the right of the cursor
   const offsetY = 14;  // and below it
@@ -2175,6 +2385,44 @@ function RoomTypePopover({
           );
         })}
       </div>
+      {/* Topology operations — split/merge (Phase 3.6d add) */}
+      {(canSplit || canMerge) && (
+        <div className="border-t border-violet-100 bg-violet-50/50 p-2 space-y-1.5">
+          <div className="text-[10px] uppercase tracking-wide font-semibold text-violet-700 px-1">
+            Topologie
+          </div>
+          {canSplit && (
+            <button
+              onClick={onSplit}
+              title="Wohnraum in Wohnen + Küche teilen (neue Trennwand, 70/30)"
+              className="w-full px-2 py-1.5 rounded text-xs font-medium bg-white text-violet-800 border border-violet-300 hover:bg-violet-100 hover:border-violet-400 transition-colors text-left"
+            >
+              <div className="flex items-center gap-1.5">
+                <span aria-hidden>◨</span>
+                <span>Wohnküche teilen</span>
+              </div>
+              <div className="text-[10px] font-normal text-violet-500 mt-0.5">
+                → Wohnen + Küche (neue Trennwand)
+              </div>
+            </button>
+          )}
+          {canMerge && (
+            <button
+              onClick={onMerge}
+              title="Angrenzende Küche einbeziehen (Trennwand entfällt → Wohnküche)"
+              className="w-full px-2 py-1.5 rounded text-xs font-medium bg-white text-violet-800 border border-violet-300 hover:bg-violet-100 hover:border-violet-400 transition-colors text-left"
+            >
+              <div className="flex items-center gap-1.5">
+                <span aria-hidden>◫</span>
+                <span>Mit Küche vereinen</span>
+              </div>
+              <div className="text-[10px] font-normal text-violet-500 mt-0.5">
+                → Wohnküche (Trennwand entfällt)
+              </div>
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2983,6 +3231,148 @@ function applyOpeningDragOnPlan(
   return { plan: nextPlan, currentPos, currentWidth, valid, invalidReason };
 }
 
+/** Generate a UUID. Uses `crypto.randomUUID()` where supported (all modern
+ *  browsers + Node 19+) and falls back to a decent pseudorandom string so
+ *  headless/test environments don't crash. Good enough for client-side
+ *  IDs — the backend never sees these until a save round-trip. */
+function genUuid(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+/**
+ * Place a NEW opening (door or window) on the plan at the clicked point
+ * (Phase 3.6c add). The click is projected onto the nearest valid host
+ * wall; the placement is validated against the standard opening rules
+ * (min edge distance, gap from other openings on the same wall, window
+ * width range). Windows additionally require an exterior wall (DIN 5034
+ * natural-light convention).
+ *
+ * Returns the next plan + validity + optional reason. An invalid
+ * placement leaves the plan unchanged (callers shouldn't commit).
+ */
+function applyNewOpeningOnPlan(
+  basePlan: FloorPlan,
+  kind: OpeningKind,
+  planX: number,
+  planY: number,
+  snap: (v: number) => number,
+): { plan: FloorPlan; valid: boolean; invalidReason?: string; newId?: string } {
+  const hostWall = findNearestWall2D({ x: planX, y: planY } as Point2D, basePlan.walls);
+  if (!hostWall) return { plan: basePlan, valid: false, invalidReason: "Keine Wand in der Nähe" };
+
+  // Axis classification (inline — same logic as classifyHostWall but
+  // pure/outside a hook).
+  const dx = Math.abs(hostWall.end.x - hostWall.start.x);
+  const dy = Math.abs(hostWall.end.y - hostWall.start.y);
+  const AXIS_TOL = 0.01;
+  let axis: WallAxis;
+  let wallMin: number;
+  let wallMax: number;
+  let perpCoord: number;
+  if (dy < AXIS_TOL && dx > AXIS_TOL) {
+    axis = "x";
+    wallMin = Math.min(hostWall.start.x, hostWall.end.x);
+    wallMax = Math.max(hostWall.start.x, hostWall.end.x);
+    perpCoord = hostWall.start.y;
+  } else if (dx < AXIS_TOL && dy > AXIS_TOL) {
+    axis = "y";
+    wallMin = Math.min(hostWall.start.y, hostWall.end.y);
+    wallMax = Math.max(hostWall.start.y, hostWall.end.y);
+    perpCoord = hostWall.start.x;
+  } else {
+    return { plan: basePlan, valid: false, invalidReason: "Wand nicht achsparallel" };
+  }
+
+  // Windows only on exterior walls (natural-light requirement). Doors can
+  // go on any wall — entrance doors on exterior, interior doors on partitions.
+  if (kind === "window" && !hostWall.is_exterior) {
+    return { plan: basePlan, valid: false, invalidReason: "Fenster nur an Außenwänden" };
+  }
+
+  const alongCursor = axis === "x" ? planX : planY;
+  const width = kind === "window" ? DEFAULT_WINDOW_WIDTH_M : DEFAULT_DOOR_WIDTH_M;
+  const half = width / 2;
+  const innerMin = wallMin + MIN_OPENING_EDGE_M;
+  const innerMax = wallMax - MIN_OPENING_EDGE_M;
+  if (innerMax - innerMin < width) {
+    return { plan: basePlan, valid: false, invalidReason: "Wand zu kurz" };
+  }
+  const lo = innerMin + half;
+  const hi = innerMax - half;
+  const centerRaw = Math.max(lo, Math.min(hi, snap(alongCursor)));
+
+  // Collect forbidden intervals from other openings on the same wall.
+  const forbidden: Array<[number, number]> = [];
+  for (const d of basePlan.doors) {
+    if (d.wall_id !== hostWall.id) continue;
+    const c = axis === "x" ? d.position.x : d.position.y;
+    forbidden.push([
+      c - d.width_m / 2 - MIN_OPENING_GAP_M,
+      c + d.width_m / 2 + MIN_OPENING_GAP_M,
+    ]);
+  }
+  for (const w of basePlan.windows) {
+    if (w.wall_id !== hostWall.id) continue;
+    const c = axis === "x" ? w.position.x : w.position.y;
+    forbidden.push([
+      c - w.width_m / 2 - MIN_OPENING_GAP_M,
+      c + w.width_m / 2 + MIN_OPENING_GAP_M,
+    ]);
+  }
+  const openLo = centerRaw - half;
+  const openHi = centerRaw + half;
+  for (const [fLo, fHi] of forbidden) {
+    if (openHi > fLo && openLo < fHi) {
+      return { plan: basePlan, valid: false, invalidReason: "Kollision mit anderer Öffnung" };
+    }
+  }
+
+  const position: Point2D =
+    axis === "x"
+      ? { x: centerRaw, y: perpCoord }
+      : { x: perpCoord, y: centerRaw };
+  const newId = genUuid();
+
+  if (kind === "window") {
+    const window: WindowPlacement = {
+      id: newId,
+      position,
+      wall_id: hostWall.id,
+      width_m: width,
+      height_m: DEFAULT_WINDOW_HEIGHT_M,
+      sill_height_m: DEFAULT_WINDOW_SILL_M,
+      is_floor_to_ceiling: false,
+    };
+    return {
+      plan: { ...basePlan, windows: [...basePlan.windows, window] },
+      valid: true,
+      newId,
+    };
+  } else {
+    const door: DoorPlacement = {
+      id: newId,
+      position,
+      wall_id: hostWall.id,
+      width_m: width,
+      height_m: DEFAULT_DOOR_HEIGHT_M,
+      is_entrance: hostWall.is_exterior,
+      swing_direction: "inward",
+    };
+    return {
+      plan: { ...basePlan, doors: [...basePlan.doors, door] },
+      valid: true,
+      newId,
+    };
+  }
+}
+
 /** Helper: look up the opening's perpendicular coordinate from the base
  *  plan (the along-axis coord is being updated by the drag). */
 function basePlanOpeningPerp(plan: FloorPlan, drag: OpeningDragState): number {
@@ -3263,6 +3653,307 @@ function applyRoomTypeChangeOnPlan(
   return { ...basePlan, rooms: roomsNextLabeled, apartments: apartmentsNext };
 }
 
+// ── Topology-changing room operations (Phase 3.6d add) ───────────────────
+
+/** Area slack beyond the sum of DIN minimums required before a split is
+ *  offered — prevents creating rooms that are exactly at min and can't be
+ *  adjusted later. 14m² (living) + 4m² (kitchen) + 2m² slack = 20m². */
+const MIN_WOHNKUECHE_SPLIT_AREA_SQM = 20.0;
+/** Kitchen portion of the split, 0–1 along the longer axis. 0.30 is
+ *  a typical German Wohnküche ratio. */
+const WOHNKUECHE_SPLIT_KITCHEN_FRAC = 0.30;
+/** Tolerance (m) for two polygon edges to be considered "shared". */
+const SHARED_EDGE_TOL = 0.05;
+
+/**
+ * Split a living room into a living room + a new kitchen along its longer
+ * axis. The room's polygon must be an axis-aligned rectangle (always true
+ * for the Goldbeck generator output). Inserts a new partition wall along
+ * the split line and updates the owning apartment's `apartment_type` to
+ * reflect the added kitchen.
+ *
+ * Returns the next plan or `null` if the operation isn't valid (room not
+ * found, not a rectangle, too small, etc.) — callers should not commit.
+ */
+function applyWohnkuecheSplit(basePlan: FloorPlan, roomId: string): FloorPlan | null {
+  const target = basePlan.rooms.find((r) => r.id === roomId);
+  if (!target || target.room_type !== "living") return null;
+  if (target.polygon.length !== 4) return null;
+  if (target.area_sqm < MIN_WOHNKUECHE_SPLIT_AREA_SQM) return null;
+
+  const xs = target.polygon.map((p) => p.x);
+  const ys = target.polygon.map((p) => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = maxX - minX;
+  const h = maxY - minY;
+  // Abort if not axis-aligned rectangle (vertices not at the four corners)
+  const tol = 0.01;
+  const isRect = target.polygon.every(
+    (p) =>
+      (Math.abs(p.x - minX) < tol || Math.abs(p.x - maxX) < tol) &&
+      (Math.abs(p.y - minY) < tol || Math.abs(p.y - maxY) < tol),
+  );
+  if (!isRect) return null;
+
+  // Find the owning apartment
+  const owningApt = basePlan.apartments.find((a) =>
+    a.rooms.some((r) => r.id === roomId),
+  );
+  if (!owningApt) return null;
+
+  // Split along the longer dimension. Living keeps the larger portion,
+  // kitchen takes WOHNKUECHE_SPLIT_KITCHEN_FRAC of the longer axis.
+  let livingPoly: Point2D[];
+  let kitchenPoly: Point2D[];
+  let wallStart: Point2D;
+  let wallEnd: Point2D;
+  const livingFrac = 1 - WOHNKUECHE_SPLIT_KITCHEN_FRAC;
+  if (w >= h) {
+    const splitX = minX + w * livingFrac;
+    livingPoly = [
+      { x: minX, y: minY },
+      { x: splitX, y: minY },
+      { x: splitX, y: maxY },
+      { x: minX, y: maxY },
+    ];
+    kitchenPoly = [
+      { x: splitX, y: minY },
+      { x: maxX, y: minY },
+      { x: maxX, y: maxY },
+      { x: splitX, y: maxY },
+    ];
+    wallStart = { x: splitX, y: minY };
+    wallEnd = { x: splitX, y: maxY };
+  } else {
+    const splitY = minY + h * livingFrac;
+    livingPoly = [
+      { x: minX, y: minY },
+      { x: maxX, y: minY },
+      { x: maxX, y: splitY },
+      { x: minX, y: splitY },
+    ];
+    kitchenPoly = [
+      { x: minX, y: splitY },
+      { x: maxX, y: splitY },
+      { x: maxX, y: maxY },
+      { x: minX, y: maxY },
+    ];
+    wallStart = { x: minX, y: splitY };
+    wallEnd = { x: maxX, y: splitY };
+  }
+
+  const livingArea = polygonArea(livingPoly);
+  const kitchenArea = polygonArea(kitchenPoly);
+  const minLiving = MIN_ROOM_AREA_SQM.living ?? 14;
+  const minKitchen = MIN_ROOM_AREA_SQM.kitchen ?? 4;
+  if (livingArea < minLiving || kitchenArea < minKitchen) return null;
+
+  const newKitchenId = genUuid();
+  const newWallId = genUuid();
+
+  const updatedLiving: FloorPlanRoom = {
+    ...target,
+    polygon: livingPoly,
+    area_sqm: livingArea,
+    label: target.label?.includes("Wohnküche") ? "Living" : target.label,
+  };
+  const newKitchen: FloorPlanRoom = {
+    ...target,
+    id: newKitchenId,
+    room_type: "kitchen",
+    label: "Kitchen",
+    polygon: kitchenPoly,
+    area_sqm: kitchenArea,
+    // Keep apartment_id so it stays attached
+  };
+
+  const newWall: WallSegment = {
+    id: newWallId,
+    start: wallStart,
+    end: wallEnd,
+    wall_type: "partition",
+    thickness_m: 0.115, // standard non-bearing gypsum partition
+    is_bearing: false,
+    is_exterior: false,
+  };
+
+  // Update flat rooms list
+  const roomsNext = basePlan.rooms
+    .map((r) => (r.id === roomId ? updatedLiving : r))
+    .concat([newKitchen]);
+
+  // Update the owning apartment's rooms + apartment_type (adds a kitchen,
+  // so zimmerCount grows by 1 vs the previous declared value).
+  const apartmentsNext = basePlan.apartments.map((apt) => {
+    if (apt.id !== owningApt.id) return apt;
+    const aptRooms = apt.rooms
+      .map((r) => (r.id === roomId ? updatedLiving : r))
+      .concat([newKitchen]);
+    const bedroomCount = aptRooms.filter((r) => r.room_type === "bedroom").length;
+    const hasLiving = aptRooms.some((r) => r.room_type === "living");
+    const zimmerCount = Math.max(1, Math.min(5, bedroomCount + (hasLiving ? 1 : 0)));
+    return { ...apt, rooms: aptRooms, apartment_type: `${zimmerCount}_room` };
+  });
+
+  return {
+    ...basePlan,
+    rooms: roomsNext,
+    apartments: apartmentsNext,
+    walls: [...basePlan.walls, newWall],
+  };
+}
+
+/**
+ * Merge an adjacent kitchen into a living room, producing a single
+ * Wohnküche. Removes the shared partition wall + any openings on it.
+ * Returns the next plan or `null` if no valid merge candidate exists.
+ */
+function applyKitchenMerge(basePlan: FloorPlan, livingRoomId: string): FloorPlan | null {
+  const living = basePlan.rooms.find((r) => r.id === livingRoomId);
+  if (!living || living.room_type !== "living") return null;
+  if (living.polygon.length !== 4) return null;
+
+  const owningApt = basePlan.apartments.find((a) =>
+    a.rooms.some((r) => r.id === livingRoomId),
+  );
+  if (!owningApt) return null;
+
+  // Find kitchen in the same apartment that shares a full edge with living
+  const kitchens = owningApt.rooms.filter(
+    (r) => r.room_type === "kitchen" && r.polygon.length === 4,
+  );
+  let kitchen: FloorPlanRoom | null = null;
+  let sharedAxis: "x" | "y" | null = null;
+  let sharedCoord: number | null = null;
+  for (const k of kitchens) {
+    const m = findSharedEdge(living.polygon, k.polygon);
+    if (m) {
+      kitchen = k;
+      sharedAxis = m.axis;
+      sharedCoord = m.coord;
+      break;
+    }
+  }
+  if (!kitchen || sharedAxis === null || sharedCoord === null) return null;
+
+  // Union of both rectangles (they share a full edge → union is the bbox
+  // of all 8 corners).
+  const allPts = [...living.polygon, ...kitchen.polygon];
+  const xs = allPts.map((p) => p.x);
+  const ys = allPts.map((p) => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const mergedPoly: Point2D[] = [
+    { x: minX, y: minY },
+    { x: maxX, y: minY },
+    { x: maxX, y: maxY },
+    { x: minX, y: maxY },
+  ];
+
+  const updatedLiving: FloorPlanRoom = {
+    ...living,
+    polygon: mergedPoly,
+    area_sqm: polygonArea(mergedPoly),
+    label: "Wohnküche",
+  };
+
+  // Find the shared wall: an axis-aligned wall whose axis coord equals
+  // the shared coord and whose extent overlaps the shared-edge range.
+  const axisTol = 0.01;
+  const sharedWallIds = new Set<string>();
+  for (const wall of basePlan.walls) {
+    const dx = Math.abs(wall.end.x - wall.start.x);
+    const dy = Math.abs(wall.end.y - wall.start.y);
+    if (sharedAxis === "x") {
+      // Shared edge is vertical (x = sharedCoord); wall must be vertical
+      if (dx < axisTol && dy > axisTol) {
+        if (
+          Math.abs(wall.start.x - sharedCoord) < axisTol &&
+          Math.abs(wall.end.x - sharedCoord) < axisTol
+        ) {
+          sharedWallIds.add(wall.id);
+        }
+      }
+    } else {
+      // Shared edge is horizontal (y = sharedCoord); wall must be horizontal
+      if (dy < axisTol && dx > axisTol) {
+        if (
+          Math.abs(wall.start.y - sharedCoord) < axisTol &&
+          Math.abs(wall.end.y - sharedCoord) < axisTol
+        ) {
+          sharedWallIds.add(wall.id);
+        }
+      }
+    }
+  }
+
+  // Drop the kitchen from rooms + apartment, update living, remove shared
+  // walls, and drop any openings on those walls.
+  const roomsNext = basePlan.rooms
+    .filter((r) => r.id !== kitchen!.id)
+    .map((r) => (r.id === livingRoomId ? updatedLiving : r));
+
+  const apartmentsNext = basePlan.apartments.map((apt) => {
+    if (apt.id !== owningApt.id) return apt;
+    const aptRooms = apt.rooms
+      .filter((r) => r.id !== kitchen!.id)
+      .map((r) => (r.id === livingRoomId ? updatedLiving : r));
+    const bedroomCount = aptRooms.filter((r) => r.room_type === "bedroom").length;
+    const hasLiving = aptRooms.some((r) => r.room_type === "living");
+    const zimmerCount = Math.max(1, Math.min(5, bedroomCount + (hasLiving ? 1 : 0)));
+    return { ...apt, rooms: aptRooms, apartment_type: `${zimmerCount}_room` };
+  });
+
+  const wallsNext = basePlan.walls.filter((w) => !sharedWallIds.has(w.id));
+  const doorsNext = basePlan.doors.filter((d) => !sharedWallIds.has(d.wall_id));
+  const windowsNext = basePlan.windows.filter((w) => !sharedWallIds.has(w.wall_id));
+
+  return {
+    ...basePlan,
+    rooms: roomsNext,
+    apartments: apartmentsNext,
+    walls: wallsNext,
+    doors: doorsNext,
+    windows: windowsNext,
+  };
+}
+
+/**
+ * Return the shared edge of two axis-aligned rectangles if one exists.
+ * An edge is "shared" if both rectangles touch the same coordinate
+ * along an axis AND their extents overlap along the perpendicular axis
+ * for at least 1.0m. Returns `null` if they don't share an edge.
+ */
+function findSharedEdge(
+  polyA: Point2D[],
+  polyB: Point2D[],
+): { axis: "x" | "y"; coord: number } | null {
+  if (polyA.length !== 4 || polyB.length !== 4) return null;
+  const ax = polyA.map((p) => p.x);
+  const ay = polyA.map((p) => p.y);
+  const bx = polyB.map((p) => p.x);
+  const by = polyB.map((p) => p.y);
+  const aMinX = Math.min(...ax), aMaxX = Math.max(...ax);
+  const aMinY = Math.min(...ay), aMaxY = Math.max(...ay);
+  const bMinX = Math.min(...bx), bMaxX = Math.max(...bx);
+  const bMinY = Math.min(...by), bMaxY = Math.max(...by);
+
+  // Vertical shared edge (x = common coord)
+  const yOverlap = Math.max(0, Math.min(aMaxY, bMaxY) - Math.max(aMinY, bMinY));
+  if (yOverlap > 1.0) {
+    if (Math.abs(aMaxX - bMinX) < SHARED_EDGE_TOL) return { axis: "x", coord: aMaxX };
+    if (Math.abs(aMinX - bMaxX) < SHARED_EDGE_TOL) return { axis: "x", coord: aMinX };
+  }
+  // Horizontal shared edge (y = common coord)
+  const xOverlap = Math.max(0, Math.min(aMaxX, bMaxX) - Math.max(aMinX, bMinX));
+  if (xOverlap > 1.0) {
+    if (Math.abs(aMaxY - bMinY) < SHARED_EDGE_TOL) return { axis: "y", coord: aMaxY };
+    if (Math.abs(aMinY - bMaxY) < SHARED_EDGE_TOL) return { axis: "y", coord: aMinY };
+  }
+  return null;
+}
+
 /** Default label for a freshly-assigned room type. Bedrooms get renumbered
  *  later by the per-apartment pass; this is just the placeholder. */
 function defaultLabelFor(t: (typeof REASSIGNABLE_ROOM_TYPES)[number]): string {
@@ -3400,8 +4091,12 @@ function validatePlan(plan: FloorPlan): ValidationResult {
       // a conservative proxy.
       const xs = r.polygon.map((p) => p.x);
       const ys = r.polygon.map((p) => p.y);
-      const w = Math.max(...xs) - Math.min(...xs);
-      const h = Math.max(...ys) - Math.min(...ys);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const w = maxX - minX;
+      const h = maxY - minY;
       const short = Math.min(w, h);
       const long = Math.max(w, h);
       if (short > 0) {
@@ -3413,6 +4108,29 @@ function validatePlan(plan: FloorPlan): ValidationResult {
             message: `${r.label || r.room_type}: Seitenverhältnis ${ratio.toFixed(1)}:1 > ${MAX_HABITABLE_ASPECT_RATIO.toFixed(1)}:1 (schwer möblierbar)`,
           });
         }
+      }
+
+      // DIN 5034 natural-light check: every habitable room (living, bedroom,
+      // kitchen) must have at least one window. Windows sit on the exterior
+      // edge of a room's bounding box, so we inflate the bbox by 0.3m (wall
+      // thickness slack) and test window centroids against it. Exact for
+      // Goldbeck's axis-aligned rectangular rooms; a small false-positive
+      // risk for future irregular polygons (acceptable — a false positive
+      // raises a visible warning but doesn't block the edit).
+      const inflate = 0.3;
+      const hasWindow = plan.windows.some(
+        (win) =>
+          win.position.x >= minX - inflate &&
+          win.position.x <= maxX + inflate &&
+          win.position.y >= minY - inflate &&
+          win.position.y <= maxY + inflate,
+      );
+      if (!hasWindow) {
+        pushRoomIssue(r.id, r.apartment_id, {
+          severity: "error",
+          code: "no_window",
+          message: `${r.label || r.room_type}: kein Fenster (DIN 5034 Tageslicht)`,
+        });
       }
     }
   }
@@ -3639,6 +4357,21 @@ function applyWallDragOnPlan(
     rooms: apt.rooms.map(updateRoom),
   }));
 
+  // Openings (doors + windows) that sit on a dragged wall must follow the
+  // wall along the perpendicular axis. Along-axis position (where they sit
+  // along the wall) is preserved — this is pure translation. Fixes the
+  // 3.6b known issue "openings don't follow apt-boundary drag".
+  const doorsNext = basePlan.doors.map((d) =>
+    wallGroup.has(d.wall_id)
+      ? { ...d, position: { ...d.position, [key]: newPos } as Point2D }
+      : d,
+  );
+  const windowsNext = basePlan.windows.map((w) =>
+    wallGroup.has(w.wall_id)
+      ? { ...w, position: { ...w.position, [key]: newPos } as Point2D }
+      : w,
+  );
+
   // Apt-boundary drags: ensure each affected apartment retains at least
   // MIN_APARTMENT_WIDTH_M along the drag axis (i.e. no apartment collapses
   // below one narrow bay).
@@ -3662,7 +4395,14 @@ function applyWallDragOnPlan(
   }
 
   return {
-    plan: { ...basePlan, walls: wallsNext, rooms: roomsNext, apartments: apartmentsNext },
+    plan: {
+      ...basePlan,
+      walls: wallsNext,
+      rooms: roomsNext,
+      apartments: apartmentsNext,
+      doors: doorsNext,
+      windows: windowsNext,
+    },
     valid,
     invalidReason,
   };

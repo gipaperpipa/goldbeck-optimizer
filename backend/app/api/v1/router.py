@@ -8,6 +8,7 @@ from app.api.v1 import (
     financial,
     shadow,
     floorplan,
+    floorplan_overrides,
     export,
     parcels,
     projects,
@@ -24,4 +25,9 @@ api_router.include_router(optimize.router, prefix="/optimize", tags=["optimize"]
 api_router.include_router(financial.router, prefix="/financial", tags=["financial"])
 api_router.include_router(shadow.router, prefix="/shadow", tags=["shadow"])
 api_router.include_router(floorplan.router, prefix="/floorplan", tags=["floorplan"])
+api_router.include_router(
+    floorplan_overrides.router,
+    prefix="/floorplan/overrides",
+    tags=["floorplan-overrides"],
+)
 api_router.include_router(export.router, prefix="/export", tags=["export"])

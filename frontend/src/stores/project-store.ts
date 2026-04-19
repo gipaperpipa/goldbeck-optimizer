@@ -31,6 +31,118 @@ export interface EditedFloorPlanEntry {
 export const editedPlanKey = (buildingId: string, floorIndex: number) =>
   `${buildingId}:${floorIndex}`;
 
+/**
+ * Storage wrapper for the Zustand `persist` middleware that transparently
+ * evicts the oldest entries from `editedFloorPlans` (by `savedAt`) when
+ * `localStorage.setItem` throws `QuotaExceededError`. Without this a user
+ * who edits ~100+ floor plans in one browser would start losing NEW edits
+ * silently once the 5 MB origin cap is hit.
+ *
+ * Strategy:
+ *  1. Try the write as-is.
+ *  2. On quota error: parse the persisted payload, drop the oldest
+ *     `editedFloorPlans` entry, re-stringify, retry.
+ *  3. Repeat until the write succeeds or the map is empty (in which
+ *     case propagate the original error — something else is oversized).
+ *
+ * Phase 3.7b add.
+ */
+function quotaAwareStorage(): Storage {
+  const base =
+    typeof window !== "undefined" ? window.localStorage : undefined;
+  if (!base) {
+    // Return the noop storage Zustand falls back to when window is absent
+    // (SSR). Persist middleware calls setItem/getItem, so both need stubs.
+    return {
+      length: 0,
+      clear: () => {},
+      getItem: () => null,
+      key: () => null,
+      removeItem: () => {},
+      setItem: () => {},
+    };
+  }
+  const isQuotaError = (err: unknown): boolean => {
+    if (err instanceof DOMException) {
+      // Covers "QuotaExceededError" on Chromium/WebKit and
+      // "NS_ERROR_DOM_QUOTA_REACHED" on Firefox.
+      return (
+        err.code === 22 ||
+        err.code === 1014 ||
+        err.name === "QuotaExceededError" ||
+        err.name === "NS_ERROR_DOM_QUOTA_REACHED"
+      );
+    }
+    return false;
+  };
+  return {
+    get length() {
+      return base.length;
+    },
+    clear: () => base.clear(),
+    getItem: (k) => base.getItem(k),
+    key: (i) => base.key(i),
+    removeItem: (k) => base.removeItem(k),
+    setItem: (k, v) => {
+      try {
+        base.setItem(k, v);
+        return;
+      } catch (err) {
+        if (!isQuotaError(err)) throw err;
+      }
+      // Quota hit — parse, evict oldest editedFloorPlans entry, retry.
+      let payload: string = v;
+      const MAX_EVICT = 50; // hard stop; each loop drops 1 entry
+      for (let i = 0; i < MAX_EVICT; i++) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          throw new Error(
+            "[project-store] quota exceeded and payload not JSON-parseable",
+          );
+        }
+        const p = parsed as {
+          state?: { editedFloorPlans?: Record<string, EditedFloorPlanEntry> };
+        };
+        const edits = p.state?.editedFloorPlans;
+        if (!edits || Object.keys(edits).length === 0) {
+          throw new Error(
+            "[project-store] quota exceeded with no edits to evict — other slices too large",
+          );
+        }
+        // Find oldest by savedAt
+        let oldestKey: string | null = null;
+        let oldestAt = Number.POSITIVE_INFINITY;
+        for (const [key, entry] of Object.entries(edits)) {
+          if (entry.savedAt < oldestAt) {
+            oldestAt = entry.savedAt;
+            oldestKey = key;
+          }
+        }
+        if (!oldestKey) break;
+        delete edits[oldestKey];
+        payload = JSON.stringify(parsed);
+        try {
+          base.setItem(k, payload);
+          if (typeof console !== "undefined") {
+            console.info(
+              `[project-store] evicted stale edit "${oldestKey}" to free localStorage`,
+            );
+          }
+          return;
+        } catch (err) {
+          if (!isQuotaError(err)) throw err;
+          // Still over — loop evicts another entry.
+        }
+      }
+      throw new Error(
+        "[project-store] localStorage quota exceeded after evicting all edits",
+      );
+    },
+  };
+}
+
 // ── Undo/Redo snapshot ───────────────────────────────────────────────
 // Only tracks the fields that represent meaningful user decisions.
 
@@ -334,7 +446,10 @@ export const useProjectStore = create<ProjectState>()(
     }),
     {
       name: "goldbeck-project-store",
-      storage: createJSONStorage(() => localStorage),
+      // Wrap localStorage in an LRU-evicting shim so hitting the 5 MB
+      // origin cap drops the oldest edited floor plans instead of
+      // silently losing the new write.
+      storage: createJSONStorage(() => quotaAwareStorage()),
       version: 1,
       // Only persist the slices a user wants to survive a page reload.
       // Skipped: large transient results (`optimizationResult`), UI-only

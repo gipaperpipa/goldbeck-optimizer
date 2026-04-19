@@ -260,3 +260,42 @@ class User(Base):
     name = Column(String, default="")
     role = Column(String, default="owner")  # owner, admin, member, viewer
     created_at = Column(DateTime, default=_now)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# EDITED FLOOR PLANS (Phase 3.7c — cross-device sync)
+# ═══════════════════════════════════════════════════════════════════
+
+class EditedFloorPlan(Base):
+    """
+    A user-edited copy of a single FloorPlan (one storey of one building),
+    persisted server-side so edits sync across devices and survive browser
+    cache clears. Paired with the Zustand localStorage cache (Phase 3.7b) —
+    localStorage provides instant offline UX while this table is the source
+    of truth on cold start / new device.
+
+    Staleness detection:
+      - `original_fingerprint` is the hash of the plan BEFORE any user
+        edits (computed on the client via FNV-1a over sorted UUIDs etc.)
+      - When the optimizer regenerates a plan, new UUIDs → new fingerprint
+      - On load, the client compares the live plan's fingerprint against
+        this column; mismatch → the stored edit is stale, discard.
+    """
+    __tablename__ = "edited_floor_plans"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    # Composite natural key — a given (building, floor) has at most one
+    # edit record. Not tied to Project/OptimizationRun yet (the building_id
+    # is a client-generated identifier from the optimizer output); once we
+    # wire up per-user auth we'll add user_id + unique(user_id, building_id, floor_index).
+    building_id = Column(String, nullable=False, index=True)
+    floor_index = Column(Integer, nullable=False)
+    original_fingerprint = Column(String, nullable=False)
+    plan_json = Column(Text, nullable=False)  # serialized FloorPlan
+    saved_at = Column(DateTime, default=_now, onupdate=_now)
+    created_at = Column(DateTime, default=_now)
+
+    __table_args__ = (
+        UniqueConstraint("building_id", "floor_index", name="uq_edit_building_floor"),
+        Index("idx_edit_building_floor", "building_id", "floor_index"),
+    )

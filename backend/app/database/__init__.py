@@ -13,6 +13,7 @@ from app.database.models import (
     TimelineEntry,
     Organization,
     User,
+    EditedFloorPlan,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "TimelineEntry",
     "Organization",
     "User",
+    "EditedFloorPlan",
 ]
