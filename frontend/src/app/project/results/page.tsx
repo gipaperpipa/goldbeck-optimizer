@@ -8,6 +8,7 @@ import { LayoutComparison } from "@/components/optimization/layout-comparison";
 import { Scene3D } from "@/components/three/scene";
 import { ShadowAnalysisPanel } from "@/components/shadow/shadow-analysis-panel";
 import { FinancialDashboard } from "@/components/financial/financial-dashboard";
+import { CostPanel } from "@/components/floorplan/cost-panel";
 import { useProjectStore } from "@/stores/project-store";
 
 export default function ResultsPage() {
@@ -51,6 +52,7 @@ export default function ResultsPage() {
             <TabsTrigger value="layouts">Layouts</TabsTrigger>
             <TabsTrigger value="3d-view">3D View</TabsTrigger>
             <TabsTrigger value="shadow">Shadow Analysis</TabsTrigger>
+            <TabsTrigger value="costs">Baukosten</TabsTrigger>
             <TabsTrigger value="financial">Financial</TabsTrigger>
           </TabsList>
 
@@ -69,6 +71,10 @@ export default function ResultsPage() {
 
           <TabsContent value="shadow">
             <ShadowAnalysisPanel />
+          </TabsContent>
+
+          <TabsContent value="costs">
+            <CostPanel />
           </TabsContent>
 
           <TabsContent value="financial">

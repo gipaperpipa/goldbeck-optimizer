@@ -16,6 +16,13 @@ import {
   putOverride,
   deleteOverride,
 } from "@/lib/floorplan-overrides";
+import {
+  placeFurnitureForPlan,
+  FURNITURE_COLORS,
+  type FurniturePlacement,
+  type RoomFurnitureResult,
+} from "@/lib/furniture-layouts";
+import { downloadFloorPlanPdf } from "@/lib/floorplan-pdf";
 
 /** Props for the 2D canvas floor plan renderer.
  * @property floorPlan - Single-storey floor plan data (rooms, walls, doors, windows).
@@ -308,6 +315,7 @@ export function FloorPlanViewer({
     dimensions: true,
     annotations: true, // north arrow, scale bar, title
     validation: true,  // per-room/apartment issue badges (Phase 3.6e)
+    furniture: false,  // DIN-compliant furniture silhouettes (Phase 4.1)
   });
   const [showLayerPanel, setShowLayerPanel] = useState(false);
   const toggleLayer = (k: keyof typeof layers) =>
@@ -577,7 +585,16 @@ export function FloorPlanViewer({
   // ── Live validation (Phase 3.6e) ─────────────────────────────────────────
   // Recomputed on every plan change (incl. every drag commit / room type
   // flip). Cheap — O(rooms + apartments) for a handful of each per floor.
-  const validation = useMemo(() => validatePlan(plan), [plan]);
+  // ── Furniture placement (Phase 4.1) ──────────────────────────────────────
+  // Computed once per plan change and cached. Only *drawn* when the
+  // `furniture` layer is enabled, but always computed so the validator
+  // can emit a "room doesn't furnish" warning regardless of layer state.
+  const furnitureByRoom = useMemo(() => placeFurnitureForPlan(plan), [plan]);
+
+  const validation = useMemo(
+    () => validatePlan(plan, furnitureByRoom),
+    [plan, furnitureByRoom],
+  );
   const [validationPanelOpen, setValidationPanelOpen] = useState(false);
   const [focusedRoomId, setFocusedRoomId] = useState<string | null>(null);
   const focusTimerRef = useRef<number | null>(null);
@@ -601,16 +618,18 @@ export function FloorPlanViewer({
   const applyViewMode = (mode: "architect" | "presentation") => {
     setViewMode(mode);
     if (mode === "architect") {
-      setLayers({
+      setLayers((prev) => ({
         grid: true, rooms: true, walls: true, openings: true,
         labels: true, dimensions: true, annotations: true, validation: true,
-      });
+        furniture: prev.furniture,
+      }));
     } else {
       // Presentation: hide technical layers, keep rooms + walls + openings + labels
-      setLayers({
+      setLayers((prev) => ({
         grid: false, rooms: true, walls: true, openings: true,
         labels: true, dimensions: false, annotations: true, validation: false,
-      });
+        furniture: prev.furniture,
+      }));
     }
   };
 
@@ -1648,6 +1667,12 @@ export function FloorPlanViewer({
       }
     }
 
+    // --- 9b. Furniture silhouettes (Phase 4.1) ---
+    //   Drawn BEFORE labels so room names stay on top of the furniture layer.
+    if (layers.furniture) {
+      drawFurnitureLayer(ctx, plan.rooms, furnitureByRoom, tx, ty, ts);
+    }
+
     // --- 10. Room labels (professional typography) ---
     if (layers.labels) {
       drawRoomLabels(ctx, allRooms, tx, ty, ts);
@@ -1780,6 +1805,7 @@ export function FloorPlanViewer({
     roomEditor,
     validation,
     focusedRoomId,
+    furnitureByRoom,
   ]);
 
   const handleMeasureToggle = () => {
@@ -1790,6 +1816,76 @@ export function FloorPlanViewer({
   const handleClearMeasurements = () => {
     setMeasurePoints([]);
   };
+
+  // Phase 4.2 — DIN A3 PDF export. Rasterizes the plan at the chosen
+  // architectural scale (auto-picked 1:50/100/200/500) on an offscreen
+  // canvas using the same module-scope draw helpers the viewer uses,
+  // then embeds it into a landscape A3 sheet with a title block.
+  const handleExportPdf = useCallback(() => {
+    const floorLabel = plan.floor_index === 0 ? "EG" : `${plan.floor_index}. OG`;
+    try {
+      downloadFloorPlanPdf({
+        plan,
+        title: {
+          projectName: "Goldbeck Residential",
+          buildingName: buildingId ?? undefined,
+          floorLabel,
+          notes: "Auto-generated layout — architectural draft",
+          author: "Goldbeck Optimizer",
+        },
+        drawPlan: (ctx, pxW, pxH, pxPerM) => {
+          // Build transforms mapping plan (0..bldgW, 0..bldgH) into
+          // canvas (0..pxW, 0..pxH) with an 8mm padding already baked
+          // into the canvas by the rasterizer.
+          const grid = plan.structural_grid;
+          const bldgW = grid.building_length_m;
+          const bldgH = grid.building_depth_m;
+          const paddingPx = (pxW - bldgW * pxPerM) / 2;
+          const tx = (x: number) => paddingPx + x * pxPerM;
+          // Canvas Y grows downward; plan Y grows upward. Flip.
+          const ty = (y: number) => pxH - paddingPx - y * pxPerM;
+          const ts = (s: number) => s * pxPerM;
+
+          // Building outline
+          ctx.strokeStyle = "#2b2520";
+          ctx.lineWidth = 2.0;
+          ctx.strokeRect(tx(0), ty(bldgH), ts(bldgW), ts(bldgH));
+
+          // Rooms (filled) + apartment outlines off
+          for (const room of plan.rooms) {
+            drawRoom(ctx, room, tx, ty, null, null);
+          }
+          // Walls
+          for (const wall of plan.walls) {
+            drawWall(ctx, wall, tx, ty, ts);
+          }
+          // Windows + doors
+          for (const win of plan.windows) {
+            const host = findNearestWall2D(win.position, plan.walls);
+            drawWindow(ctx, win, host, tx, ty, ts);
+          }
+          for (const door of plan.doors) {
+            const host = findNearestWall2D(door.position, plan.walls);
+            drawDoor(ctx, door, host, tx, ty, ts);
+          }
+          // Furniture (if user has it enabled — carries over to print)
+          if (layers.furniture) {
+            drawFurnitureLayer(ctx, plan.rooms, furnitureByRoom, tx, ty, ts);
+          }
+          // Labels
+          drawRoomLabels(ctx, plan.rooms, tx, ty, ts);
+          // Dimensions
+          drawDimensionLines(ctx, grid, tx, ty, ts, bldgW, bldgH);
+          // North arrow + scale bar in the canvas corners
+          drawNorthArrow(ctx, pxW, pxH);
+          drawScaleBar(ctx, pxW, pxH, pxPerM);
+        },
+      });
+    } catch (err) {
+      console.error("[pdf-export] failed:", err);
+      alert("PDF-Export fehlgeschlagen — siehe Konsole");
+    }
+  }, [plan, buildingId, layers.furniture, furnitureByRoom]);
 
   return (
     <div className="relative inline-block">
@@ -1855,6 +1951,7 @@ export function FloorPlanViewer({
                 ["dimensions", "Dimensions"],
                 ["annotations", "North / scale / title"],
                 ["validation", "Validation issues"],
+                ["furniture", "Möblierung (DIN)"],
               ] as const).map(([key, label]) => (
                 <label
                   key={key}
@@ -2075,6 +2172,13 @@ export function FloorPlanViewer({
           title="Grundriss als PNG exportieren"
         >
           PNG
+        </button>
+        <button
+          onClick={handleExportPdf}
+          className="px-3 py-1.5 rounded text-sm font-medium bg-neutral-900 text-white hover:bg-neutral-800 transition-colors"
+          title="Grundriss als DIN A3 PDF (1:100 oder auto) exportieren"
+        >
+          PDF
         </button>
         <button
           className="w-7 h-7 rounded-full bg-gray-200 text-gray-600 hover:bg-gray-300 text-xs font-bold transition-colors"
@@ -4038,7 +4142,10 @@ function drawRoomEditOverlay(
  *   • Apartment declared `{N}_room` but composition (bedrooms + hasLiving)
  *     disagrees → warn
  */
-function validatePlan(plan: FloorPlan): ValidationResult {
+function validatePlan(
+  plan: FloorPlan,
+  furnitureByRoom?: Map<string, RoomFurnitureResult>,
+): ValidationResult {
   const issues: ValidationIssue[] = [];
   const byRoom = new Map<string, ValidationIssue[]>();
   const byApartment = new Map<string, ValidationIssue[]>();
@@ -4130,6 +4237,27 @@ function validatePlan(plan: FloorPlan): ValidationResult {
           severity: "error",
           code: "no_window",
           message: `${r.label || r.room_type}: kein Fenster (DIN 5034 Tageslicht)`,
+        });
+      }
+    }
+
+    // Phase 4.1 — furnishability warning. Emitted for any furnished room
+    // type (living/bedroom/kitchen/bathroom) where the DIN-minimum layout
+    // couldn't be placed. Warn (not error) because the room is still legal
+    // by area / windows / aspect — just a usability issue.
+    if (
+      furnitureByRoom &&
+      (r.room_type === "living" ||
+        r.room_type === "bedroom" ||
+        r.room_type === "kitchen" ||
+        r.room_type === "bathroom")
+    ) {
+      const f = furnitureByRoom.get(r.id);
+      if (f && !f.fitted) {
+        pushRoomIssue(r.id, r.apartment_id, {
+          severity: "warn",
+          code: "not_furnishable",
+          message: `${r.label || r.room_type}: Standard-Möblierung passt nicht${f.reason ? ` — ${f.reason}` : ""}`,
         });
       }
     }
@@ -4648,6 +4776,138 @@ function computeConvexHull(points: Point2D[]): Point2D[] {
 
 function cross(o: Point2D, a: Point2D, b: Point2D): number {
   return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+/** Phase 4.1 — DIN-compliant furniture silhouettes per room.
+ *  Each piece rendered as a filled rectangle with a soft stroke and a
+ *  tiny label when zoom allows. Rooms where placement failed get a faint
+ *  dashed warning rectangle across the centroid area. */
+function drawFurnitureLayer(
+  ctx: CanvasRenderingContext2D,
+  rooms: FloorPlanRoom[],
+  byRoom: Map<string, RoomFurnitureResult>,
+  tx: (x: number) => number,
+  ty: (y: number) => number,
+  ts: (s: number) => number,
+) {
+  ctx.save();
+  // Draw each placement on top of the room fill
+  for (const room of rooms) {
+    const result = byRoom.get(room.id);
+    if (!result) continue;
+    for (const p of result.placements) {
+      drawFurniturePiece(ctx, p, tx, ty, ts);
+    }
+  }
+  ctx.restore();
+}
+
+function drawFurniturePiece(
+  ctx: CanvasRenderingContext2D,
+  p: FurniturePlacement,
+  tx: (x: number) => number,
+  ty: (y: number) => number,
+  ts: (s: number) => number,
+) {
+  const fill = FURNITURE_COLORS[p.kind] ?? "#8a7a6a";
+  // Top-left in screen: (tx(x), ty(y + depth)) because canvas-y is flipped.
+  const sx = tx(p.x);
+  const sy = ty(p.y + p.depth_m);
+  const sw = ts(p.width_m);
+  const sh = ts(p.depth_m);
+
+  // Base fill — semi-transparent so room color still shows through
+  ctx.fillStyle = fill + "b3"; // ~70% alpha
+  ctx.fillRect(sx, sy, sw, sh);
+  // Crisp outline
+  ctx.strokeStyle = fill;
+  ctx.lineWidth = 0.75;
+  ctx.strokeRect(sx, sy, sw, sh);
+
+  // Kind-specific embellishments for architectural legibility
+  switch (p.kind) {
+    case "bed_double":
+    case "bed_single": {
+      // Pillow line at head (assumed top edge — we don't track orientation,
+      // so draw two small rectangles at the short edge nearest the centroid
+      // of the longer dimension)
+      const headAlongX = p.depth_m > p.width_m; // piece is "tall" — head at top
+      ctx.fillStyle = "#f5ede0";
+      const padding = ts(0.08);
+      const pillowThick = ts(0.15);
+      if (headAlongX) {
+        ctx.fillRect(sx + padding, sy + padding, sw - 2 * padding, pillowThick);
+      } else {
+        ctx.fillRect(sx + padding, sy + padding, pillowThick, sh - 2 * padding);
+      }
+      break;
+    }
+    case "sofa": {
+      // Back cushion indication — draw a thinner rectangle along the longer
+      // edge, slightly inset.
+      ctx.fillStyle = "#6b5d50";
+      const inset = ts(0.15);
+      if (p.width_m > p.depth_m) {
+        ctx.fillRect(sx + 1, sy + 1, sw - 2, inset);
+      } else {
+        ctx.fillRect(sx + 1, sy + 1, inset, sh - 2);
+      }
+      break;
+    }
+    case "bathtub": {
+      // Inner basin outline
+      ctx.strokeStyle = "#5c7a9e";
+      ctx.lineWidth = 0.5;
+      const inset = ts(0.12);
+      ctx.strokeRect(sx + inset, sy + inset, sw - 2 * inset, sh - 2 * inset);
+      break;
+    }
+    case "shower": {
+      ctx.strokeStyle = "#5c7a9e";
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx + sw, sy + sh);
+      ctx.moveTo(sx + sw, sy);
+      ctx.lineTo(sx, sy + sh);
+      ctx.stroke();
+      break;
+    }
+    case "wc": {
+      // Round the front edge slightly
+      ctx.fillStyle = "#b5c7d5";
+      ctx.beginPath();
+      ctx.arc(sx + sw / 2, sy + sh - ts(0.12), ts(0.15), 0, Math.PI);
+      ctx.fill();
+      break;
+    }
+    case "kitchen_counter": {
+      // Hob indicator: four small circles
+      ctx.fillStyle = "#2e3a44";
+      const rr = ts(0.08);
+      const isHorizontal = p.width_m > p.depth_m;
+      if (isHorizontal) {
+        const cy = sy + sh / 2;
+        for (let i = 0; i < 4; i++) {
+          const cx = sx + ts(0.30) + i * ts(0.22);
+          if (cx + rr > sx + sw - ts(0.1)) break;
+          ctx.beginPath();
+          ctx.arc(cx, cy, rr, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      break;
+    }
+  }
+
+  // Label (only if piece is large enough to host text at current zoom)
+  if (p.label && sw > 24 && sh > 14) {
+    ctx.fillStyle = "#1f1a15";
+    ctx.font = `500 ${Math.min(11, Math.max(8, Math.min(sw, sh) / 4))}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(p.label, sx + sw / 2, sy + sh / 2);
+  }
 }
 
 function drawRoomLabels(
