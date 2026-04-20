@@ -42,6 +42,12 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 
 ## Last Request
 **Status:** DONE
+**Date:** 2026-04-20
+**Request:** Phase 4.4 — Thermal envelope analysis panel.
+**Progress:** New `frontend/src/lib/thermal-envelope.ts` pure module computing GEG 2023-style envelope heat balance for the selected building. Element U·A·F_x breakdown (wall / window / door / roof / floor) with DIN V 4108-6 reduction factors (F_ext=1.0, F_roof=0.8, F_floor=0.5). Five preset standards: GEG 2023 Referenz, Goldbeck Standard, KfW Effizienzhaus 55/40, Passivhaus — each with per-element U-values. Outputs H_T, H_T′, annual heating demand Q_h (DIN V 4108-6 simplified: Q_T + Q_V − 20 kWh/m² internal/solar gains, HGT = 84 kKh/a), KfW tier via H_T′/Referenz ratio (≤ 0.40 → EH40, ≤ 0.55 → EH55), GEG compliance verdict (pass < 0.9 × Referenz / warn ≤ Referenz / fail). New `ThermalPanel` component: building + standard selector, GEG verdict card (tri-color), KPI cards (Heizwärmebedarf, H_T, KfW-Stufe), element breakdown table with F_x column, geometry+annual-balance card. Wired into results page as new "Energie" tab between "Baukosten" and "Financial". Typecheck + build clean.
+
+## Previous Request
+**Status:** DONE
 **Date:** 2026-04-19
 **Request:** Phase 4 — start with 4.1 Furniture feasibility overlay, then continue through 4.2 PDF export, 4.3 cost estimation.
 **Progress:** Three focused additions shipped as the Phase 4.1–4.3 batch:
