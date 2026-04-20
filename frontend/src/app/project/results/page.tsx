@@ -10,6 +10,7 @@ import { ShadowAnalysisPanel } from "@/components/shadow/shadow-analysis-panel";
 import { FinancialDashboard } from "@/components/financial/financial-dashboard";
 import { CostPanel } from "@/components/floorplan/cost-panel";
 import { ThermalPanel } from "@/components/floorplan/thermal-panel";
+import { SiteCoordinationPanel } from "@/components/plot/site-coordination-panel";
 import { useProjectStore } from "@/stores/project-store";
 
 export default function ResultsPage() {
@@ -52,6 +53,7 @@ export default function ResultsPage() {
           <TabsList className="mb-6">
             <TabsTrigger value="layouts">Layouts</TabsTrigger>
             <TabsTrigger value="3d-view">3D View</TabsTrigger>
+            <TabsTrigger value="site">Standort</TabsTrigger>
             <TabsTrigger value="shadow">Shadow Analysis</TabsTrigger>
             <TabsTrigger value="costs">Baukosten</TabsTrigger>
             <TabsTrigger value="energy">Energie</TabsTrigger>
@@ -69,6 +71,10 @@ export default function ResultsPage() {
                 Select a layout from the Layouts tab first
               </p>
             )}
+          </TabsContent>
+
+          <TabsContent value="site">
+            <SiteCoordinationPanel />
           </TabsContent>
 
           <TabsContent value="shadow">

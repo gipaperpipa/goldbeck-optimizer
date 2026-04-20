@@ -43,6 +43,12 @@ Adrian Krasniqi, architect/developer at a plus a studio L.L.C. Building a web-ba
 ## Last Request
 **Status:** DONE
 **Date:** 2026-04-20
+**Request:** Phase 4.5 — Multi-building site coordination panel (Abstandsflächen check).
+**Progress:** New `frontend/src/lib/site-coordination.ts` pure module analyzing a LayoutOption's buildings array: polygonizes each footprint (rotation-aware corners), computes pairwise minimum facade-to-facade distance via polygon-to-polygon point/segment distance, applies BauO NRW §6 / MBO §6 rule (required = max(hCoeff × max(H_a, H_b), 3 m)) per pair, emits pass (≥ required) / warn (≥ 90 % required) / fail verdicts. Also returns total footprint, GRZ (if plot area known), height stats (min/max/mean/σ, flagged if σ > 3 m), and axis alignment (common rotation within ±5°). Three `hCoeff` presets: 0.4 Regelfall Wohngebiet, 0.25 Kerngebiet, 0.2 Nebengebäude. New `SiteCoordinationPanel` component with: h-coefficient selector, tri-color overall verdict card, four KPI cards (Gebäude-Anzahl / Gesamtfußabdruck+GRZ / Höhenspanne+σ / Achsausrichtung), a top-down SVG Lageplan coloring footprints by worst pair status with centroid-to-centroid distance labels on connection lines, and a paired-distance table with pass/warn/fail pills and Δ column (shortfall or headroom). Wired as new "Standort" tab between "3D View" and "Shadow Analysis". Typecheck + build clean.
+
+## Previous Request
+**Status:** DONE
+**Date:** 2026-04-20
 **Request:** Phase 4.4 — Thermal envelope analysis panel.
 **Progress:** New `frontend/src/lib/thermal-envelope.ts` pure module computing GEG 2023-style envelope heat balance for the selected building. Element U·A·F_x breakdown (wall / window / door / roof / floor) with DIN V 4108-6 reduction factors (F_ext=1.0, F_roof=0.8, F_floor=0.5). Five preset standards: GEG 2023 Referenz, Goldbeck Standard, KfW Effizienzhaus 55/40, Passivhaus — each with per-element U-values. Outputs H_T, H_T′, annual heating demand Q_h (DIN V 4108-6 simplified: Q_T + Q_V − 20 kWh/m² internal/solar gains, HGT = 84 kKh/a), KfW tier via H_T′/Referenz ratio (≤ 0.40 → EH40, ≤ 0.55 → EH55), GEG compliance verdict (pass < 0.9 × Referenz / warn ≤ Referenz / fail). New `ThermalPanel` component: building + standard selector, GEG verdict card (tri-color), KPI cards (Heizwärmebedarf, H_T, KfW-Stufe), element breakdown table with F_x column, geometry+annual-balance card. Wired into results page as new "Energie" tab between "Baukosten" and "Financial". Typecheck + build clean.
 
