@@ -56,8 +56,25 @@ class IfcWriter:
         self,
         building: BuildingFootprint,
         floor_plans: BuildingFloorPlans,
+        cost_metadata: Optional[dict] = None,
+        thermal_metadata: Optional[dict] = None,
+        furniture_counts: Optional[dict] = None,
     ) -> str:
-        """Generate complete IFC file content as string."""
+        """Generate complete IFC file content as string.
+
+        Optional metadata is attached to the IfcBuilding as IfcPropertySets
+        (Phase 4.6 BIM enrichment):
+
+        - ``cost_metadata``   : dict from `estimateCost()` (KG 300-700,
+                                 total, revenue, cost/value ratio).
+        - ``thermal_metadata``: dict from `estimateThermal()` (H_T, H_T',
+                                 Qh, Qh per m², KfW tier, GEG status).
+        - ``furniture_counts``: dict[str, int] of furniture kind counts
+                                 aggregated across all rooms.
+
+        None fields produce no property sets — backward compatible with
+        the existing `/ifc` endpoint payload.
+        """
         self._lines = []
         self._id = 0
 
@@ -205,6 +222,14 @@ DATA;"""
             self._add(
                 f"IFCRELAGGREGATES('{_guid()}',#{owner},$,$,#{ifc_building},({storeys_str}))"
             )
+
+        # ── Phase 4.6: optional metadata property sets ──────────
+        if cost_metadata:
+            self._attach_cost_pset(ifc_building, owner, cost_metadata)
+        if thermal_metadata:
+            self._attach_thermal_pset(ifc_building, owner, thermal_metadata)
+        if furniture_counts:
+            self._attach_furniture_pset(ifc_building, owner, furniture_counts)
 
         # ── Assemble file ───────────────────────────────────────
         data_section = "\n".join(self._lines)
@@ -545,3 +570,156 @@ DATA;"""
         dz = self._add("IFCDIRECTION((0.,0.,1.))")
         dx = self._add("IFCDIRECTION((1.,0.,0.))")
         return self._add(f"IFCAXIS2PLACEMENT3D(#{pt},#{dz},#{dx})")
+
+    # ── Phase 4.6: property-set helpers ────────────────────────
+
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape apostrophes for IFC STEP string encoding."""
+        return str(text).replace("'", "\\'")
+
+    def _prop_real(self, name: str, value: float, unit_label: str = "") -> int:
+        """Create an IFCPROPERTYSINGLEVALUE with a real number.
+
+        unit_label is embedded in the property description for human
+        readability since we don't emit a full IFCUNITASSIGNMENT for
+        derived units like €/m²."""
+        label = self._escape(name)
+        desc = self._escape(unit_label) if unit_label else "$"
+        desc_field = f"'{desc}'" if unit_label else "$"
+        return self._add(
+            f"IFCPROPERTYSINGLEVALUE('{label}',{desc_field},IFCREAL({value:.4f}),$)"
+        )
+
+    def _prop_int(self, name: str, value: int) -> int:
+        label = self._escape(name)
+        return self._add(
+            f"IFCPROPERTYSINGLEVALUE('{label}',$,IFCINTEGER({int(value)}),$)"
+        )
+
+    def _prop_text(self, name: str, value: str) -> int:
+        label = self._escape(name)
+        val = self._escape(value)
+        return self._add(
+            f"IFCPROPERTYSINGLEVALUE('{label}',$,IFCTEXT('{val}'),$)"
+        )
+
+    def _emit_pset(
+        self,
+        pset_name: str,
+        prop_ids: list[int],
+        target_id: int,
+        owner: int,
+    ) -> int:
+        """Create an IFCPROPERTYSET and link it to a target entity
+        via IFCRELDEFINESBYPROPERTIES."""
+        if not prop_ids:
+            return 0
+        props_str = ",".join(f"#{p}" for p in prop_ids)
+        pset = self._add(
+            f"IFCPROPERTYSET('{_guid()}',#{owner},'{self._escape(pset_name)}',$,({props_str}))"
+        )
+        self._add(
+            f"IFCRELDEFINESBYPROPERTIES('{_guid()}',#{owner},$,$,(#{target_id}),#{pset})"
+        )
+        return pset
+
+    def _attach_cost_pset(
+        self, target_id: int, owner: int, cost: dict,
+    ) -> None:
+        """Attach a DIN 276 cost breakdown as Pset_ADS_Costs (custom
+        pset namespaced to a+a studio; Revit will show it under the
+        IfcBuilding properties)."""
+        prop_ids: list[int] = []
+        costs = cost.get("costs", {})
+        revenue = cost.get("revenue", {})
+        areas = cost.get("areas", {})
+
+        # DIN 276 KG breakdown
+        for key, label, unit in [
+            ("kg300", "DIN 276 KG 300 Bauwerk Baukonstruktion", "EUR"),
+            ("kg400", "DIN 276 KG 400 Technische Anlagen", "EUR"),
+            ("kg500", "DIN 276 KG 500 Aussenanlagen", "EUR"),
+            ("kg700", "DIN 276 KG 700 Baunebenkosten", "EUR"),
+            ("contingency", "Risikozuschlag", "EUR"),
+            ("totalConstruction", "Summe Bau- und Planungskosten", "EUR"),
+            ("land", "KG 100 Grundstueck", "EUR"),
+            ("total", "Gesamtinvestition", "EUR"),
+        ]:
+            if key in costs and costs[key] is not None:
+                prop_ids.append(self._prop_real(label, float(costs[key]), unit))
+
+        # Revenue
+        for key, label, unit in [
+            ("monthlyRent", "Kaltmiete pro Monat", "EUR/Monat"),
+            ("annualRent", "Kaltmiete pro Jahr", "EUR/Jahr"),
+            ("saleValue", "Verkehrswert (ETW-Verkauf)", "EUR"),
+            ("vacancyPct", "Leerstandsannahme", "%"),
+        ]:
+            if key in revenue and revenue[key] is not None:
+                prop_ids.append(self._prop_real(label, float(revenue[key]), unit))
+
+        # Headline ratios
+        for key, label, unit in [
+            ("costToValueRatio", "Kosten-Verkehrswert-Verhaeltnis", "1"),
+            ("grossMargin", "Rohmarge", "EUR"),
+            ("grossMarginPct", "Rohmarge Prozent", "%"),
+        ]:
+            if key in cost and cost[key] is not None:
+                prop_ids.append(self._prop_real(label, float(cost[key]), unit))
+
+        # Areas for reference
+        for key, label in [("bgfSqm", "BGF"), ("ngfSqm", "NGF")]:
+            if key in areas and areas[key] is not None:
+                prop_ids.append(self._prop_real(f"{label} (m2)", float(areas[key]), "m2"))
+
+        # Market label
+        if cost.get("market"):
+            prop_ids.append(self._prop_text("Markt", str(cost["market"])))
+
+        self._emit_pset("Pset_ADS_Costs_DIN276", prop_ids, target_id, owner)
+
+    def _attach_thermal_pset(
+        self, target_id: int, owner: int, thermal: dict,
+    ) -> None:
+        """Attach GEG 2023 thermal metadata. Uses the Revit-compatible
+        Pset_BuildingCommon placeholder keys where they map cleanly,
+        plus a custom Pset_ADS_Thermal for extras."""
+        prop_ids: list[int] = []
+
+        for key, label, unit in [
+            ("htTotal", "H_T Transmission", "W/K"),
+            ("htPrime", "H_T' specific", "W/(m2K)"),
+            ("hvTotal", "H_V Lueftung", "W/K"),
+            ("qHeating", "Jaehrlicher Heizwaermebedarf", "kWh/a"),
+            ("qHeatingPerSqm", "Heizwaermebedarf pro m2", "kWh/(m2a)"),
+            ("envelopeArea", "Huellflaeche", "m2"),
+            ("heatedVolume", "Beheiztes Volumen V_e", "m3"),
+            ("avRatio", "A/V Kompaktheit", "1/m"),
+        ]:
+            if key in thermal and thermal[key] is not None:
+                prop_ids.append(self._prop_real(label, float(thermal[key]), unit))
+
+        if thermal.get("standard"):
+            prop_ids.append(self._prop_text("Daemmstandard", str(thermal["standard"])))
+        if thermal.get("gegStatus"):
+            prop_ids.append(self._prop_text("GEG 2023 Status", str(thermal["gegStatus"])))
+        if thermal.get("kfwTier") is not None:
+            prop_ids.append(self._prop_text("KfW Effizienzhaus", f"EH {int(thermal['kfwTier'])}"))
+
+        self._emit_pset("Pset_ADS_Thermal_GEG2023", prop_ids, target_id, owner)
+
+    def _attach_furniture_pset(
+        self, target_id: int, owner: int, counts: dict,
+    ) -> None:
+        """Attach DIN 18011 furniture kind counts as integer properties."""
+        prop_ids: list[int] = []
+        total = 0
+        for kind, n in counts.items():
+            if not isinstance(n, (int, float)) or n <= 0:
+                continue
+            prop_ids.append(self._prop_int(str(kind), int(n)))
+            total += int(n)
+        if total > 0:
+            prop_ids.append(self._prop_int("total_pieces", total))
+        self._emit_pset("Pset_ADS_Furniture_DIN18011", prop_ids, target_id, owner)
