@@ -11,6 +11,26 @@ import { Button } from "@/components/ui/button";
 import { Download } from "lucide-react";
 import type { LayoutOption, PlotAnalysis, BuildingFloorPlans } from "@/types/api";
 import { API_BASE } from "@/lib/api-client";
+import { estimateCost } from "@/lib/cost-estimator";
+import { estimateThermal } from "@/lib/thermal-envelope";
+import { placeFurnitureForPlan, type FurnitureKind } from "@/lib/furniture-layouts";
+
+/** Aggregate furniture placements across every floor of a building into a
+ *  flat `{kind: count}` dict for the IFC Pset_ADS_Furniture_DIN18011 pset.
+ *  Only counts pieces that actually got placed (`fitted` rooms or partial
+ *  fits still emit placements that landed successfully). */
+function aggregateFurnitureCounts(building: BuildingFloorPlans): Record<string, number> {
+  const counts: Partial<Record<FurnitureKind, number>> = {};
+  for (const floor of building.floor_plans) {
+    const perRoom = placeFurnitureForPlan(floor);
+    for (const result of perRoom.values()) {
+      for (const piece of result.placements) {
+        counts[piece.kind] = (counts[piece.kind] ?? 0) + 1;
+      }
+    }
+  }
+  return counts as Record<string, number>;
+}
 
 /** Props for the 3D building scene (Three.js / R3F).
  * @property layout - The selected optimizer layout with building positions.
@@ -43,6 +63,30 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
     setExporting(true);
     setExportStatus(null);
     try {
+      const floorPlans = floorPlansMap[buildingId];
+
+      // Phase 4.6 — enrich the IFC with cost, thermal, and furniture psets.
+      // All three are best-effort: failures fall back to a minimal IFC so a
+      // broken estimator can never block the export.
+      let costMetadata: unknown = null;
+      let thermalMetadata: unknown = null;
+      let furnitureCounts: Record<string, number> | null = null;
+      try {
+        costMetadata = estimateCost({ building: floorPlans });
+      } catch (e) {
+        console.debug("cost metadata skipped:", e);
+      }
+      try {
+        thermalMetadata = estimateThermal({ building: floorPlans, standard: "goldbeck_standard" });
+      } catch (e) {
+        console.debug("thermal metadata skipped:", e);
+      }
+      try {
+        furnitureCounts = aggregateFurnitureCounts(floorPlans);
+      } catch (e) {
+        console.debug("furniture counts skipped:", e);
+      }
+
       const response = await fetch(
         `${API_BASE}/v1/export/ifc`,
         {
@@ -50,7 +94,10 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             building,
-            floor_plans: floorPlansMap[buildingId],
+            floor_plans: floorPlans,
+            cost_metadata: costMetadata,
+            thermal_metadata: thermalMetadata,
+            furniture_counts: furnitureCounts,
           }),
         }
       );
