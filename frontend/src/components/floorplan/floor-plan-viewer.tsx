@@ -23,6 +23,7 @@ import {
   type RoomFurnitureResult,
 } from "@/lib/furniture-layouts";
 import { downloadFloorPlanPdf } from "@/lib/floorplan-pdf";
+import { analyzeEgress } from "@/lib/fire-egress";
 
 /** Props for the 2D canvas floor plan renderer.
  * @property floorPlan - Single-storey floor plan data (rooms, walls, doors, windows).
@@ -4298,6 +4299,22 @@ function validatePlan(
         });
       }
     }
+  }
+
+  // ── Fire-egress check (Phase 5a, MBO §35) ──────────────────────────────
+  // Routed distance from each apt entrance door to the nearest staircase:
+  // fail > 35 m (legal violation), warn 30-35 m (planning-stage early
+  // warning). See `frontend/src/lib/fire-egress.ts` for the algorithm —
+  // corridor-axis routing for Ganghaus layouts, Euclidean × 1.15 fallback
+  // for Spänner / Laubengang.
+  const egress = analyzeEgress(plan);
+  for (const check of egress.checks) {
+    if (check.status === "pass") continue;
+    pushApartmentIssue(check.apartmentId, {
+      severity: check.status === "fail" ? "error" : "warn",
+      code: check.status === "fail" ? "egress_too_long" : "egress_warn",
+      message: `Wohnung ${check.unitNumber}: ${check.reason}`,
+    });
   }
 
   const errorCount = issues.filter((i) => i.severity === "error").length;
