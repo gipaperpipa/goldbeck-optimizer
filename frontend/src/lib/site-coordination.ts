@@ -67,11 +67,26 @@ export interface PairwiseCheck {
   shortfall: number;
 }
 
+export interface BoundaryCheck {
+  /** Building whose facade is being measured. */
+  buildingId: string;
+  /** Minimum distance from any building corner to the parcel boundary [m]. */
+  minDistance: number;
+  /** Required §6 setback = max(hCoeff · H, 3) [m]. Uses the building's own
+   *  height (single-building check, not pairwise). */
+  required: number;
+  status: "pass" | "warn" | "fail";
+  shortfall: number;
+}
+
 export interface SiteCoordinationResult {
   /** Per-building polygons (corners, height, footprint). */
   buildings: BuildingPolygon[];
-  /** Pairwise Abstandsflächen checks. */
+  /** Pairwise Abstandsflächen checks (building-to-building). */
   pairs: PairwiseCheck[];
+  /** Per-building setback to parcel boundary. Empty if no plot polygon
+   *  was supplied — the check is skipped rather than guessed. */
+  boundaries: BoundaryCheck[];
   /** Total footprint [m²]. */
   totalFootprintSqm: number;
   /** GRZ — footprint / plot area. */
@@ -86,6 +101,8 @@ export interface SiteCoordinationResult {
   summary: {
     pairFails: number;
     pairWarns: number;
+    boundaryFails: number;
+    boundaryWarns: number;
     grzOver: boolean; // true if grz > 0.4 (typical Wohngebiet cap)
     heightSpread: boolean;
   };
@@ -94,6 +111,10 @@ export interface SiteCoordinationResult {
 export interface SiteCoordinationInput {
   layout: LayoutOption;
   plotAreaSqm?: number;
+  /** Plot boundary polygon in plot-local coordinates [m], CCW. When
+   *  supplied, enables the single-building setback check to each
+   *  parcel edge per §6. */
+  plotBoundary?: [number, number][];
   /** Override §6 coefficient (0.4 default, 0.25 city core, 0.2 rural). */
   hCoeff?: number;
 }
@@ -165,6 +186,25 @@ function polygonMinDistance(
   return minD;
 }
 
+/** Minimum distance from a building's corners to the nearest edge of
+ *  the parcel boundary. Assumes the building is fully inside the plot
+ *  (the normal Goldbeck generator guarantee). Iterates all corners ×
+ *  all boundary segments. */
+function polygonToBoundaryMinDistance(
+  polyCorners: [number, number][],
+  boundary: [number, number][],
+): number {
+  let minD = Infinity;
+  for (const p of polyCorners) {
+    for (let i = 0; i < boundary.length; i++) {
+      const a = boundary[i];
+      const b = boundary[(i + 1) % boundary.length];
+      minD = Math.min(minD, pointToSegDistance(p, a, b));
+    }
+  }
+  return minD;
+}
+
 // ── Main analyzer ─────────────────────────────────────────────────
 
 export function analyzeSite(input: SiteCoordinationInput): SiteCoordinationResult {
@@ -210,6 +250,29 @@ export function analyzeSite(input: SiteCoordinationInput): SiteCoordinationResul
     }
   }
 
+  // 2b. Boundary setback — per-building distance to every parcel edge.
+  //    §6 also applies the Abstandsfläche normal to the lot line, so the
+  //    required setback is computed from the single building's height
+  //    (not pairwise). We take the min distance from any building corner
+  //    to any parcel boundary segment as the governing setback.
+  const boundaries: BoundaryCheck[] = [];
+  if (input.plotBoundary && input.plotBoundary.length >= 3) {
+    for (const A of buildings) {
+      const dist = polygonToBoundaryMinDistance(A.corners, input.plotBoundary);
+      const required = Math.max(hCoeff * A.height, MIN_ABSTAND_M);
+      const shortfall = Math.max(0, required - dist);
+      const status: BoundaryCheck["status"] =
+        dist >= required ? "pass" : dist >= required * 0.9 ? "warn" : "fail";
+      boundaries.push({
+        buildingId: A.id,
+        minDistance: dist,
+        required,
+        status,
+        shortfall,
+      });
+    }
+  }
+
   // 3. Height stats.
   const heights = buildings.map((b) => b.height);
   const heightStats = summarize(heights);
@@ -223,10 +286,13 @@ export function analyzeSite(input: SiteCoordinationInput): SiteCoordinationResul
 
   const pairFails = pairs.filter((p) => p.status === "fail").length;
   const pairWarns = pairs.filter((p) => p.status === "warn").length;
+  const boundaryFails = boundaries.filter((b) => b.status === "fail").length;
+  const boundaryWarns = boundaries.filter((b) => b.status === "warn").length;
 
   return {
     buildings,
     pairs,
+    boundaries,
     totalFootprintSqm,
     grz,
     heightStats,
@@ -235,6 +301,8 @@ export function analyzeSite(input: SiteCoordinationInput): SiteCoordinationResul
     summary: {
       pairFails,
       pairWarns,
+      boundaryFails,
+      boundaryWarns,
       grzOver: grz !== null && grz > 0.4,
       heightSpread: heightStats.stdDev > HEIGHT_STD_WARN_M,
     },

@@ -31,6 +31,7 @@ export function SiteCoordinationPanel() {
     return analyzeSite({
       layout: selectedLayout,
       plotAreaSqm: plotAnalysis?.area_sqm,
+      plotBoundary: plotAnalysis?.boundary_polygon_local,
       hCoeff,
     });
   }, [selectedLayout, plotAnalysis, hCoeff]);
@@ -46,12 +47,14 @@ export function SiteCoordinationPanel() {
 
   if (!result) return null;
 
-  const { buildings, pairs, totalFootprintSqm, grz, heightStats, isAligned, commonRotationDeg, summary } = result;
+  const { buildings, pairs, boundaries, totalFootprintSqm, grz, heightStats, isAligned, commonRotationDeg, summary } = result;
 
+  const totalFails = summary.pairFails + summary.boundaryFails;
+  const totalWarns = summary.pairWarns + summary.boundaryWarns;
   const verdict =
-    summary.pairFails > 0
+    totalFails > 0
       ? { cls: "text-rose-700 border-rose-300 bg-rose-50", icon: <XCircle className="w-4 h-4" />, label: "Abstandsflächen verletzt" }
-      : summary.pairWarns > 0
+      : totalWarns > 0
       ? { cls: "text-amber-700 border-amber-300 bg-amber-50", icon: <AlertTriangle className="w-4 h-4" />, label: "Grenzwertig" }
       : { cls: "text-emerald-700 border-emerald-300 bg-emerald-50", icon: <CheckCircle2 className="w-4 h-4" />, label: "BauO-konform" };
 
@@ -93,7 +96,12 @@ export function SiteCoordinationPanel() {
                 </div>
                 <div className="text-lg font-bold">{verdict.label}</div>
                 <div className="text-xs mt-0.5 opacity-80">
-                  {summary.pairFails} Verletzung(en) · {summary.pairWarns} grenzwertig · {pairs.length - summary.pairFails - summary.pairWarns} OK
+                  {totalFails} Verletzung(en) · {totalWarns} grenzwertig
+                  {boundaries.length > 0 ? (
+                    <span className="opacity-70"> · {pairs.length} Gebäude-Paare + {boundaries.length} Grenzabstände</span>
+                  ) : (
+                    <span className="opacity-70"> · {pairs.length} Gebäude-Paare (Grundstücksgrenze nicht verfügbar)</span>
+                  )}
                 </div>
               </div>
             </div>
@@ -131,7 +139,7 @@ export function SiteCoordinationPanel() {
             <CardTitle className="text-base">Lageplan (Top-Down)</CardTitle>
           </CardHeader>
           <CardContent>
-            <SiteDiagram result={result} />
+            <SiteDiagram result={result} plotBoundary={plotAnalysis?.boundary_polygon_local} />
             <LegendRow />
           </CardContent>
         </Card>
@@ -181,6 +189,53 @@ export function SiteCoordinationPanel() {
         </Card>
       </div>
 
+      {/* Parcel boundary setback table */}
+      {boundaries.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Abstand zur Grundstücksgrenze</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-xs text-neutral-500 border-b">
+                  <th className="text-left py-1.5">Gebäude</th>
+                  <th className="text-right py-1.5">min. Abstand zur Grenze</th>
+                  <th className="text-right py-1.5">erford. ({hCoeff} · H, min 3 m)</th>
+                  <th className="text-right py-1.5">Δ</th>
+                  <th className="text-center py-1.5">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {boundaries.map((b) => (
+                  <tr key={b.buildingId} className="border-t border-neutral-100">
+                    <td className="py-1.5 font-mono text-xs">{b.buildingId}</td>
+                    <td className="py-1.5 text-right tabular-nums">{formatMeters(b.minDistance)}</td>
+                    <td className="py-1.5 text-right tabular-nums">{formatMeters(b.required)}</td>
+                    <td
+                      className={`py-1.5 text-right tabular-nums ${
+                        b.status === "fail" ? "text-rose-700" : b.status === "warn" ? "text-amber-700" : "text-emerald-700"
+                      }`}
+                    >
+                      {b.status === "fail" ? `−${formatMeters(b.shortfall)}` : `+${formatMeters(b.minDistance - b.required)}`}
+                    </td>
+                    <td className="py-1.5 text-center">
+                      <StatusPill status={b.status} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="text-xs text-neutral-500 mt-3">
+              Messung von jeder Gebäudeecke zur nächsten Kante der Flurstücksgrenze.
+              Bei Grenzbebauung nach §6 Abs. 1 S. 3 (Bauwich, Reihenhaus) ist der
+              Abstand gegen die betroffene Grenze verzichtbar — in diesem Fall sind
+              „Verletzungen“ auf dieser Seite bewusst und legal.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       <p className="text-xs text-neutral-500 leading-relaxed">
         Screening nach MBO §6 / BauO NRW §6. Prüft nur interne
         Abstandsflächen zwischen eigenen Gebäuden. Ein vollständiger
@@ -196,14 +251,24 @@ export function SiteCoordinationPanel() {
 
 // ── Diagram ───────────────────────────────────────────────────────
 
-function SiteDiagram({ result }: { result: ReturnType<typeof analyzeSite> }) {
-  const { buildings, pairs } = result;
+function SiteDiagram({
+  result,
+  plotBoundary,
+}: {
+  result: ReturnType<typeof analyzeSite>;
+  plotBoundary?: [number, number][];
+}) {
+  const { buildings, pairs, boundaries } = result;
   const padding = 20;
   const svgW = 520;
   const svgH = 360;
 
-  // Compute bbox of all corners
-  const all = buildings.flatMap((b) => b.corners);
+  // bbox covers buildings + plot boundary (if present) so the plot
+  // always fits when the boundary extends beyond the building footprints.
+  const all = [
+    ...buildings.flatMap((b) => b.corners),
+    ...(plotBoundary ?? []),
+  ];
   if (all.length === 0) {
     return <div className="text-sm text-neutral-500">Kein Gebäude gefunden.</div>;
   }
@@ -218,26 +283,39 @@ function SiteDiagram({ result }: { result: ReturnType<typeof analyzeSite> }) {
   const tx = (x: number) => padding + (x - minX) * scale;
   const ty = (y: number) => svgH - padding - (y - minY) * scale;
 
-  const buildingColor = (id: string): string => {
-    const statuses = pairs
-      .filter((p) => p.a === id || p.b === id)
-      .map((p) => p.status);
-    if (statuses.includes("fail")) return "#fecaca"; // rose-200
-    if (statuses.includes("warn")) return "#fde68a"; // amber-200
-    return "#d1fae5"; // emerald-200
+  /** Worst status across pairs + boundary checks that touch this building. */
+  const worstStatus = (id: string): "pass" | "warn" | "fail" => {
+    const statuses: ("pass" | "warn" | "fail")[] = [
+      ...pairs.filter((p) => p.a === id || p.b === id).map((p) => p.status),
+      ...boundaries.filter((b) => b.buildingId === id).map((b) => b.status),
+    ];
+    if (statuses.includes("fail")) return "fail";
+    if (statuses.includes("warn")) return "warn";
+    return "pass";
   };
 
+  const buildingColor = (id: string): string => {
+    const s = worstStatus(id);
+    return s === "fail" ? "#fecaca" : s === "warn" ? "#fde68a" : "#d1fae5";
+  };
   const buildingStroke = (id: string): string => {
-    const statuses = pairs
-      .filter((p) => p.a === id || p.b === id)
-      .map((p) => p.status);
-    if (statuses.includes("fail")) return "#be123c";
-    if (statuses.includes("warn")) return "#b45309";
-    return "#047857";
+    const s = worstStatus(id);
+    return s === "fail" ? "#be123c" : s === "warn" ? "#b45309" : "#047857";
   };
 
   return (
     <svg width={svgW} height={svgH} className="w-full h-auto border rounded bg-neutral-50">
+      {/* Parcel boundary (if available) — drawn first so buildings overlay it */}
+      {plotBoundary && plotBoundary.length >= 3 && (
+        <polygon
+          points={plotBoundary.map((p) => `${tx(p[0])},${ty(p[1])}`).join(" ")}
+          fill="#f8fafc"
+          stroke="#334155"
+          strokeWidth={1.3}
+          strokeDasharray="6 3"
+          opacity={0.85}
+        />
+      )}
       {/* Connection lines between building centroids */}
       {pairs.map((p) => {
         const A = buildings.find((b) => b.id === p.a);
