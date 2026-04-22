@@ -194,18 +194,11 @@ function drawTitleBlock(pdf: jsPDF, tb: Required<PdfTitleBlock>, x: number, y: n
 
 // ── Public API ────────────────────────────────────────────────────
 
-/** Build and trigger download of a DIN A3 landscape PDF for the given
- *  floor plan. Scale is auto-picked. Returns the jsPDF instance so the
- *  caller can save under a custom filename or post-process. */
-export function exportFloorPlanPdf(opts: ExportPdfOptions): jsPDF {
+/** Render a single plan onto the CURRENT page of the given jsPDF instance.
+ *  Shared between single-plan and multi-plan exports — the multi-plan
+ *  variant just calls `pdf.addPage()` between invocations. */
+function renderPlanPage(pdf: jsPDF, opts: ExportPdfOptions): void {
   const { plan, title, drawPlan } = opts;
-
-  const pdf = new jsPDF({
-    orientation: "landscape",
-    unit: "mm",
-    format: "a3",
-    compress: true,
-  });
 
   // Available plan area = sheet minus margins minus title block (right side)
   const availW = A3_WIDTH_MM - 2 * MARGIN_MM - TITLE_BLOCK_WIDTH_MM - 5;
@@ -246,7 +239,19 @@ export function exportFloorPlanPdf(opts: ExportPdfOptions): jsPDF {
     author: title.author ?? "—",
   };
   drawTitleBlock(pdf, resolved, tbX, tbY);
+}
 
+/** Build and trigger download of a DIN A3 landscape PDF for the given
+ *  floor plan. Scale is auto-picked. Returns the jsPDF instance so the
+ *  caller can save under a custom filename or post-process. */
+export function exportFloorPlanPdf(opts: ExportPdfOptions): jsPDF {
+  const pdf = new jsPDF({
+    orientation: "landscape",
+    unit: "mm",
+    format: "a3",
+    compress: true,
+  });
+  renderPlanPage(pdf, opts);
   return pdf;
 }
 
@@ -258,5 +263,51 @@ export function downloadFloorPlanPdf(opts: ExportPdfOptions, filename?: string):
     `${opts.title.projectName || "floorplan"}_${opts.title.floorLabel}_1-${
       opts.title.scaleDenominator ?? "auto"
     }.pdf`.replace(/[^a-zA-Z0-9._-]/g, "_");
+  pdf.save(name);
+}
+
+// ── Multi-plan batch export (Phase 5b) ────────────────────────────
+
+export interface MultiPlanPdfOptions {
+  /** Ordered list of pages to render. Each entry is a full
+   *  ExportPdfOptions (its own plan + title + drawPlan). Typical usage
+   *  is all floors of a building, or all floors × all buildings of a
+   *  project. */
+  pages: ExportPdfOptions[];
+}
+
+/** Build a multi-page A3 PDF containing every page in `opts.pages`, one
+ *  plan per page, sharing the same title-block convention as the single
+ *  export. Returns the jsPDF instance. Throws if `pages` is empty. */
+export function exportMultiPlanPdf(opts: MultiPlanPdfOptions): jsPDF {
+  if (!opts.pages || opts.pages.length === 0) {
+    throw new Error("exportMultiPlanPdf: pages array is empty");
+  }
+
+  const pdf = new jsPDF({
+    orientation: "landscape",
+    unit: "mm",
+    format: "a3",
+    compress: true,
+  });
+
+  opts.pages.forEach((pageOpts, idx) => {
+    if (idx > 0) pdf.addPage("a3", "landscape");
+    renderPlanPage(pdf, pageOpts);
+  });
+
+  return pdf;
+}
+
+/** Convenience wrapper: build + save multi-page PDF. */
+export function downloadMultiPlanPdf(opts: MultiPlanPdfOptions, filename?: string): void {
+  const pdf = exportMultiPlanPdf(opts);
+  const first = opts.pages[0]?.title;
+  const name =
+    filename ||
+    `${first?.projectName || "project"}_${opts.pages.length}_Geschosse.pdf`.replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_",
+    );
   pdf.save(name);
 }

@@ -489,6 +489,7 @@ export function FloorPlanPanel() {
               onApartmentSelect={setSelectedApt}
               buildingId={selectedBuildingId ?? undefined}
               floorIndex={selectedFloorIndex}
+              allFloors={currentFloorPlans.floor_plans}
             />
           </div>
 

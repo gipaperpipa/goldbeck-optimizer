@@ -22,7 +22,7 @@ import {
   type FurniturePlacement,
   type RoomFurnitureResult,
 } from "@/lib/furniture-layouts";
-import { downloadFloorPlanPdf } from "@/lib/floorplan-pdf";
+import { downloadFloorPlanPdf, downloadMultiPlanPdf, type ExportPdfOptions } from "@/lib/floorplan-pdf";
 import { analyzeEgress } from "@/lib/fire-egress";
 
 /** Props for the 2D canvas floor plan renderer.
@@ -44,6 +44,10 @@ interface FloorPlanViewerProps {
    *  if the plan's fingerprint still matches (Phase 3.7b). */
   buildingId?: string;
   floorIndex?: number;
+  /** All floor plans of the current building. When provided, the toolbar
+   *  gains an "Alle Geschosse PDF" button that batch-exports every floor
+   *  to a single multi-page A3 PDF (Phase 5b). */
+  allFloors?: FloorPlan[];
 }
 
 /**
@@ -298,6 +302,7 @@ export function FloorPlanViewer({
   onApartmentSelect,
   buildingId,
   floorIndex,
+  allFloors,
 }: FloorPlanViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hoveredAptId, setHoveredAptId] = useState<string | null>(null);
@@ -1822,11 +1827,20 @@ export function FloorPlanViewer({
   // architectural scale (auto-picked 1:50/100/200/500) on an offscreen
   // canvas using the same module-scope draw helpers the viewer uses,
   // then embeds it into a landscape A3 sheet with a title block.
-  const handleExportPdf = useCallback(() => {
-    const floorLabel = plan.floor_index === 0 ? "EG" : `${plan.floor_index}. OG`;
-    try {
-      downloadFloorPlanPdf({
-        plan,
+  // Factory: builds an ExportPdfOptions for any FloorPlan, reusing the
+  // exact screen-draw helpers so single + batch exports share linework.
+  const buildPdfOptions = useCallback(
+    (p: FloorPlan): ExportPdfOptions => {
+      const floorLabel =
+        p.floor_type === "staffelgeschoss"
+          ? "SG"
+          : p.floor_index === 0
+            ? "EG"
+            : `${p.floor_index}. OG`;
+      const furnitureForP =
+        p === plan ? furnitureByRoom : placeFurnitureForPlan(p);
+      return {
+        plan: p,
         title: {
           projectName: "Goldbeck Residential",
           buildingName: buildingId ?? undefined,
@@ -1835,58 +1849,67 @@ export function FloorPlanViewer({
           author: "Goldbeck Optimizer",
         },
         drawPlan: (ctx, pxW, pxH, pxPerM) => {
-          // Build transforms mapping plan (0..bldgW, 0..bldgH) into
-          // canvas (0..pxW, 0..pxH) with an 8mm padding already baked
-          // into the canvas by the rasterizer.
-          const grid = plan.structural_grid;
+          const grid = p.structural_grid;
           const bldgW = grid.building_length_m;
           const bldgH = grid.building_depth_m;
           const paddingPx = (pxW - bldgW * pxPerM) / 2;
           const tx = (x: number) => paddingPx + x * pxPerM;
-          // Canvas Y grows downward; plan Y grows upward. Flip.
           const ty = (y: number) => pxH - paddingPx - y * pxPerM;
           const ts = (s: number) => s * pxPerM;
 
-          // Building outline
           ctx.strokeStyle = "#2b2520";
           ctx.lineWidth = 2.0;
           ctx.strokeRect(tx(0), ty(bldgH), ts(bldgW), ts(bldgH));
 
-          // Rooms (filled) + apartment outlines off
-          for (const room of plan.rooms) {
+          for (const room of p.rooms) {
             drawRoom(ctx, room, tx, ty, null, null);
           }
-          // Walls
-          for (const wall of plan.walls) {
+          for (const wall of p.walls) {
             drawWall(ctx, wall, tx, ty, ts);
           }
-          // Windows + doors
-          for (const win of plan.windows) {
-            const host = findNearestWall2D(win.position, plan.walls);
+          for (const win of p.windows) {
+            const host = findNearestWall2D(win.position, p.walls);
             drawWindow(ctx, win, host, tx, ty, ts);
           }
-          for (const door of plan.doors) {
-            const host = findNearestWall2D(door.position, plan.walls);
+          for (const door of p.doors) {
+            const host = findNearestWall2D(door.position, p.walls);
             drawDoor(ctx, door, host, tx, ty, ts);
           }
-          // Furniture (if user has it enabled — carries over to print)
           if (layers.furniture) {
-            drawFurnitureLayer(ctx, plan.rooms, furnitureByRoom, tx, ty, ts);
+            drawFurnitureLayer(ctx, p.rooms, furnitureForP, tx, ty, ts);
           }
-          // Labels
-          drawRoomLabels(ctx, plan.rooms, tx, ty, ts);
-          // Dimensions
+          drawRoomLabels(ctx, p.rooms, tx, ty, ts);
           drawDimensionLines(ctx, grid, tx, ty, ts, bldgW, bldgH);
-          // North arrow + scale bar in the canvas corners
           drawNorthArrow(ctx, pxW, pxH);
           drawScaleBar(ctx, pxW, pxH, pxPerM);
         },
-      });
+      };
+    },
+    [plan, buildingId, layers.furniture, furnitureByRoom],
+  );
+
+  const handleExportPdf = useCallback(() => {
+    try {
+      downloadFloorPlanPdf(buildPdfOptions(plan));
     } catch (err) {
       console.error("[pdf-export] failed:", err);
       alert("PDF-Export fehlgeschlagen — siehe Konsole");
     }
-  }, [plan, buildingId, layers.furniture, furnitureByRoom]);
+  }, [plan, buildPdfOptions]);
+
+  // Phase 5b — multi-floor batch export. Iterates every floor of the
+  // current building and emits a single multi-page A3 PDF.
+  const handleExportAllFloorsPdf = useCallback(() => {
+    if (!allFloors || allFloors.length === 0) return;
+    try {
+      downloadMultiPlanPdf({
+        pages: allFloors.map((fp) => buildPdfOptions(fp)),
+      });
+    } catch (err) {
+      console.error("[pdf-export-batch] failed:", err);
+      alert("Batch-PDF-Export fehlgeschlagen — siehe Konsole");
+    }
+  }, [allFloors, buildPdfOptions]);
 
   return (
     <div className="relative inline-block">
@@ -2181,6 +2204,15 @@ export function FloorPlanViewer({
         >
           PDF
         </button>
+        {allFloors && allFloors.length > 1 && (
+          <button
+            onClick={handleExportAllFloorsPdf}
+            className="px-3 py-1.5 rounded text-sm font-medium bg-neutral-700 text-white hover:bg-neutral-600 transition-colors"
+            title={`Alle ${allFloors.length} Geschosse als mehrseitiges DIN A3 PDF exportieren`}
+          >
+            PDF ×{allFloors.length}
+          </button>
+        )}
         <button
           className="w-7 h-7 rounded-full bg-gray-200 text-gray-600 hover:bg-gray-300 text-xs font-bold transition-colors"
           title="M = Messen, C = Löschen, Esc = Abwählen"
