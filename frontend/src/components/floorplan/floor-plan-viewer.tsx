@@ -24,6 +24,7 @@ import {
 } from "@/lib/furniture-layouts";
 import { downloadFloorPlanPdf, downloadMultiPlanPdf, type ExportPdfOptions } from "@/lib/floorplan-pdf";
 import { analyzeEgress } from "@/lib/fire-egress";
+import { analyzeBarrierFree } from "@/lib/barrier-free";
 
 /** Props for the 2D canvas floor plan renderer.
  * @property floorPlan - Single-storey floor plan data (rooms, walls, doors, windows).
@@ -4347,6 +4348,40 @@ function validatePlan(
       code: check.status === "fail" ? "egress_too_long" : "egress_warn",
       message: `Wohnung ${check.unitNumber}: ${check.reason}`,
     });
+  }
+
+  // ── Barrier-free check (Phase 5f, DIN 18040-2) ─────────────────────────
+  // Only runs on the ground floor (BauO NRW §50 scope). Validates door
+  // widths, bathroom turning areas, and corridor clear widths. See
+  // `frontend/src/lib/barrier-free.ts` for the code-reference per check.
+  const bf = analyzeBarrierFree(plan);
+  for (const bfIssue of bf.issues) {
+    // Prefer room scope when we have a subjectId that maps to a known
+    // room (bathroom / corridor cases). Doors fall through to apt scope.
+    const roomMatch = bfIssue.subjectId
+      ? plan.rooms.find((r) => r.id === bfIssue.subjectId)
+      : undefined;
+    if (roomMatch) {
+      pushRoomIssue(roomMatch.id, roomMatch.apartment_id ?? bfIssue.apartmentId, {
+        severity: bfIssue.severity,
+        code: bfIssue.code,
+        message: bfIssue.message,
+      });
+    } else if (bfIssue.apartmentId) {
+      pushApartmentIssue(bfIssue.apartmentId, {
+        severity: bfIssue.severity,
+        code: bfIssue.code,
+        message: bfIssue.message,
+      });
+    } else {
+      // Orphan issue (e.g. floor-level corridor with no apt_id) — push
+      // as a plan-wide issue via the issues array directly.
+      issues.push({
+        severity: bfIssue.severity,
+        code: bfIssue.code,
+        message: bfIssue.message,
+      });
+    }
   }
 
   const errorCount = issues.filter((i) => i.severity === "error").length;
