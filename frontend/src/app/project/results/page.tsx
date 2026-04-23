@@ -11,6 +11,7 @@ import { FinancialDashboard } from "@/components/financial/financial-dashboard";
 import { CostPanel } from "@/components/floorplan/cost-panel";
 import { ThermalPanel } from "@/components/floorplan/thermal-panel";
 import { SiteCoordinationPanel } from "@/components/plot/site-coordination-panel";
+import { PermitPanel } from "@/components/permit/permit-panel";
 import { useProjectStore } from "@/stores/project-store";
 
 export default function ResultsPage() {
@@ -52,6 +53,7 @@ export default function ResultsPage() {
         <Tabs value={activeTab} onValueChange={setActiveTab}>
           <TabsList className="mb-6">
             <TabsTrigger value="layouts">Layouts</TabsTrigger>
+            <TabsTrigger value="permit">Prüfung</TabsTrigger>
             <TabsTrigger value="3d-view">3D View</TabsTrigger>
             <TabsTrigger value="site">Standort</TabsTrigger>
             <TabsTrigger value="shadow">Shadow Analysis</TabsTrigger>
@@ -62,6 +64,10 @@ export default function ResultsPage() {
 
           <TabsContent value="layouts">
             <LayoutComparison />
+          </TabsContent>
+
+          <TabsContent value="permit">
+            <PermitPanel />
           </TabsContent>
 
           <TabsContent value="3d-view">
