@@ -58,6 +58,7 @@ export function FloorPlanPanel() {
     selectedVariantIndex,
     setSelectedVariantIndex,
     setFloorPlan,
+    plotAnalysis,
   } = useProjectStore();
 
   const { generate, estimate, isLoading, error, progress, estimatedSeconds, completedFitnessHistory } = useFloorPlan();
@@ -490,6 +491,9 @@ export function FloorPlanPanel() {
               buildingId={selectedBuildingId ?? undefined}
               floorIndex={selectedFloorIndex}
               allFloors={currentFloorPlans.floor_plans}
+              latitude={plotAnalysis?.centroid_geo?.lat}
+              longitude={plotAnalysis?.centroid_geo?.lng}
+              buildingRotationDeg={currentBuilding?.rotation_deg ?? 0}
             />
           </div>
 

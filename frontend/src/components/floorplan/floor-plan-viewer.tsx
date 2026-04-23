@@ -25,6 +25,7 @@ import {
 import { downloadFloorPlanPdf, downloadMultiPlanPdf, type ExportPdfOptions } from "@/lib/floorplan-pdf";
 import { analyzeEgress } from "@/lib/fire-egress";
 import { analyzeBarrierFree } from "@/lib/barrier-free";
+import { analyzeBesonnung } from "@/lib/besonnung";
 
 /** Props for the 2D canvas floor plan renderer.
  * @property floorPlan - Single-storey floor plan data (rooms, walls, doors, windows).
@@ -49,6 +50,12 @@ interface FloorPlanViewerProps {
    *  gains an "Alle Geschosse PDF" button that batch-exports every floor
    *  to a single multi-page A3 PDF (Phase 5b). */
   allFloors?: FloorPlan[];
+  /** Plot latitude in decimal degrees — enables DIN 5034 Besonnung
+   *  check. Skipped when undefined. */
+  latitude?: number;
+  longitude?: number;
+  /** Building rotation (CCW about +z, degrees). Plan +y = north when 0. */
+  buildingRotationDeg?: number;
 }
 
 /**
@@ -304,6 +311,9 @@ export function FloorPlanViewer({
   buildingId,
   floorIndex,
   allFloors,
+  latitude,
+  longitude,
+  buildingRotationDeg,
 }: FloorPlanViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hoveredAptId, setHoveredAptId] = useState<string | null>(null);
@@ -599,8 +609,13 @@ export function FloorPlanViewer({
   const furnitureByRoom = useMemo(() => placeFurnitureForPlan(plan), [plan]);
 
   const validation = useMemo(
-    () => validatePlan(plan, furnitureByRoom),
-    [plan, furnitureByRoom],
+    () =>
+      validatePlan(plan, furnitureByRoom, {
+        latitude,
+        longitude,
+        buildingRotationDeg,
+      }),
+    [plan, furnitureByRoom, latitude, longitude, buildingRotationDeg],
   );
   const [validationPanelOpen, setValidationPanelOpen] = useState(false);
   const [focusedRoomId, setFocusedRoomId] = useState<string | null>(null);
@@ -4179,6 +4194,11 @@ function drawRoomEditOverlay(
 function validatePlan(
   plan: FloorPlan,
   furnitureByRoom?: Map<string, RoomFurnitureResult>,
+  besonnungCtx?: {
+    latitude?: number;
+    longitude?: number;
+    buildingRotationDeg?: number;
+  },
 ): ValidationResult {
   const issues: ValidationIssue[] = [];
   const byRoom = new Map<string, ValidationIssue[]>();
@@ -4381,6 +4401,28 @@ function validatePlan(
         code: bfIssue.code,
         message: bfIssue.message,
       });
+    }
+  }
+
+  // ── Besonnung check (Phase 5g, DIN 5034-1) ─────────────────────────────
+  // Per-apartment 17.01. sun-hour verdict. Only runs when lat/lng are
+  // provided (i.e. plot has been geocoded); otherwise silently skipped.
+  if (besonnungCtx?.latitude !== undefined && besonnungCtx?.longitude !== undefined) {
+    const bes = analyzeBesonnung({
+      plan,
+      latitude: besonnungCtx.latitude,
+      longitude: besonnungCtx.longitude,
+      buildingRotationDeg: besonnungCtx.buildingRotationDeg,
+    });
+    if (bes.evaluated) {
+      for (const apt of bes.apartments) {
+        if (apt.status === "pass") continue;
+        pushApartmentIssue(apt.apartmentId, {
+          severity: apt.status === "fail" ? "error" : "warn",
+          code: apt.status === "fail" ? "besonnung_fail" : "besonnung_warn",
+          message: apt.reason,
+        });
+      }
     }
   }
 
