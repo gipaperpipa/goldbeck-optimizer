@@ -19,27 +19,29 @@ import type { BuildingFloorPlans, FloorPlanRoom } from "@/types/api";
 
 /** Base construction cost per m² BGF (Bruttogrundfläche) for Goldbeck
  *  precast residential mid-range (2024 BKI adjusted).
- *  KG 300 = Bauwerk Baukonstruktion (structure, envelope, finishes). */
-const KG300_PER_SQM_BGF = 1_750; // €/m²
+ *  KG 300 = Bauwerk Baukonstruktion (structure, envelope, finishes).
+ *  Exported so the panel can pre-fill the override input with the
+ *  BKI default. */
+export const DEFAULT_KG300_PER_SQM_BGF = 1_750; // €/m²
 
 /** KG 400 = Bauwerk Technische Anlagen (HVAC, plumbing, electrical). */
-const KG400_PER_SQM_BGF = 520; // €/m²
+export const DEFAULT_KG400_PER_SQM_BGF = 520; // €/m²
 
 /** KG 500 = Außenanlagen (landscaping, paving, outdoor fixtures) —
  *  typically 3% of (KG 300 + KG 400). */
-const KG500_RATIO_OF_300_400 = 0.03;
+export const DEFAULT_KG500_RATIO_OF_300_400 = 0.03;
 
 /** KG 700 = Baunebenkosten (architects, engineers, permits, insurance,
  *  financing). Typically 16–20% of (KG 300 + KG 400 + KG 500). */
-const KG700_RATIO_OF_HARD_COSTS = 0.18;
+export const DEFAULT_KG700_RATIO_OF_HARD_COSTS = 0.18;
 
 /** Contingency reserve on top of everything — 5% is standard for
  *  precast projects (less than monolithic's 8–10% because Goldbeck's
  *  fixed grid removes many risk sources). */
-const CONTINGENCY_RATIO = 0.05;
+export const DEFAULT_CONTINGENCY_RATIO = 0.05;
 
 /** Rental benchmarks — cold rent per m² NGF per month. */
-const RENT_PER_SQM_MONTH_BY_MARKET: Record<string, number> = {
+export const RENT_PER_SQM_MONTH_BY_MARKET: Record<string, number> = {
   berlin: 15.5,
   munich: 23.0,
   hamburg: 17.0,
@@ -53,7 +55,7 @@ const RENT_PER_SQM_MONTH_BY_MARKET: Record<string, number> = {
 };
 
 /** Sale price benchmarks — €/m² NGF for condominiums (Eigentumswohnungen). */
-const SALE_PRICE_PER_SQM_NGF_BY_MARKET: Record<string, number> = {
+export const SALE_PRICE_PER_SQM_NGF_BY_MARKET: Record<string, number> = {
   berlin: 6_200,
   munich: 10_500,
   hamburg: 7_200,
@@ -70,6 +72,30 @@ const SALE_PRICE_PER_SQM_NGF_BY_MARKET: Record<string, number> = {
 
 export type Market = keyof typeof RENT_PER_SQM_MONTH_BY_MARKET;
 
+/** Per-site overrides for the BKI defaults. Every field is optional —
+ *  missing fields fall back to the national benchmarks. Intended to
+ *  be threaded in from the cost panel's "Erweiterte Parameter" form
+ *  so an architect can drop in site-specific BKI data (e.g. a fresh
+ *  comparable analysis) without touching the module. */
+export interface CostOverrides {
+  /** €/m² BGF for KG 300 structure + envelope (pre-regional-factor). */
+  kg300PerSqmBgf?: number;
+  /** €/m² BGF for KG 400 MEP. */
+  kg400PerSqmBgf?: number;
+  /** Fraction of (KG300+KG400) for KG 500 outdoor works. */
+  kg500Ratio?: number;
+  /** Fraction of hard costs for KG 700 soft costs. */
+  kg700Ratio?: number;
+  /** Contingency fraction on top of hard + soft costs. */
+  contingencyRatio?: number;
+  /** €/m² NGF · month — cold rent benchmark for this site. */
+  rentPerSqmMonth?: number;
+  /** €/m² NGF — condominium sale price benchmark for this site. */
+  salePricePerSqmNgf?: number;
+  /** Vacancy percentage (0–100). */
+  vacancyPct?: number;
+}
+
 export interface CostEstimateInput {
   building: BuildingFloorPlans;
   /** Market for revenue benchmarks. Default: "default" (national avg). */
@@ -80,6 +106,9 @@ export interface CostEstimateInput {
   /** Land cost in Euro for the plot. Optional; if omitted, the
    *  margin calculation excludes land. */
   landCostEur?: number;
+  /** Per-site overrides for BKI defaults. Any field left undefined
+   *  falls back to the national benchmark. */
+  overrides?: CostOverrides;
 }
 
 export interface CostBreakdown {
@@ -210,17 +239,25 @@ export function estimateCost(input: CostEstimateInput): CostEstimate {
   const { building } = input;
   const market = (input.market ?? "default") as Market;
   const regionalFactor = input.regionalFactor ?? 1.0;
+  const ov = input.overrides ?? {};
 
   const areas = computeAreas(building);
 
+  // Resolve rates: per-site override wins over BKI default.
+  const rateKg300 = ov.kg300PerSqmBgf ?? DEFAULT_KG300_PER_SQM_BGF;
+  const rateKg400 = ov.kg400PerSqmBgf ?? DEFAULT_KG400_PER_SQM_BGF;
+  const ratioKg500 = ov.kg500Ratio ?? DEFAULT_KG500_RATIO_OF_300_400;
+  const ratioKg700 = ov.kg700Ratio ?? DEFAULT_KG700_RATIO_OF_HARD_COSTS;
+  const ratioContingency = ov.contingencyRatio ?? DEFAULT_CONTINGENCY_RATIO;
+
   // KG 300 scaled by regional factor (the majority of the variance);
   // KG 400 is mostly equipment + labor at the standard national rate.
-  const kg300 = areas.bgfSqm * KG300_PER_SQM_BGF * regionalFactor;
-  const kg400 = areas.bgfSqm * KG400_PER_SQM_BGF;
-  const kg500 = (kg300 + kg400) * KG500_RATIO_OF_300_400;
+  const kg300 = areas.bgfSqm * rateKg300 * regionalFactor;
+  const kg400 = areas.bgfSqm * rateKg400;
+  const kg500 = (kg300 + kg400) * ratioKg500;
   const hardCosts = kg300 + kg400 + kg500;
-  const kg700 = hardCosts * KG700_RATIO_OF_HARD_COSTS;
-  const contingency = (hardCosts + kg700) * CONTINGENCY_RATIO;
+  const kg700 = hardCosts * ratioKg700;
+  const contingency = (hardCosts + kg700) * ratioContingency;
   const totalConstruction = hardCosts + kg700 + contingency;
   const land = input.landCostEur ?? 0;
   const total = totalConstruction + land;
@@ -238,12 +275,24 @@ export function estimateCost(input: CostEstimateInput): CostEstimate {
 
   const units = Math.max(1, building.total_apartments);
 
-  const rentPerSqm = RENT_PER_SQM_MONTH_BY_MARKET[market] ?? RENT_PER_SQM_MONTH_BY_MARKET.default;
-  const salePerSqm = SALE_PRICE_PER_SQM_NGF_BY_MARKET[market] ?? SALE_PRICE_PER_SQM_NGF_BY_MARKET.default;
+  const rentPerSqm =
+    ov.rentPerSqmMonth ??
+    RENT_PER_SQM_MONTH_BY_MARKET[market] ??
+    RENT_PER_SQM_MONTH_BY_MARKET.default;
+  const salePerSqm =
+    ov.salePricePerSqmNgf ??
+    SALE_PRICE_PER_SQM_NGF_BY_MARKET[market] ??
+    SALE_PRICE_PER_SQM_NGF_BY_MARKET.default;
 
   const monthlyRent = areas.ngfSqm * rentPerSqm;
   const annualRent = monthlyRent * 12;
-  const vacancyPct = market === "munich" || market === "frankfurt" ? 3 : market === "rural" || market === "leipzig" ? 8 : 5;
+  const vacancyPct =
+    ov.vacancyPct ??
+    (market === "munich" || market === "frankfurt"
+      ? 3
+      : market === "rural" || market === "leipzig"
+        ? 8
+        : 5);
   const effectiveAnnualRent = annualRent * (1 - vacancyPct / 100);
   const saleValue = areas.ngfSqm * salePerSqm;
 
