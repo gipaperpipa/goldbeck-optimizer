@@ -322,6 +322,33 @@ export function FloorPlanViewer({
   const [snapPoint, setSnapPoint] = useState<Point2D | null>(null);
   const rafRef = useRef<number | null>(null);
 
+  // ── User view state (Phase 7) ──────────────────────────────────────
+  // Sits on top of the fit-to-canvas base transform. zoom = 1, pan = 0
+  // means "fit". Wheel + button zoom is anchored at the cursor; pan is a
+  // free screen-space translation driven by middle-button drag, space +
+  // left-drag, or the toolbar arrow keys.
+  const [view, setView] = useState({ zoom: 1, panX: 0, panY: 0 });
+  const viewRef = useRef(view);
+  useEffect(() => { viewRef.current = view; }, [view]);
+  // Pan drag bookkeeping. Only set while a middle-button or
+  // space-modified drag is in progress; mutated through the existing
+  // mouse-move/up handlers.
+  const panDragRef = useRef<{
+    startX: number;
+    startY: number;
+    startPanX: number;
+    startPanY: number;
+  } | null>(null);
+  // Track whether the space bar is currently held — used to convert a
+  // primary-button drag into a pan gesture (Photoshop / Figma idiom).
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  // Wrapper container ref so we can request fullscreen on it.
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  const MIN_ZOOM = 0.25;
+  const MAX_ZOOM = 16;
+
   // Layer visibility — each architectural category can be toggled independently
   const [layers, setLayers] = useState({
     grid: true,
@@ -692,23 +719,33 @@ export function FloorPlanViewer({
     const scaleY = (height - 2 * padding) / bldgH;
     const scale = Math.min(scaleX, scaleY);
 
-    const offsetX =
+    const baseOffsetX =
       padding + ((width - 2 * padding) - bldgW * scale) / 2 - minX * scale;
-    const offsetY =
+    const baseOffsetY =
       padding + ((height - 2 * padding) - bldgH * scale) / 2 - minY * scale;
 
+    // Apply user view (Phase 7): zoom around the canvas centre, then
+    // translate by (panX, panY). Reduces back to the fit transform when
+    // zoom = 1 and pan = 0.
+    const { zoom, panX, panY } = view;
+    const cx = width / 2;
+    const cy = height / 2;
+    const finalScale = scale * zoom;
+    const offsetX = panX + cx * (1 - zoom) + zoom * baseOffsetX;
+    const offsetY = (1 - zoom) * cy + zoom * baseOffsetY - panY;
+
     return {
-      scale,
+      scale: finalScale,
       offsetX,
       offsetY,
-      tx: (x: number) => offsetX + x * scale,
-      ty: (y: number) => height - (offsetY + y * scale),
-      ts: (s: number) => s * scale,
+      tx: (x: number) => offsetX + x * finalScale,
+      ty: (y: number) => height - (offsetY + y * finalScale),
+      ts: (s: number) => s * finalScale,
       // Inverse transforms: convert screen coordinates to plan coordinates
-      invTx: (screenX: number) => (screenX - offsetX) / scale,
-      invTy: (screenY: number) => (height - screenY - offsetY) / scale,
+      invTx: (screenX: number) => (screenX - offsetX) / finalScale,
+      invTy: (screenY: number) => (height - screenY - offsetY) / finalScale,
     };
-  }, [plan, allFloors, width, height]);
+  }, [plan, allFloors, width, height, view]);
 
   // ── Wall drag helpers (Phase 3.6a partition + Phase 3.6b apt boundary) ───
 
@@ -1213,10 +1250,24 @@ export function FloorPlanViewer({
   // ── Mouse down — start a partition wall drag or opening drag ──────────────
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (e.button !== 0) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
+
+      // Pan gesture (Phase 7): middle button always pans; primary
+      // button pans when space is held. Prevents the gesture from
+      // falling through to wall/opening hit-test below.
+      if (e.button === 1 || (e.button === 0 && spaceHeld)) {
+        panDragRef.current = {
+          startX: e.clientX,
+          startY: e.clientY,
+          startPanX: viewRef.current.panX,
+          startPanY: viewRef.current.panY,
+        };
+        e.preventDefault();
+        return;
+      }
+      if (e.button !== 0) return;
       const { invTx, invTy } = getTransform();
       const planX = invTx(e.clientX - rect.left);
       const planY = invTy(e.clientY - rect.top);
@@ -1317,11 +1368,18 @@ export function FloorPlanViewer({
       openingAddMode,
       snapOpeningCoord,
       commitEdit,
+      spaceHeld,
     ]
   );
 
   // ── Mouse up — commit (valid) or revert (invalid) a drag ──────────────────
   const handleMouseUp = useCallback(() => {
+    // Phase 7: terminate any active pan gesture first; pan never
+    // produces a wall/opening edit so it must short-circuit.
+    if (panDragRef.current) {
+      panDragRef.current = null;
+      return;
+    }
     if (wallDrag) {
       // editedPlan is already live-updated during mousemove; revert if
       // invalid or if the wall never moved off its original position.
@@ -1364,6 +1422,19 @@ export function FloorPlanViewer({
         const rect = canvas.getBoundingClientRect();
         const mx = clientX - rect.left;
         const my = clientY - rect.top;
+
+        // Phase 7: pan gesture in progress → translate the view and
+        // exit before any hit-test runs.
+        if (panDragRef.current) {
+          const pd = panDragRef.current;
+          setView({
+            zoom: viewRef.current.zoom,
+            panX: pd.startPanX + (clientX - pd.startX),
+            panY: pd.startPanY + (clientY - pd.startY),
+          });
+          return;
+        }
+
       const { invTx, invTy } = getTransform();
 
       const planX = invTx(mx);
@@ -1551,9 +1622,144 @@ export function FloorPlanViewer({
     ]
   );
 
+  // ── Phase 7: zoom helpers ──────────────────────────────────────
+  // Cursor-anchored zoom: when the user wheels over a point, that point
+  // stays fixed in screen space. Toolbar/keyboard zoom anchors at the
+  // canvas centre.
+  const zoomAt = useCallback(
+    (factor: number, screenX: number, screenY: number) => {
+      const v = viewRef.current;
+      const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, v.zoom * factor));
+      if (Math.abs(newZoom - v.zoom) < 1e-6) return;
+      // Recompute base transform parameters (without view) so we can
+      // solve for the pan that pins (screenX, screenY) to its current
+      // world coordinate.
+      const grid = plan.structural_grid;
+      let minX = grid.origin?.x ?? 0;
+      let minY = grid.origin?.y ?? 0;
+      let maxX = minX + grid.building_length_m;
+      let maxY = minY + grid.building_depth_m;
+      if (allFloors && allFloors.length > 0) {
+        for (const fp of allFloors) {
+          const g = fp.structural_grid;
+          const ox = g.origin?.x ?? 0;
+          const oy = g.origin?.y ?? 0;
+          if (ox < minX) minX = ox;
+          if (oy < minY) minY = oy;
+          if (ox + g.building_length_m > maxX) maxX = ox + g.building_length_m;
+          if (oy + g.building_depth_m > maxY) maxY = oy + g.building_depth_m;
+        }
+      }
+      const bldgW = Math.max(1, maxX - minX);
+      const bldgH = Math.max(1, maxY - minY);
+      const padding = 50;
+      const baseScale = Math.min(
+        (width - 2 * padding) / bldgW,
+        (height - 2 * padding) / bldgH,
+      );
+      const baseOffsetX =
+        padding + ((width - 2 * padding) - bldgW * baseScale) / 2 - minX * baseScale;
+      const baseOffsetY =
+        padding + ((height - 2 * padding) - bldgH * baseScale) / 2 - minY * baseScale;
+      const cx = width / 2;
+      const cy = height / 2;
+      // World point under cursor at the *current* view.
+      const oldFinalScale = baseScale * v.zoom;
+      const oldOffsetX = v.panX + cx * (1 - v.zoom) + v.zoom * baseOffsetX;
+      const oldOffsetY = (1 - v.zoom) * cy + v.zoom * baseOffsetY - v.panY;
+      const wx = (screenX - oldOffsetX) / oldFinalScale;
+      const wy = (height - screenY - oldOffsetY) / oldFinalScale;
+      // Solve new pan so the same world point lands at (screenX, screenY)
+      // under the new zoom.
+      const newFinalScale = baseScale * newZoom;
+      const newPanX =
+        screenX - cx * (1 - newZoom) - newZoom * baseOffsetX - wx * newFinalScale;
+      const newPanY =
+        (1 - newZoom) * cy + newZoom * baseOffsetY + wy * newFinalScale - (height - screenY);
+      setView({ zoom: newZoom, panX: newPanX, panY: newPanY });
+    },
+    [plan, allFloors, width, height],
+  );
+
+  const fitView = useCallback(() => {
+    setView({ zoom: 1, panX: 0, panY: 0 });
+  }, []);
+
+  // Wheel handler must be attached non-passive so preventDefault stops
+  // the page from scrolling. React's onWheel is passive in modern
+  // browsers, hence the manual addEventListener.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const listener = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      zoomAt(factor, e.clientX - rect.left, e.clientY - rect.top);
+    };
+    canvas.addEventListener("wheel", listener, { passive: false });
+    return () => canvas.removeEventListener("wheel", listener);
+  }, [zoomAt]);
+
+  // ── Phase 7: fullscreen ────────────────────────────────────────
+  const toggleFullscreen = useCallback(() => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      void document.exitFullscreen?.();
+    } else {
+      void el.requestFullscreen?.();
+    }
+  }, []);
+  useEffect(() => {
+    const onChange = () => {
+      setIsFullscreen(document.fullscreenElement === wrapperRef.current);
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
   // Keyboard shortcuts (L10)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Phase 7: ignore zoom/pan shortcuts while typing in form inputs.
+      const target = e.target as HTMLElement | null;
+      const isTyping =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable);
+
+      // Space-held → enables hand-tool pan on primary button drag.
+      if (e.code === "Space" && !isTyping) {
+        if (!e.repeat) setSpaceHeld(true);
+        e.preventDefault();
+      }
+
+      // Zoom & fit shortcuts (Phase 7)
+      if (!isTyping && !e.ctrlKey && !e.metaKey) {
+        const cx = (canvasRef.current?.width ?? width) / 2;
+        const cy = (canvasRef.current?.height ?? height) / 2;
+        if (e.key === "0") {
+          fitView();
+          return;
+        }
+        if (e.key === "+" || e.key === "=") {
+          zoomAt(1.2, cx, cy);
+          return;
+        }
+        if (e.key === "-" || e.key === "_") {
+          zoomAt(1 / 1.2, cx, cy);
+          return;
+        }
+        if (e.key === "f" || e.key === "F") {
+          if (e.shiftKey) {
+            toggleFullscreen();
+            return;
+          }
+        }
+      }
+
       if (e.key === "Escape") {
         if (wallDrag) {
           // Cancel active drag — revert to pre-drag snapshot
@@ -1632,9 +1838,21 @@ export function FloorPlanViewer({
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") setSpaceHeld(false);
+    };
+
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [measureMode, onApartmentSelect, editMode, wallDrag, openingDrag, selectedOpening, roomEditor, undo, redo, commitEdit, openingAddMode]);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [
+    measureMode, onApartmentSelect, editMode, wallDrag, openingDrag,
+    selectedOpening, roomEditor, undo, redo, commitEdit, openingAddMode,
+    fitView, zoomAt, toggleFullscreen, width, height,
+  ]);
 
   // Main draw effect
   useEffect(() => {
@@ -1955,12 +2173,30 @@ export function FloorPlanViewer({
     }
   }, [allFloors, buildPdfOptions]);
 
+  // Phase 7: cursor reflects the active gesture so the user knows when
+  // a pan is available (space held / middle button capable) vs the
+  // default cursor used for clicks and edit modes.
+  const canvasCursor = panDragRef.current
+    ? "grabbing"
+    : spaceHeld
+      ? "grab"
+      : "default";
+
   return (
-    <div className="relative inline-block">
+    <div
+      ref={wrapperRef}
+      className={`relative inline-block ${
+        isFullscreen ? "w-screen h-screen bg-white" : ""
+      }`}
+    >
       <canvas
         ref={canvasRef}
-        style={{ width, height }}
-        className="border rounded-lg bg-white cursor-default"
+        style={{
+          width: isFullscreen ? "100vw" : width,
+          height: isFullscreen ? "100vh" : height,
+          cursor: canvasCursor,
+        }}
+        className={`border rounded-lg bg-white ${isFullscreen ? "" : ""}`}
         tabIndex={0}
         role="img"
         aria-label={`Grundriss ${plan.floor_index === 0 ? "EG" : `${plan.floor_index}. OG`} — ${plan.apartments.length} Wohnungen`}
@@ -1969,9 +2205,69 @@ export function FloorPlanViewer({
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onMouseMove={handleMouseMove}
+        onContextMenu={(e) => {
+          // Right-click traditionally pans in CAD apps; suppress the
+          // browser menu so the gesture is usable. We don't yet wire
+          // right-button drag to pan (middle button + space already
+          // cover the use cases) but suppressing the menu keeps it
+          // available as a future affordance.
+          if (spaceHeld) e.preventDefault();
+        }}
       />
       <div className="absolute top-2 right-2 flex gap-2">
         {/* View mode segmented toggle */}
+        {/* Phase 7: view controls — zoom +/-, fit, fullscreen */}
+        <div className="inline-flex rounded overflow-hidden border border-neutral-300 text-sm font-medium bg-white">
+          <button
+            type="button"
+            onClick={() => {
+              const cv = canvasRef.current;
+              if (!cv) return;
+              zoomAt(1 / 1.2, cv.width / 2, cv.height / 2);
+            }}
+            className="px-2.5 py-1.5 text-gray-700 hover:bg-gray-100 transition-colors"
+            title="Verkleinern (−)"
+            aria-label="Zoom out"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            onClick={fitView}
+            className="px-2.5 py-1.5 text-gray-700 hover:bg-gray-100 border-l border-neutral-300 transition-colors font-mono text-xs"
+            title="An Inhalt anpassen (0)"
+            aria-label="Zoom to fit"
+          >
+            {Math.round(view.zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const cv = canvasRef.current;
+              if (!cv) return;
+              zoomAt(1.2, cv.width / 2, cv.height / 2);
+            }}
+            className="px-2.5 py-1.5 text-gray-700 hover:bg-gray-100 border-l border-neutral-300 transition-colors"
+            title="Vergrößern (+)"
+            aria-label="Zoom in"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            onClick={toggleFullscreen}
+            className={`px-2.5 py-1.5 border-l border-neutral-300 transition-colors ${
+              isFullscreen
+                ? "bg-neutral-900 text-white hover:bg-neutral-800"
+                : "text-gray-700 hover:bg-gray-100"
+            }`}
+            title={isFullscreen ? "Vollbild verlassen (Shift+F)" : "Vollbild (Shift+F)"}
+            aria-label="Toggle fullscreen"
+          >
+            {isFullscreen ? "⤡" : "⤢"}
+          </button>
+        </div>
+
         <div className="inline-flex rounded overflow-hidden border border-neutral-300 text-sm font-medium">
           <button
             onClick={() => applyViewMode("architect")}
