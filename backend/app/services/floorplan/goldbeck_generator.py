@@ -63,6 +63,110 @@ def _pick_best_raster(target_width: float) -> float:
     return best
 
 
+# ============================================================
+# Shared-edge geometry helpers (Phase 6c/d)
+# ============================================================
+#
+# Goldbeck rooms are axis-aligned rectangles. Two rooms share an interior
+# edge when one's east/west aligns with the other's west/east, or one's
+# north/south aligns with the other's south/north, *and* the two rooms
+# overlap perpendicular to that shared axis.
+#
+# These helpers underpin two corrections:
+#   - Phase 6c: door placement — bath/storage doors must connect to the
+#     apartment hallway, not the building corridor.
+#   - Phase 6d: partition walls — every internal room-to-room boundary
+#     gets a partition wall, not just bath/storage perimeters.
+
+def _poly_bbox(poly: list[Point2D]) -> tuple[float, float, float, float]:
+    xs = [p.x for p in poly]
+    ys = [p.y for p in poly]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _shared_edge(
+    poly_a: list[Point2D],
+    poly_b: list[Point2D],
+    tol: float = 0.06,  # ~6 cm — covers partition-wall thickness
+) -> Optional[tuple[str, float, float, float]]:
+    """Return ('x'|'y', shared_coord, lo, hi) when polys share an edge.
+
+    'x' axis = vertical wall at x = shared_coord, lo..hi along y.
+    'y' axis = horizontal wall at y = shared_coord, lo..hi along x.
+
+    Returns the *longest* shared edge if multiple match; ``None`` when no
+    edge with non-zero overlap is found.
+    """
+    ax0, ay0, ax1, ay1 = _poly_bbox(poly_a)
+    bx0, by0, bx1, by1 = _poly_bbox(poly_b)
+
+    candidates: list[tuple[str, float, float, float]] = []
+
+    # Vertical adjacency: a.east ↔ b.west
+    if abs(ax1 - bx0) < tol:
+        lo = max(ay0, by0)
+        hi = min(ay1, by1)
+        if hi - lo > tol:
+            candidates.append(("x", (ax1 + bx0) / 2, lo, hi))
+    if abs(bx1 - ax0) < tol:
+        lo = max(ay0, by0)
+        hi = min(ay1, by1)
+        if hi - lo > tol:
+            candidates.append(("x", (bx1 + ax0) / 2, lo, hi))
+
+    # Horizontal adjacency: a.north ↔ b.south
+    if abs(ay1 - by0) < tol:
+        lo = max(ax0, bx0)
+        hi = min(ax1, bx1)
+        if hi - lo > tol:
+            candidates.append(("y", (ay1 + by0) / 2, lo, hi))
+    if abs(by1 - ay0) < tol:
+        lo = max(ax0, bx0)
+        hi = min(ax1, bx1)
+        if hi - lo > tol:
+            candidates.append(("y", (by1 + ay0) / 2, lo, hi))
+
+    if not candidates:
+        return None
+    # Longest overlap wins.
+    candidates.sort(key=lambda c: c[3] - c[2], reverse=True)
+    return candidates[0]
+
+
+def _segment_overlaps_existing_wall(
+    axis: str,
+    coord: float,
+    lo: float,
+    hi: float,
+    walls: list[WallSegment],
+    tol: float = 0.06,
+) -> bool:
+    """True if a partition along (axis, coord, lo..hi) coincides with an
+    already-emitted structural wall (gable, outer, bearing_cross, corridor).
+    """
+    for w in walls:
+        wsx, wsy = w.start.x, w.start.y
+        wex, wey = w.end.x, w.end.y
+        if axis == "x":
+            # Wall must be vertical
+            if abs(wsx - wex) > tol:
+                continue
+            if abs(wsx - coord) > tol:
+                continue
+            wlo, whi = sorted([wsy, wey])
+            if not (whi < lo - tol or wlo > hi + tol):
+                return True
+        else:  # 'y'
+            if abs(wsy - wey) > tol:
+                continue
+            if abs(wsy - coord) > tol:
+                continue
+            wlo, whi = sorted([wsx, wex])
+            if not (whi < lo - tol or wlo > hi + tol):
+                return True
+    return False
+
+
 class GoldbeckGenerator(ConstructionSystem):
     """Goldbeck Wohngebäude construction system floor plan generator."""
 
@@ -408,14 +512,24 @@ class GoldbeckGenerator(ConstructionSystem):
             for win in staffel_windows:
                 win.position = _offset_point(win.position)
 
-            # Offset rooms
+            # Offset rooms — apartment rooms and `staffel_rooms` reference
+            # the same Python objects (phase 6 returns the union as
+            # `all_rooms`), so we deduplicate by `id()` to avoid offsetting
+            # the same polygon twice and pushing the SG floor 2× the
+            # setback to the right.
+            offset_room_ids: set[int] = set()
             for room in staffel_rooms:
+                if id(room) in offset_room_ids:
+                    continue
                 room.polygon = [_offset_point(p) for p in room.polygon]
+                offset_room_ids.add(id(room))
 
-            # Offset apartments and their rooms
             for apt in staffel_apts:
                 for room in apt.rooms:
+                    if id(room) in offset_room_ids:
+                        continue
                     room.polygon = [_offset_point(p) for p in room.polygon]
+                    offset_room_ids.add(id(room))
                 apt.bathroom.position = _offset_point(apt.bathroom.position)
 
             # Offset staircases
@@ -1578,22 +1692,40 @@ class GoldbeckGenerator(ConstructionSystem):
                 label="External Gallery (Laubengang)",
             ))
 
-        # --- Partition walls within apartments ---
+        # --- Partition walls within apartments (Phase 6d) ---
+        # Emit a partition along EVERY shared edge between two rooms of the
+        # same apartment. The previous logic emitted walls only around
+        # bath/storage perimeters which left bedroom-bedroom and
+        # bedroom-living boundaries un-walled. Skips any segment that
+        # already coincides with a structural wall (bearing, gable, outer,
+        # corridor) so we don't double up.
         for apt in apartments:
-            for room in apt.rooms:
-                if room.room_type in (RoomType.BATHROOM, RoomType.STORAGE):
-                    poly = room.polygon
-                    if len(poly) >= 4:
-                        for j in range(len(poly)):
-                            p1 = poly[j]
-                            p2 = poly[(j + 1) % len(poly)]
-                            walls.append(WallSegment(
-                                id=f"wall_{_uid()}",
-                                wall_type=WallType.PARTITION,
-                                start=p1, end=p2,
-                                thickness_m=C.PARTITION_WALL,
-                                is_bearing=False, is_exterior=False,
-                            ))
+            apt_rooms = list(apt.rooms)
+            for i in range(len(apt_rooms)):
+                for j in range(i + 1, len(apt_rooms)):
+                    poly_a = apt_rooms[i].polygon
+                    poly_b = apt_rooms[j].polygon
+                    if len(poly_a) < 4 or len(poly_b) < 4:
+                        continue
+                    edge = _shared_edge(poly_a, poly_b)
+                    if edge is None:
+                        continue
+                    axis, coord, lo, hi = edge
+                    if _segment_overlaps_existing_wall(axis, coord, lo, hi, walls):
+                        continue
+                    if axis == "x":
+                        start = Point2D(x=coord, y=lo)
+                        end = Point2D(x=coord, y=hi)
+                    else:
+                        start = Point2D(x=lo, y=coord)
+                        end = Point2D(x=hi, y=coord)
+                    walls.append(WallSegment(
+                        id=f"wall_{_uid()}",
+                        wall_type=WallType.PARTITION,
+                        start=start, end=end,
+                        thickness_m=C.PARTITION_WALL,
+                        is_bearing=False, is_exterior=False,
+                    ))
 
         # --- Staircase rooms ---
         for stair in staircases:
@@ -1620,102 +1752,112 @@ class GoldbeckGenerator(ConstructionSystem):
                     label="Elevator",
                 ))
 
-        # --- Windows on exterior walls ---
-        # Architectural rule: window area must be 20-25% of room floor area
-        # Standard Goldbeck window widths: 0.625, 1.25, 1.50, 1.875m
-        # Heights: 2.24m (floor-to-ceiling) or 1.34m (parapet/Brüstung)
-        MIN_WINDOW_AREA_RATIO = 0.20  # 20% minimum of room floor area
-        TARGET_WINDOW_AREA_RATIO = 0.22  # Target slightly above minimum
+        # --- Windows on exterior walls (Phase 6e) ---
+        # DIN 5034-1 §4.4 requires habitable-room window area ≥ 12.5 % of
+        # the room floor area; we target 22 % so the room comfortably
+        # passes Tageslicht-Stunden checks. Also includes KITCHEN now —
+        # separate (non-Wohnküche) kitchens still need a window when on
+        # an exterior wall.
+        #
+        # Window centering: compute the total horizontal width consumed
+        # by the chosen window count + spacing, then distribute the band
+        # symmetrically inside the room's available wall span. Previously
+        # windows were greedy-packed from the left edge, which left a
+        # visible gap on the right side of every room.
+        TARGET_WINDOW_AREA_RATIO = 0.22  # Target ratio (DIN 5034 min 12.5 %)
+
+        habitable_with_windows = (RoomType.LIVING, RoomType.BEDROOM, RoomType.KITCHEN)
 
         for apt in apartments:
             for room in apt.rooms:
-                if room.room_type in (RoomType.LIVING, RoomType.BEDROOM):
-                    poly = room.polygon
-                    if len(poly) < 4:
-                        continue
+                if room.room_type not in habitable_with_windows:
+                    continue
+                poly = room.polygon
+                if len(poly) < 4:
+                    continue
 
-                    min_x = min(p.x for p in poly)
-                    max_x = max(p.x for p in poly)
-                    min_y = min(p.y for p in poly)
-                    max_y = max(p.y for p in poly)
-                    room_w = max_x - min_x
-                    center_x = (min_x + max_x) / 2
+                min_x = min(p.x for p in poly)
+                max_x = max(p.x for p in poly)
+                min_y = min(p.y for p in poly)
+                max_y = max(p.y for p in poly)
+                room_w = max_x - min_x
+                center_x = (min_x + max_x) / 2
 
-                    on_south = min_y <= C.OUTER_LONG_WALL + 0.1
-                    on_north = max_y >= depth - C.OUTER_LONG_WALL - 0.1
+                on_south = min_y <= C.OUTER_LONG_WALL + 0.1
+                on_north = max_y >= depth - C.OUTER_LONG_WALL - 0.1
+                if not (on_south or on_north):
+                    continue  # interior room — no exterior wall to host a window
 
-                    if on_south or on_north:
-                        win_y = C.OUTER_LONG_WALL / 2 if on_south else depth - C.OUTER_LONG_WALL / 2
+                win_y = (
+                    C.OUTER_LONG_WALL / 2 if on_south
+                    else depth - C.OUTER_LONG_WALL / 2
+                )
+                is_ftc = room.room_type == RoomType.LIVING
+                win_h = (
+                    C.WINDOW_HEIGHT_FLOOR_TO_CEILING if is_ftc
+                    else C.WINDOW_HEIGHT_PARAPET
+                )
+                sill_h = 0.0 if is_ftc else C.WINDOW_SILL_HEIGHT
 
-                        # Living rooms: floor-to-ceiling (2.24m), others: parapet (1.34m)
-                        is_ftc = room.room_type == RoomType.LIVING
-                        win_h = C.WINDOW_HEIGHT_FLOOR_TO_CEILING if is_ftc else C.WINDOW_HEIGHT_PARAPET
-                        sill_h = 0.0 if is_ftc else C.WINDOW_SILL_HEIGHT
+                required_win_area = room.area_sqm * TARGET_WINDOW_AREA_RATIO
 
-                        # Calculate required window area from room floor area
-                        room_area = room.area_sqm
-                        required_win_area = room_area * TARGET_WINDOW_AREA_RATIO
+                available_widths = sorted(C.WINDOW_WIDTHS, reverse=True)
+                smallest_w = available_widths[-1]
+                max_wall_span = room_w - 2 * C.MIN_EDGE_TO_OPENING
+                if max_wall_span < smallest_w:
+                    # Room too narrow for any standard width window.
+                    continue
 
-                        # Pick window configuration to meet the area requirement
-                        # Available widths sorted for greedy fill
-                        available_widths = sorted(C.WINDOW_WIDTHS, reverse=True)
-                        max_wall_span = room_w - 2 * C.MIN_EDGE_TO_OPENING
+                # Pick widths greedily until the area target is met.
+                chosen_widths: list[float] = []
+                remaining_area = required_win_area
+                remaining_span = max_wall_span
+                while remaining_area > 0 and remaining_span >= smallest_w:
+                    chosen = None
+                    for ww in available_widths:
+                        if ww <= remaining_span + 0.01:
+                            chosen = ww
+                            break
+                    if chosen is None:
+                        break
+                    chosen_widths.append(chosen)
+                    remaining_area -= chosen * win_h
+                    remaining_span -= chosen + C.MIN_BETWEEN_OPENINGS
 
-                        placed_windows = []
-                        remaining_area = required_win_area
-                        remaining_span = max_wall_span
-                        cursor_x = min_x + C.MIN_EDGE_TO_OPENING
+                if not chosen_widths:
+                    # Always emit at least one window per habitable room
+                    # (DIN 5034 mandates it). Fall back to the smallest
+                    # standard width that fits.
+                    chosen_widths.append(min(smallest_w, max_wall_span))
 
-                        while remaining_area > 0 and remaining_span > available_widths[-1]:
-                            # Pick largest window that fits
-                            chosen_w = None
-                            for ww in available_widths:
-                                if ww <= remaining_span + 0.01:
-                                    chosen_w = ww
-                                    break
-                            if not chosen_w:
-                                break
+                # Center the resulting window band in the room's wall span.
+                total_w = sum(chosen_widths) + max(0, len(chosen_widths) - 1) * C.MIN_BETWEEN_OPENINGS
+                start_x = center_x - total_w / 2
+                # Clamp so we honor min-edge-to-opening on both sides AND
+                # the global building envelope.
+                start_x = max(start_x, min_x + C.MIN_EDGE_TO_OPENING)
+                start_x = max(start_x, C.MIN_EDGE_TO_OPENING)
+                end_required = start_x + total_w
+                env_max = length - C.MIN_EDGE_TO_OPENING
+                room_max = max_x - C.MIN_EDGE_TO_OPENING
+                if end_required > min(env_max, room_max):
+                    start_x = min(env_max, room_max) - total_w
+                    if start_x < min_x + C.MIN_EDGE_TO_OPENING:
+                        start_x = min_x + C.MIN_EDGE_TO_OPENING
 
-                            win_area = chosen_w * win_h
-                            wx = cursor_x + chosen_w / 2
-                            placed_windows.append((wx, chosen_w))
-                            remaining_area -= win_area
-                            remaining_span -= (chosen_w + C.MIN_BETWEEN_OPENINGS)
-                            cursor_x += chosen_w + C.MIN_BETWEEN_OPENINGS
-
-                        # Ensure at least one window per habitable room
-                        if not placed_windows:
-                            # Fallback: smallest window at room center
-                            win_w = min(available_widths[-1], room_w - 2 * C.MIN_EDGE_TO_OPENING)
-                            if win_w > 0:
-                                placed_windows.append((center_x, max(0.625, win_w)))
-
-                        for wx, ww in placed_windows:
-                            # Clamp window to building envelope
-                            half_w = ww / 2
-                            # Ensure window doesn't protrude past building edges
-                            wx = max(half_w + C.MIN_EDGE_TO_OPENING, wx)
-                            wx = min(length - half_w - C.MIN_EDGE_TO_OPENING, wx)
-                            # Also clamp to room boundaries
-                            wx = max(min_x + half_w + C.MIN_EDGE_TO_OPENING, wx)
-                            wx = min(max_x - half_w - C.MIN_EDGE_TO_OPENING, wx)
-                            # Skip window if room is too narrow to fit it
-                            if max_x - min_x < ww + 2 * C.MIN_EDGE_TO_OPENING:
-                                # Try a smaller window
-                                ww = max(0.625, max_x - min_x - 2 * C.MIN_EDGE_TO_OPENING)
-                                half_w = ww / 2
-                                wx = (min_x + max_x) / 2
-                                if ww < 0.5:
-                                    continue  # Room too narrow for any window
-                            windows.append(WindowPlacement(
-                                id=f"win_{_uid()}",
-                                position=Point2D(x=round(wx, 3), y=round(win_y, 3)),
-                                wall_id="south_wall" if on_south else "north_wall",
-                                width_m=round(ww, 3),
-                                height_m=win_h,
-                                sill_height_m=sill_h,
-                                is_floor_to_ceiling=is_ftc,
-                            ))
+                cursor = start_x
+                for ww in chosen_widths:
+                    wx = cursor + ww / 2
+                    windows.append(WindowPlacement(
+                        id=f"win_{_uid()}",
+                        position=Point2D(x=round(wx, 3), y=round(win_y, 3)),
+                        wall_id="south_wall" if on_south else "north_wall",
+                        width_m=round(ww, 3),
+                        height_m=win_h,
+                        sill_height_m=sill_h,
+                        is_floor_to_ceiling=is_ftc,
+                    ))
+                    cursor += ww + C.MIN_BETWEEN_OPENINGS
 
         # --- Apartment entrance doors (upper floors) ---
         # Each apartment gets exactly ONE entrance door:
@@ -1757,25 +1899,154 @@ class GoldbeckGenerator(ConstructionSystem):
                 is_entrance=True,
             ))
 
-        # --- Interior doors ---
+        # --- Interior doors (Phase 6c) ---
+        #
+        # Place each interior door along the room's shared edge with the
+        # apartment hallway. The previous logic centered every door on the
+        # corridor-facing side of the room which, for bath/storage in
+        # apartments without a distribution arm, sometimes landed the door
+        # on the building corridor wall — i.e. you'd walk straight from
+        # the public corridor into the bathroom. That violates the basic
+        # rule that all rooms in an apartment must be reached *through*
+        # the apartment entrance.
+        #
+        # Adjacency lookup uses `_shared_edge` which only succeeds when
+        # two rooms share an internal boundary. If no hallway adjacency
+        # exists (rare layout edge case) we fall back to the previous
+        # corridor-facing midpoint so the apartment isn't left without a
+        # door — and we log a warning so we can audit those plans.
         for apt in apartments:
+            hallway_polys = [
+                r.polygon for r in apt.rooms
+                if r.room_type == RoomType.HALLWAY and len(r.polygon) >= 4
+            ]
             for room in apt.rooms:
-                if room.room_type in (RoomType.BEDROOM, RoomType.LIVING, RoomType.BATHROOM, RoomType.STORAGE):
-                    poly = room.polygon
-                    if len(poly) >= 4:
-                        center_x = sum(p.x for p in poly) / len(poly)
-                        if apt.side == "south":
-                            door_y = max(p.y for p in poly)
-                        else:
-                            door_y = min(p.y for p in poly)
+                if room.room_type not in (
+                    RoomType.BEDROOM,
+                    RoomType.LIVING,
+                    RoomType.KITCHEN,
+                    RoomType.BATHROOM,
+                    RoomType.STORAGE,
+                ):
+                    continue
+                poly = room.polygon
+                if len(poly) < 4:
+                    continue
 
-                        doors.append(DoorPlacement(
-                            id=f"door_{_uid()}",
-                            position=Point2D(x=round(center_x, 3), y=round(door_y, 3)),
-                            wall_id=f"partition_{room.id}",
-                            width_m=C.INTERIOR_DOOR_WIDTH,
-                            is_entrance=False,
-                        ))
+                # 1. Prefer a shared edge with any hallway in this apartment.
+                #    The Goldbeck service strip places a TGA shaft (≈30 cm)
+                #    between the hallway and the bathroom — so for those
+                #    rooms we relax the adjacency tolerance to span the
+                #    shaft + a partition wall + safety. The door physically
+                #    sits on the bathroom-side wall and people circulate
+                #    across the shaft (the shaft is just risers in the slab).
+                hall_tol = (
+                    C.SHAFT_ZONE_WIDTH + C.PARTITION_WALL + 0.10
+                    if room.room_type in (RoomType.BATHROOM, RoomType.STORAGE)
+                    else 0.06
+                )
+                door_pos: Optional[Point2D] = None
+                door_wall_ref = f"partition_{room.id}"
+                rx0, ry0, rx1, ry1 = _poly_bbox(poly)
+
+                # 1a. Containment case: storage closets are carved from the
+                #     hallway interior, so their bbox is fully inside a
+                #     hallway polygon and `_shared_edge` returns None. Pick
+                #     whichever room edge does *not* coincide with the
+                #     hallway perimeter — that edge faces clear hallway
+                #     space and is the natural door location.
+                contain_tol = 0.06
+                for hp in hallway_polys:
+                    hx0, hy0, hx1, hy1 = _poly_bbox(hp)
+                    if not (
+                        rx0 >= hx0 - contain_tol and rx1 <= hx1 + contain_tol
+                        and ry0 >= hy0 - contain_tol and ry1 <= hy1 + contain_tol
+                    ):
+                        continue
+                    candidates: list[tuple[str, float, float, float]] = []
+                    if abs(rx0 - hx0) > contain_tol:
+                        candidates.append(("x", rx0, ry0, ry1))
+                    if abs(rx1 - hx1) > contain_tol:
+                        candidates.append(("x", rx1, ry0, ry1))
+                    if abs(ry0 - hy0) > contain_tol:
+                        candidates.append(("y", ry0, rx0, rx1))
+                    if abs(ry1 - hy1) > contain_tol:
+                        candidates.append(("y", ry1, rx0, rx1))
+                    if not candidates:
+                        continue
+                    candidates.sort(key=lambda e: e[3] - e[2], reverse=True)
+                    axis, coord, lo, hi = candidates[0]
+                    if hi - lo < C.INTERIOR_DOOR_WIDTH + 0.05:
+                        continue
+                    mid = (lo + hi) / 2
+                    if axis == "x":
+                        door_pos = Point2D(x=round(coord, 3), y=round(mid, 3))
+                    else:
+                        door_pos = Point2D(x=round(mid, 3), y=round(coord, 3))
+                    break
+
+                # 1b. Adjacency case: rooms share an edge with hallway
+                #     (possibly across a shaft strip). Pick the longest.
+                if door_pos is None:
+                    best_overlap = 0.0
+                    for hp in hallway_polys:
+                        edge = _shared_edge(poly, hp, tol=hall_tol)
+                        if edge is None:
+                            continue
+                        axis, coord, lo, hi = edge
+                        overlap = hi - lo
+                        if overlap < C.INTERIOR_DOOR_WIDTH + 0.05:
+                            continue
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            mid = (lo + hi) / 2
+                            if axis == "x":
+                                hx0, _, hx1, _ = _poly_bbox(hp)
+                                wall_x = rx0 if hx1 <= rx0 + hall_tol else rx1
+                                door_pos = Point2D(x=round(wall_x, 3), y=round(mid, 3))
+                            else:
+                                _, hy0, _, hy1 = _poly_bbox(hp)
+                                wall_y = ry0 if hy1 <= ry0 + hall_tol else ry1
+                                door_pos = Point2D(x=round(mid, 3), y=round(wall_y, 3))
+
+                # 2. Fallback to legacy corridor-facing midpoint, but
+                #    explicitly avoid the building corridor wall.
+                if door_pos is None:
+                    center_x = sum(p.x for p in poly) / len(poly)
+                    if apt.side == "south":
+                        door_y = max(p.y for p in poly)
+                    else:
+                        door_y = min(p.y for p in poly)
+                    if has_corridor and (
+                        abs(door_y - corr_y0) < 0.10
+                        or abs(door_y - corr_y1) < 0.10
+                    ):
+                        # Refusing to open a private room directly onto
+                        # the building corridor — log + skip this room's
+                        # interior door (apartment validation will flag
+                        # the missing door rather than the gen producing
+                        # an unsafe layout).
+                        logger.warning(
+                            "[Phase7 doors] %s in apt %s has no hallway"
+                            " adjacency; skipping interior door to avoid"
+                            " corridor opening.",
+                            room.room_type.value, apt.id,
+                        )
+                        continue
+                    door_pos = Point2D(x=round(center_x, 3), y=round(door_y, 3))
+                    logger.debug(
+                        "[Phase7 doors] %s in apt %s: hallway adjacency"
+                        " not found, using legacy fallback.",
+                        room.room_type.value, apt.id,
+                    )
+
+                doors.append(DoorPlacement(
+                    id=f"door_{_uid()}",
+                    position=door_pos,
+                    wall_id=door_wall_ref,
+                    width_m=C.INTERIOR_DOOR_WIDTH,
+                    is_entrance=False,
+                ))
 
         return walls, doors, windows, building_rooms
 

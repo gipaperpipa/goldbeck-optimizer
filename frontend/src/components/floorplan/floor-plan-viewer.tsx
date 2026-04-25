@@ -655,19 +655,47 @@ export function FloorPlanViewer({
     }
   };
 
-  // Precompute transform
+  // Precompute transform.
+  //
+  // When the building has a Staffelgeschoss its top floor's grid is smaller
+  // than the floors below it AND its origin is offset (the SG is centered
+  // inside the base footprint). If we sized the canvas to the SG's own grid
+  // length, walls drawn at `origin.x .. origin.x + length` would render
+  // outside the visible area on the right.
+  //
+  // Solution: size the canvas to the union extent across `allFloors` so every
+  // floor shares the same plan-space → screen-space mapping. The SG then
+  // draws naturally inset within the building outline. When `allFloors` is
+  // not supplied we fall back to the current plan's grid only.
   const getTransform = useCallback(() => {
     const grid = plan.structural_grid;
-    const bldgW = grid.building_length_m;
-    const bldgH = grid.building_depth_m;
+    let minX = grid.origin?.x ?? 0;
+    let minY = grid.origin?.y ?? 0;
+    let maxX = minX + grid.building_length_m;
+    let maxY = minY + grid.building_depth_m;
+    if (allFloors && allFloors.length > 0) {
+      for (const fp of allFloors) {
+        const g = fp.structural_grid;
+        const ox = g.origin?.x ?? 0;
+        const oy = g.origin?.y ?? 0;
+        if (ox < minX) minX = ox;
+        if (oy < minY) minY = oy;
+        if (ox + g.building_length_m > maxX) maxX = ox + g.building_length_m;
+        if (oy + g.building_depth_m > maxY) maxY = oy + g.building_depth_m;
+      }
+    }
+    const bldgW = Math.max(1, maxX - minX);
+    const bldgH = Math.max(1, maxY - minY);
 
     const padding = 50;
     const scaleX = (width - 2 * padding) / bldgW;
     const scaleY = (height - 2 * padding) / bldgH;
     const scale = Math.min(scaleX, scaleY);
 
-    const offsetX = padding + ((width - 2 * padding) - bldgW * scale) / 2;
-    const offsetY = padding + ((height - 2 * padding) - bldgH * scale) / 2;
+    const offsetX =
+      padding + ((width - 2 * padding) - bldgW * scale) / 2 - minX * scale;
+    const offsetY =
+      padding + ((height - 2 * padding) - bldgH * scale) / 2 - minY * scale;
 
     return {
       scale,
@@ -680,7 +708,7 @@ export function FloorPlanViewer({
       invTx: (screenX: number) => (screenX - offsetX) / scale,
       invTy: (screenY: number) => (height - screenY - offsetY) / scale,
     };
-  }, [plan, width, height]);
+  }, [plan, allFloors, width, height]);
 
   // ── Wall drag helpers (Phase 3.6a partition + Phase 3.6b apt boundary) ───
 

@@ -474,16 +474,35 @@ export function BuildingDetailed({
         );
       })}
 
-      {/* Roof slab */}
-      {sectionBoxY === null && (
-        <Slab3D
-          width={floorPlans.building_width_m}
-          depth={floorPlans.building_depth_m}
-          yOffset={building.stories * storyHeight}
-          originX={-floorPlans.building_width_m / 2}
-          originZ={-floorPlans.building_depth_m / 2}
-        />
-      )}
+      {/* Roof slab — sized to the topmost floor's footprint, not the building's
+          overall extent. Otherwise a Staffelgeschoss gets an overhang the size
+          of the floors below it. */}
+      {sectionBoxY === null && (() => {
+        const topFloor = plans
+          .slice()
+          .sort((a, b) => b.floor_index - a.floor_index)[0];
+        const roofW =
+          topFloor?.structural_grid?.building_length_m ??
+          floorPlans.building_width_m;
+        const roofD =
+          topFloor?.structural_grid?.building_depth_m ??
+          floorPlans.building_depth_m;
+        const roofOriginX =
+          (topFloor?.structural_grid?.origin?.x ?? 0) -
+          floorPlans.building_width_m / 2;
+        const roofOriginZ =
+          (topFloor?.structural_grid?.origin?.y ?? 0) -
+          floorPlans.building_depth_m / 2;
+        return (
+          <Slab3D
+            width={roofW}
+            depth={roofD}
+            yOffset={building.stories * storyHeight}
+            originX={roofOriginX}
+            originZ={roofOriginZ}
+          />
+        );
+      })()}
 
       {/* Label */}
       {showLabel && (
