@@ -54,6 +54,8 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   const [sectionY, setSectionY] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  // Phase 8c: §6 Abstandsflächen overlay
+  const [showAbstand, setShowAbstand] = useState(false);
 
   const handleExportIfc = useCallback(async (buildingId: string) => {
     if (!layout || !floorPlansMap?.[buildingId]) return;
@@ -156,6 +158,14 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
         >
           Labels
         </Button>
+        <Button
+          size="sm"
+          variant={showAbstand ? "default" : "outline"}
+          onClick={() => setShowAbstand((v) => !v)}
+          title="§6 Abstandsflächen ein-/ausblenden"
+        >
+          Abstandsflächen
+        </Button>
         {/* IFC export buttons — only when floor plans exist */}
         {hasDetailedData && layout.buildings.map((b) =>
           floorPlansMap?.[b.id] ? (
@@ -241,6 +251,13 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
             fadeStrength={1}
           />
 
+          {/* Phase 8c: §6 Abstandsflächen translucent ground projections —
+              one rectangle per facade, depth = max(0.4·H, 3 m). Drawn at
+              y = 0.02 to sit above the ground but below buildings. */}
+          {showAbstand && layout.buildings.map((b) => (
+            <AbstandsflaechenLayer3D key={`abst-${b.id}`} building={b} />
+          ))}
+
           {/* Buildings — detailed if floor plans exist, simple otherwise */}
           {layout.buildings.map((building, i) => (
             <BuildingDetailed
@@ -317,3 +334,63 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
 }
 
 const SLAB_COLOR = "#c4b5a3";
+
+// ── Phase 8c: §6 Abstandsflächen ground projection ───────────────────
+//
+// One translucent amber slab per facade, depth = max(0.4·H, 3 m). Each
+// slab is built in the building's local frame (so it rotates with the
+// building) and lifted slightly off the ground (y = 0.02) so it draws
+// above the ground plane but below building walls.
+function AbstandsflaechenLayer3D({
+  building,
+  hCoeff = 0.4,
+}: {
+  building: { width_m: number; depth_m: number; total_height_m: number;
+    position_x: number; position_y: number; rotation_deg: number };
+  hCoeff?: number;
+}) {
+  const depth = Math.max(hCoeff * building.total_height_m, 3.0);
+  const halfW = building.width_m / 2;
+  const halfD = building.depth_m / 2;
+  const rotationRad = (building.rotation_deg * Math.PI) / 180;
+
+  // Each rectangle is positioned in the building's local frame (origin
+  // at building centre, +x along width, +z along depth — note Three.js
+  // uses y-up so the plan's y axis maps to z). The mesh's local rotation
+  // lays it flat (face up).
+  const faces = [
+    // South facade (-z side)
+    { lx: 0, lz: -halfD - depth / 2, w: building.width_m + 2 * depth, d: depth },
+    // North facade (+z side)
+    { lx: 0, lz:  halfD + depth / 2, w: building.width_m + 2 * depth, d: depth },
+    // West facade (-x side)
+    { lx: -halfW - depth / 2, lz: 0, w: depth, d: building.depth_m },
+    // East facade (+x side)
+    { lx:  halfW + depth / 2, lz: 0, w: depth, d: building.depth_m },
+  ];
+
+  return (
+    <group
+      position={[building.position_x, 0.02, -building.position_y]}
+      rotation={[0, rotationRad, 0]}
+    >
+      {faces.map((f, i) => (
+        <mesh
+          key={i}
+          position={[f.lx, 0, f.lz]}
+          rotation={[-Math.PI / 2, 0, 0]}
+        >
+          <planeGeometry args={[f.w, f.d]} />
+          <meshBasicMaterial
+            color="#f59e0b"
+            transparent
+            opacity={0.18}
+            depthWrite={false}
+            polygonOffset
+            polygonOffsetFactor={-1}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}

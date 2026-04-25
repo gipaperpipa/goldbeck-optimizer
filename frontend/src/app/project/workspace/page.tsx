@@ -389,6 +389,24 @@ export default function WorkspacePage() {
                   buildingRotationDeg={
                     currentBuildingFootprint?.rotation_deg ?? 0
                   }
+                  plotBoundary={plotAnalysis?.boundary_polygon_local}
+                  buildingPosition={
+                    currentBuildingFootprint
+                      ? {
+                          x: currentBuildingFootprint.position_x,
+                          y: currentBuildingFootprint.position_y,
+                        }
+                      : undefined
+                  }
+                  buildingDimensions={
+                    currentBuildingFootprint
+                      ? {
+                          width: currentBuildingFootprint.width_m,
+                          depth: currentBuildingFootprint.depth_m,
+                        }
+                      : undefined
+                  }
+                  buildingHeightM={currentBuildingFootprint?.total_height_m}
                 />
               )}
             </div>

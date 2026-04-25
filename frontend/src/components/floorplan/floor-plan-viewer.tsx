@@ -56,6 +56,19 @@ interface FloorPlanViewerProps {
   longitude?: number;
   /** Building rotation (CCW about +z, degrees). Plan +y = north when 0. */
   buildingRotationDeg?: number;
+  /** Parcel boundary in plot-local coordinates (CCW polygon, metres).
+   *  Phase 8a: when provided alongside `buildingPosition` /
+   *  `buildingDimensions` the viewer projects the boundary into the
+   *  building's local plan frame and renders it as an under-layer. */
+  plotBoundary?: [number, number][];
+  /** Building centre position in plot-local coordinates (metres). */
+  buildingPosition?: { x: number; y: number };
+  /** Building footprint dimensions (metres) — used to translate the
+   *  building centre to its bottom-left in the plan frame. */
+  buildingDimensions?: { width: number; depth: number };
+  /** Building total height (metres). Phase 8b: drives the
+   *  Abstandsflächen overlay depth (max(hCoeff·H, 3 m)). */
+  buildingHeightM?: number;
 }
 
 /**
@@ -314,6 +327,10 @@ export function FloorPlanViewer({
   latitude,
   longitude,
   buildingRotationDeg,
+  plotBoundary,
+  buildingPosition,
+  buildingDimensions,
+  buildingHeightM,
 }: FloorPlanViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hoveredAptId, setHoveredAptId] = useState<string | null>(null);
@@ -360,6 +377,8 @@ export function FloorPlanViewer({
     annotations: true, // north arrow, scale bar, title
     validation: true,  // per-room/apartment issue badges (Phase 3.6e)
     furniture: false,  // DIN-compliant furniture silhouettes (Phase 4.1)
+    parcel: true,      // parcel boundary (Phase 8a)
+    abstand: true,     // §6 Abstandsflächen overlay (Phase 8b)
   });
   const [showLayerPanel, setShowLayerPanel] = useState(false);
   const toggleLayer = (k: keyof typeof layers) =>
@@ -671,6 +690,7 @@ export function FloorPlanViewer({
         grid: true, rooms: true, walls: true, openings: true,
         labels: true, dimensions: true, annotations: true, validation: true,
         furniture: prev.furniture,
+        parcel: prev.parcel, abstand: prev.abstand,
       }));
     } else {
       // Presentation: hide technical layers, keep rooms + walls + openings + labels
@@ -678,6 +698,7 @@ export function FloorPlanViewer({
         grid: false, rooms: true, walls: true, openings: true,
         labels: true, dimensions: false, annotations: true, validation: false,
         furniture: prev.furniture,
+        parcel: false, abstand: false,
       }));
     }
   };
@@ -1878,6 +1899,44 @@ export function FloorPlanViewer({
     ctx.fillStyle = isPresentation ? "#ffffff" : "#fafaf8";
     ctx.fillRect(0, 0, width, height);
 
+    // --- 2a. Parcel boundary (Phase 8a) ---
+    // Drawn under everything so it provides spatial context without
+    // obscuring the building. Skipped silently if any of the position /
+    // dimensions / boundary props are missing.
+    if (
+      layers.parcel &&
+      plotBoundary &&
+      plotBoundary.length >= 3 &&
+      buildingPosition &&
+      buildingDimensions &&
+      !isPresentation
+    ) {
+      drawParcelBoundary(ctx, {
+        boundary: plotBoundary,
+        buildingCenter: buildingPosition,
+        buildingDims: buildingDimensions,
+        buildingRotationDeg: buildingRotationDeg ?? 0,
+        tx, ty,
+      });
+    }
+
+    // --- 2b. Abstandsflächen overlay (Phase 8b) ---
+    // Project each exterior wall outward by max(hCoeff·H, 3 m). Drawn
+    // before the building outline so the building sits cleanly on top.
+    if (
+      layers.abstand &&
+      buildingHeightM &&
+      buildingHeightM > 0 &&
+      !isPresentation
+    ) {
+      drawAbstandsflaechen(ctx, {
+        buildingW: bldgW,
+        buildingD: bldgH,
+        heightM: buildingHeightM,
+        tx, ty, ts,
+      });
+    }
+
     // --- 2. Building shadow/depth effect (Architect mode only) ---
     if (!isPresentation) {
       ctx.fillStyle = "#e8e4df";
@@ -2074,6 +2133,11 @@ export function FloorPlanViewer({
     validation,
     focusedRoomId,
     furnitureByRoom,
+    plotBoundary,
+    buildingPosition,
+    buildingDimensions,
+    buildingRotationDeg,
+    buildingHeightM,
   ]);
 
   const handleMeasureToggle = () => {
@@ -2316,6 +2380,8 @@ export function FloorPlanViewer({
                 ["annotations", "North / scale / title"],
                 ["validation", "Validation issues"],
                 ["furniture", "Möblierung (DIN)"],
+                ["parcel", "Flurstück"],
+                ["abstand", "Abstandsflächen (§6)"],
               ] as const).map(([key, label]) => (
                 <label
                   key={key}
@@ -3103,6 +3169,140 @@ function findNearestWall2D(
 }
 
 // --- Drawing helpers ---
+
+// ── Phase 8a: parcel boundary overlay ─────────────────────────────
+//
+// The plot polygon is supplied in plot-local coordinates. The viewer
+// renders in building-local coordinates (origin = bottom-left corner of
+// the building footprint, axes aligned with the structural grid). To
+// project a plot-local point P into building-local coords:
+//
+//   1. shift so the building centre is at origin:  P' = P − centre
+//   2. rotate by  −rotationDeg  (un-rotate to building axes)
+//   3. shift to bottom-left of footprint:          P'' = P' + (W/2, D/2)
+//
+// Then the existing tx/ty handle building-local → screen.
+function drawParcelBoundary(
+  ctx: CanvasRenderingContext2D,
+  args: {
+    boundary: [number, number][];
+    buildingCenter: { x: number; y: number };
+    buildingDims: { width: number; depth: number };
+    buildingRotationDeg: number;
+    tx: (x: number) => number;
+    ty: (y: number) => number;
+  },
+) {
+  const { boundary, buildingCenter, buildingDims, buildingRotationDeg, tx, ty } = args;
+  const rad = (-buildingRotationDeg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const halfW = buildingDims.width / 2;
+  const halfD = buildingDims.depth / 2;
+
+  ctx.save();
+  // Soft fill so the plot reads as the surrounding context.
+  ctx.fillStyle = "rgba(102, 92, 80, 0.06)";
+  ctx.strokeStyle = "rgba(102, 92, 80, 0.45)";
+  ctx.lineWidth = 1.0;
+  ctx.setLineDash([6, 4]);
+
+  ctx.beginPath();
+  for (let i = 0; i < boundary.length; i++) {
+    const [px, py] = boundary[i];
+    const dx = px - buildingCenter.x;
+    const dy = py - buildingCenter.y;
+    const lx = dx * cos - dy * sin + halfW;
+    const ly = dx * sin + dy * cos + halfD;
+    const sx = tx(lx);
+    const sy = ty(ly);
+    if (i === 0) ctx.moveTo(sx, sy);
+    else ctx.lineTo(sx, sy);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+
+  // Tiny "Flurstück" caption near the first vertex so the user knows
+  // what the dashed polygon is.
+  ctx.save();
+  ctx.fillStyle = "rgba(102, 92, 80, 0.7)";
+  ctx.font = "10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+  const [p0x, p0y] = boundary[0];
+  const dx0 = p0x - buildingCenter.x;
+  const dy0 = p0y - buildingCenter.y;
+  const lx0 = dx0 * cos - dy0 * sin + halfW;
+  const ly0 = dx0 * sin + dy0 * cos + halfD;
+  ctx.fillText("Flurstück", tx(lx0) + 4, ty(ly0) - 4);
+  ctx.restore();
+}
+
+// ── Phase 8b: §6 Abstandsflächen overlay ─────────────────────────
+//
+// For each of the four exterior walls (axis-aligned in building-local
+// coords) we project a rectangle outward by max(hCoeff·H, 3 m). Drawn
+// as translucent amber fills so they read as "the offsets we owe the
+// neighbours". Rectangle overlap at corners is intentional — they
+// represent the union of offsets, not separate triangular wedges.
+function drawAbstandsflaechen(
+  ctx: CanvasRenderingContext2D,
+  args: {
+    buildingW: number;
+    buildingD: number;
+    heightM: number;
+    tx: (x: number) => number;
+    ty: (y: number) => number;
+    ts: (s: number) => number;
+    hCoeff?: number;
+  },
+) {
+  const { buildingW, buildingD, heightM, tx, ty, ts } = args;
+  const hCoeff = args.hCoeff ?? 0.4;
+  const depth = Math.max(hCoeff * heightM, 3.0);
+
+  ctx.save();
+  ctx.fillStyle = "rgba(245, 158, 11, 0.10)"; // amber-500 @ 10 %
+  ctx.strokeStyle = "rgba(180, 83, 9, 0.55)";   // amber-700 @ 55 %
+  ctx.lineWidth = 1.0;
+  ctx.setLineDash([4, 3]);
+
+  // South face (y = 0)
+  drawAbstRect(ctx, tx(-depth), ty(0), ts(buildingW + 2 * depth), ts(depth));
+  // North face (y = buildingD)
+  drawAbstRect(ctx, tx(-depth), ty(buildingD + depth), ts(buildingW + 2 * depth), ts(depth));
+  // West face (x = 0)
+  drawAbstRect(ctx, tx(-depth), ty(buildingD), ts(depth), ts(buildingD));
+  // East face (x = buildingW)
+  drawAbstRect(ctx, tx(buildingW), ty(buildingD), ts(depth), ts(buildingD));
+
+  // Depth label near the south face
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(180, 83, 9, 0.85)";
+  ctx.font = "10px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(
+    `§6 · ${depth.toFixed(2)} m  (${hCoeff} · H)`,
+    tx(buildingW / 2),
+    ty(-depth / 2),
+  );
+  ctx.textAlign = "left";
+  ctx.restore();
+}
+
+function drawAbstRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+) {
+  // Canvas y grows downward; our ty() already flips. The caller passed
+  // the *top-left* of the rectangle in screen coords, so we just need
+  // a positive width/height.
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+}
 
 function drawRoom(
   ctx: CanvasRenderingContext2D,

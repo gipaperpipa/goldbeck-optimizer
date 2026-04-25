@@ -494,6 +494,18 @@ export function FloorPlanPanel() {
               latitude={plotAnalysis?.centroid_geo?.lat}
               longitude={plotAnalysis?.centroid_geo?.lng}
               buildingRotationDeg={currentBuilding?.rotation_deg ?? 0}
+              plotBoundary={plotAnalysis?.boundary_polygon_local}
+              buildingPosition={
+                currentBuilding
+                  ? { x: currentBuilding.position_x, y: currentBuilding.position_y }
+                  : undefined
+              }
+              buildingDimensions={
+                currentBuilding
+                  ? { width: currentBuilding.width_m, depth: currentBuilding.depth_m }
+                  : undefined
+              }
+              buildingHeightM={currentBuilding?.total_height_m}
             />
           </div>
 
