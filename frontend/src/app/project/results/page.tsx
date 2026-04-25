@@ -45,6 +45,12 @@ export default function ResultsPage() {
               {optimizationResult.layouts.length} layouts | {optimizationResult.elapsed_seconds?.toFixed(1)}s
             </span>
           </div>
+          <Link
+            href="/project/workspace"
+            className="text-sm font-medium text-neutral-900 border border-neutral-200 rounded-md px-3 py-1.5 hover:bg-neutral-50"
+          >
+            Workspace →
+          </Link>
         </div>
       </header>
 

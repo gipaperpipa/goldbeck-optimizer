@@ -24,3 +24,44 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ * Workspace design tokens (Phase 5i — CAD/blueprint redesign)
+ * Scoped under .workspace-root so the existing app keeps its look.
+ * ──────────────────────────────────────────────────────────────── */
+.workspace-root {
+  --ws-bg:        oklch(0.985 0.003 85);
+  --ws-bg-canvas: oklch(0.975 0.004 85);
+  --ws-ink:       oklch(0.18 0.01 60);
+  --ws-ink-mid:   oklch(0.35 0.01 60);
+  --ws-ink-dim:   oklch(0.55 0.01 60);
+  --ws-line:      oklch(0.92 0.005 85);
+  --ws-line-strong: oklch(0.85 0.005 85);
+  --ws-accent:    oklch(0.55 0.12 220);
+  --ws-accent-bg: oklch(0.93 0.05 220);
+  --ws-south:     oklch(0.94 0.04 70);
+  --ws-south-fg:  oklch(0.42 0.07 60);
+  --ws-north:     oklch(0.94 0.025 240);
+  --ws-north-fg:  oklch(0.40 0.06 240);
+  --ws-ok-bg:     oklch(0.93 0.05 150);
+  --ws-ok-fg:     oklch(0.38 0.09 150);
+  --ws-neutral-bg: oklch(0.95 0.003 85);
+
+  background: var(--ws-bg);
+  color: var(--ws-ink);
+  font-family: var(--font-inter-tight), system-ui, sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "ss01", "cv11";
+}
+
+.workspace-root .ws-mono { font-family: var(--font-jetbrains-mono), ui-monospace, monospace; }
+.workspace-root .ws-serif { font-family: var(--font-instrument-serif), Georgia, serif; }
+
+.workspace-root .ws-paper {
+  background:
+    radial-gradient(ellipse at 20% 10%, oklch(0.99 0.003 85) 0%, oklch(0.97 0.005 85) 100%);
+}
+
+.workspace-root ::selection { background: var(--ws-accent-bg); color: var(--ws-ink); }
+.workspace-root .ws-scrollable { scrollbar-width: thin; scrollbar-color: var(--ws-line-strong) transparent; }
