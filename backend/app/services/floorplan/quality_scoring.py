@@ -15,7 +15,7 @@ import math
 from typing import Optional
 
 from app.models.floorplan import (
-    RoomType, Room, Apartment, FloorPlan, BuildingFloorPlans,
+    RoomType, Room, Apartment, ApartmentScores, FloorPlan, BuildingFloorPlans,
     DoorPlacement, WindowPlacement, Point2D,
 )
 from app.services.floorplan import goldbeck_constants as C
@@ -632,3 +632,131 @@ def evaluate_quality(
     breakdown["acoustic"] = score_acoustic_zoning(floor)
 
     return breakdown
+
+
+# ============================================================
+# PER-APARTMENT SCORES
+# ============================================================
+#
+# `evaluate_quality()` averages each criterion across the floor — fine for
+# the GA fitness loop. The UI's apartment inspector wants the same six
+# criteria evaluated for *one* apartment so the user can see why their
+# selected unit scores well or poorly. The first five reuse the
+# already-public per-apartment scorers above; acoustic is recomputed
+# locally because `score_acoustic_zoning` only exposes a floor-wide mean.
+
+
+def _score_apartment_acoustic(
+    apartment: Apartment,
+    floor: FloorPlan,
+) -> float:
+    """Acoustic zoning restricted to one apartment.
+
+    Mirrors `score_acoustic_zoning`'s two sub-criteria but evaluates only
+    the bedrooms in `apartment` (intra-apt bath distance + closest
+    staircase). Returns 0–10. When the apartment has no bedrooms (studio)
+    we return a neutral 7.0 — there's no one to disturb.
+    """
+    bedrooms = [
+        r for r in apartment.rooms
+        if r.room_type == RoomType.BEDROOM and len(r.polygon) >= 4
+    ]
+    if not bedrooms:
+        return 7.0
+
+    # A. Bedroom ↔ bathroom in same apartment.
+    baths = [
+        r for r in apartment.rooms
+        if r.room_type == RoomType.BATHROOM and len(r.polygon) >= 4
+    ]
+    intra_scores: list[float] = []
+    if baths:
+        bath_cs = [_room_centroid(b) for b in baths]
+        for bed in bedrooms:
+            bcx, bcy = _room_centroid(bed)
+            min_d = min(
+                math.sqrt((bcx - bx) ** 2 + (bcy - by) ** 2)
+                for bx, by in bath_cs
+            )
+            intra_scores.append(max(0.0, min(10.0, (min_d / 3.5) * 10.0)))
+    intra_avg = sum(intra_scores) / len(intra_scores) if intra_scores else 7.0
+
+    # B. Bedroom ↔ nearest staircase.
+    stair_scores: list[float] = []
+    if floor.staircases:
+        stair_centers = [
+            (s.position.x + s.width_m / 2, s.position.y + s.depth_m / 2)
+            for s in floor.staircases
+        ]
+        for bed in bedrooms:
+            bcx, bcy = _room_centroid(bed)
+            min_d = min(
+                math.sqrt((bcx - sx) ** 2 + (bcy - sy) ** 2)
+                for sx, sy in stair_centers
+            )
+            if min_d <= 2.5:
+                stair_scores.append(0.0)
+            elif min_d >= 6.0:
+                stair_scores.append(10.0)
+            else:
+                stair_scores.append((min_d - 2.5) / 3.5 * 10.0)
+    stair_avg = sum(stair_scores) / len(stair_scores) if stair_scores else 7.0
+
+    return round((intra_avg + stair_avg) / 2.0, 2)
+
+
+def compute_apartment_scores(
+    apartment: Apartment,
+    floor: FloorPlan,
+    building_depth_m: float,
+    building_rotation_deg: float = 0.0,
+) -> ApartmentScores:
+    """Compute the 6-criterion quality breakdown for a single apartment.
+
+    Returns scores in [0, 10]. `overall` is the unweighted mean.
+    """
+    connectivity = round(score_room_connectivity(apartment), 2)
+    furniture = round(score_furniture_feasibility(apartment), 2)
+    daylight = round(
+        score_daylight_quality(apartment, floor.windows, building_depth_m), 2,
+    )
+    kitchen_living = round(score_kitchen_living_relationship(apartment), 2)
+    orientation = round(
+        score_orientation(apartment, building_depth_m, building_rotation_deg), 2,
+    )
+    acoustic = _score_apartment_acoustic(apartment, floor)
+
+    overall = round(
+        (connectivity + furniture + daylight + kitchen_living + orientation + acoustic)
+        / 6.0,
+        2,
+    )
+
+    return ApartmentScores(
+        connectivity=connectivity,
+        furniture=furniture,
+        daylight=daylight,
+        kitchen_living=kitchen_living,
+        orientation=orientation,
+        acoustic=acoustic,
+        overall=overall,
+    )
+
+
+def attach_apartment_scores(
+    plans: BuildingFloorPlans,
+    building_rotation_deg: float = 0.0,
+) -> None:
+    """Mutate `plans` in place: every apartment on every floor gets `scores`.
+
+    Called once on the final layouts being shipped to the client. Cheap —
+    O(apartments × rooms) — and only runs after the GA has converged.
+    """
+    for floor in plans.floor_plans:
+        for apt in floor.apartments:
+            apt.scores = compute_apartment_scores(
+                apt,
+                floor,
+                building_depth_m=plans.building_depth_m,
+                building_rotation_deg=building_rotation_deg,
+            )

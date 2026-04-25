@@ -525,6 +525,18 @@ export interface FloorPlanBathroom {
   area_sqm: number;
 }
 
+export interface ApartmentScores {
+  /** Each criterion is in [0, 10]. */
+  connectivity: number;
+  furniture: number;
+  daylight: number;
+  kitchen_living: number;
+  orientation: number;
+  acoustic: number;
+  /** Unweighted mean of the six criteria. */
+  overall: number;
+}
+
 export interface FloorPlanApartment {
   id: string;
   apartment_type: string;
@@ -536,6 +548,8 @@ export interface FloorPlanApartment {
   bay_indices: number[];
   entrance_door_id: string;
   has_balcony: boolean;
+  /** Populated on the final layouts returned by the optimizer. */
+  scores?: ApartmentScores;
 }
 
 export interface FloorPlanStaircase {

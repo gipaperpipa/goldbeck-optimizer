@@ -53,6 +53,21 @@ def _run_floor_plans_for_layout(layout, request: OptimizationRequest, job_id: st
             optimizer = FloorPlanOptimizer()
             variants = optimizer.optimize(fp_request)
 
+            # Attach per-apartment quality scores to every variant so the
+            # workspace inspector can show the real 6-criterion breakdown.
+            from app.services.floorplan.quality_scoring import attach_apartment_scores
+            for variant in variants:
+                try:
+                    attach_apartment_scores(
+                        variant.building_floor_plans,
+                        building_rotation_deg=building.rotation_deg,
+                    )
+                except Exception:
+                    logger.debug(
+                        f"[Optimize] per-apt scoring failed for {building.id} rank {variant.rank}",
+                        exc_info=True,
+                    )
+
             result = BuildingFloorPlanResult(
                 building_id=building.id,
                 best_floor_plan=variants[0].building_floor_plans if variants else None,

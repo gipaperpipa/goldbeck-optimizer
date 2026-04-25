@@ -1,6 +1,10 @@
 "use client";
 
-import type { FloorPlanApartment, FloorPlanRoom } from "@/types/api";
+import type {
+  ApartmentScores,
+  FloorPlanApartment,
+  FloorPlanRoom,
+} from "@/types/api";
 
 const DIN_MIN_AREA: Record<string, number> = {
   living: 14.0,
@@ -121,13 +125,49 @@ function RoomRow({ room }: { room: FloorPlanRoom }) {
   );
 }
 
+/** Six per-apartment criteria from `quality_scoring.compute_apartment_scores`.
+ *  When the backend hasn't shipped scores (older job, fallback path) we
+ *  show placeholders derived from the apartment's orientation. */
+const CRITERIA: { key: keyof ApartmentScores; label: string }[] = [
+  { key: "daylight", label: "Belichtung" },
+  { key: "acoustic", label: "Akustik" },
+  { key: "connectivity", label: "Erschließung" },
+  { key: "furniture", label: "Möblierbarkeit" },
+  { key: "kitchen_living", label: "Wohn-/Kochzone" },
+  { key: "orientation", label: "Ausrichtung" },
+];
+
+function placeholderScores(south: boolean): ApartmentScores {
+  // Decorative fallback when the backend didn't attach real scores.
+  // Roughly mirrors what a typical layout produces so the panel doesn't
+  // look broken.
+  const base = {
+    connectivity: 7.5,
+    furniture: 8.6,
+    daylight: south ? 9.4 : 7.0,
+    kitchen_living: 8.9,
+    orientation: south ? 10.0 : 4.5,
+    acoustic: 8.6,
+  };
+  const overall =
+    (base.connectivity +
+      base.furniture +
+      base.daylight +
+      base.kitchen_living +
+      base.orientation +
+      base.acoustic) /
+    6;
+  return { ...base, overall: Math.round(overall * 100) / 100 };
+}
+
 export function RightInspector({
   apartment,
   qualityScore,
   floorLabel,
 }: {
   apartment: FloorPlanApartment | null;
-  /** 0..1 if available; falls back to a stub when null. */
+  /** Layout-level livability score, 0..1. Used only when an apartment has
+   *  no `scores` field of its own. */
   qualityScore?: number | null;
   floorLabel: string;
 }) {
@@ -172,7 +212,13 @@ export function RightInspector({
 
   const south = isSouth(apartment.side);
   const orientationLabel = south ? "Südausrichtung" : "Nordausrichtung";
-  const quality = qualityScore ?? 0.85;
+  const realScores = apartment.scores ?? null;
+  const scores = realScores ?? placeholderScores(south);
+  // Big-number quality: prefer per-apt overall (0..10 → 0..1), else
+  // fall back to the layout livability score.
+  const quality = realScores
+    ? realScores.overall / 10
+    : (qualityScore ?? scores.overall / 10);
 
   // Sort rooms in a sensible inspector order.
   const roomOrder = [
@@ -368,30 +414,41 @@ export function RightInspector({
           }}
         >
           <div
-            className="ws-mono"
             style={{
-              fontSize: 11,
-              color: "var(--ws-ink-mid)",
-              letterSpacing: "0.12em",
-              textTransform: "uppercase",
-              fontWeight: 500,
+              display: "flex",
+              alignItems: "baseline",
+              justifyContent: "space-between",
               marginBottom: 10,
             }}
           >
-            Bewertung · 17 Kriterien
+            <div
+              className="ws-mono"
+              style={{
+                fontSize: 11,
+                color: "var(--ws-ink-mid)",
+                letterSpacing: "0.12em",
+                textTransform: "uppercase",
+                fontWeight: 500,
+              }}
+            >
+              Bewertung · 6 Kriterien
+            </div>
+            {!realScores && (
+              <span
+                className="ws-mono"
+                style={{ fontSize: 9, color: "var(--ws-ink-dim)" }}
+                title="Backend-Scores fehlen — Schätzwerte angezeigt."
+              >
+                Schätzung
+              </span>
+            )}
           </div>
-          {[
-            ["Belichtung", south ? 0.94 : 0.7],
-            ["Akustik", 0.86],
-            ["Proportionen", 0.89],
-            ["Erschließung", 0.95],
-            ["Flurbreite", 1.0],
-            ["Südausrichtung", south ? 1.0 : 0.45],
-          ].map(([k, v]) => {
-            const value = v as number;
+          {CRITERIA.map(({ key, label }) => {
+            const raw = scores[key]; // 0..10
+            const value = Math.max(0, Math.min(1, raw / 10));
             return (
               <div
-                key={k as string}
+                key={key}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -400,7 +457,7 @@ export function RightInspector({
                 }}
               >
                 <span style={{ flex: 1, fontSize: 12, color: "var(--ws-ink-mid)" }}>
-                  {k}
+                  {label}
                 </span>
                 <div
                   style={{
@@ -431,11 +488,28 @@ export function RightInspector({
                     color: "var(--ws-ink-mid)",
                   }}
                 >
-                  {value.toFixed(2)}
+                  {raw.toFixed(2)}
                 </span>
               </div>
             );
           })}
+          <div
+            className="ws-mono"
+            style={{
+              marginTop: 10,
+              paddingTop: 8,
+              borderTop: "1px solid var(--ws-line)",
+              display: "flex",
+              justifyContent: "space-between",
+              fontSize: 11,
+              color: "var(--ws-ink-mid)",
+            }}
+          >
+            <span>Gesamt</span>
+            <span style={{ fontWeight: 500, color: "var(--ws-ink)" }}>
+              {scores.overall.toFixed(2)} / 10.00
+            </span>
+          </div>
         </div>
       </div>
     </aside>

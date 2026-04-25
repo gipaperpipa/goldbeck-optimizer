@@ -141,6 +141,22 @@ class BathroomUnit(BaseModel):
     area_sqm: float
 
 
+class ApartmentScores(BaseModel):
+    """Per-apartment quality scores from `quality_scoring.compute_apartment_scores`.
+
+    Each criterion is in [0, 10]. `overall` is the unweighted mean. Attached
+    to apartments only on the final layouts returned to the client — the GA
+    fitness loop computes scores in aggregate and doesn't need them per-apt.
+    """
+    connectivity: float         # Adjacency graph: living↔kitchen, hall↔bathroom, …
+    furniture: float            # DIN 18011 fit feasibility per room
+    daylight: float             # Window area + sill rules per habitable room
+    kitchen_living: float       # Wohnküche / shared-edge bonus
+    orientation: float          # Compass match: living south, bedroom east/north
+    acoustic: float             # Bedroom-bath + bedroom-staircase isolation
+    overall: float              # Mean of the six criteria
+
+
 class Apartment(BaseModel):
     id: str
     apartment_type: ApartmentType
@@ -152,6 +168,7 @@ class Apartment(BaseModel):
     bay_indices: list[int]      # which structural bays this apartment spans
     entrance_door_id: str
     has_balcony: bool = True
+    scores: Optional[ApartmentScores] = None  # populated on final layouts
 
 
 class StaircaseUnit(BaseModel):

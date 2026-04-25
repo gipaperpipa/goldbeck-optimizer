@@ -101,11 +101,19 @@ def _run_generation(job_id: str, request: FloorPlanRequest):
 
         # Run validation on all variants
         from app.services.floorplan.validation import validate_building_dict
+        from app.services.floorplan.quality_scoring import attach_apartment_scores
         for variant in variants:
             try:
                 variant.validation = validate_building_dict(variant.building_floor_plans)
             except Exception:
                 logger.warning(f"[FloorPlan] Job {job_id[:8]}: validation failed for rank {variant.rank}", exc_info=True)
+            try:
+                attach_apartment_scores(
+                    variant.building_floor_plans,
+                    building_rotation_deg=request.rotation_deg,
+                )
+            except Exception:
+                logger.warning(f"[FloorPlan] Job {job_id[:8]}: per-apt scoring failed for rank {variant.rank}", exc_info=True)
 
         # Build completion state atomically
         best_variant = variants[0] if variants else None
