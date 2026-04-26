@@ -516,11 +516,19 @@ class LayoutOptimizer:
             overflow = envelope.difference(plot_polygon).area
         except Exception:
             overflow = 0.0
-        ratio = max(0.0, 1.0 - overflow / max(envelope.area, 0.01))
-        if ratio < 0.7:
+        overflow_pct = overflow / max(envelope.area, 0.01)
+        # Phase 8.6.2 — tightened from 30 % overflow → reject down to
+        # 5 %. The user's expectation is "Abstandsflächen must not go
+        # over the plot boundary", so we want a hard hand-off as soon
+        # as the GA's gradient has done its job. < 5 % is rotation /
+        # rounding noise that disappears once the building snaps to a
+        # valid position.
+        if overflow_pct > 0.05:
             self._track_fail(fail_tag)
             return 0.0
-        return ratio ** 2
+        # Steeper penalty too — squared term punishes any visible
+        # overflow harder than before.
+        return max(0.0, 1.0 - overflow_pct * 8.0) ** 2
 
     @staticmethod
     def _genotype_distance(a: Chromosome, b: Chromosome) -> float:
@@ -571,21 +579,19 @@ class LayoutOptimizer:
             width = min_dim + gene.width * (max_dim_w - min_dim)
             depth = min_dim + gene.depth * (max_dim_d - min_dim)
             rotation = gene.rotation * 45.0 - 22.5  # -22.5 to +22.5 degrees
-            raw_stories = max(1, int(gene.stories * request.regulations.max_stories) + 1)
-            raw_stories = min(raw_stories, request.regulations.max_stories)
+            stories = max(1, int(gene.stories * request.regulations.max_stories) + 1)
+            stories = min(stories, request.regulations.max_stories)
 
-            # Phase 8.6 fix: SG counts toward the total story budget.
-            # When SG is enabled we reserve one storey for it so the
-            # §6 envelope (which grows with TOTAL height) doesn't get
-            # systematically pushed past the plot edge. Without this
-            # adjustment SG layouts always lost the §6 ⊂ plot test.
-            has_staffel_raw = gene.has_staffel >= 0.5
-            if has_staffel_raw and raw_stories >= 2:
-                stories = raw_stories - 1
-                has_staffel = True
-            else:
-                stories = raw_stories
-                has_staffel = False
+            # Phase 8.6.2 — SG is a *bonus* floor on top of the
+            # full story count. BauNVO doesn't count it as a
+            # Vollgeschoss when its footprint is < 75 % of the
+            # floor below (our 2 m symmetric setback satisfies that),
+            # so it adds one effective floor of NFA without consuming
+            # a slot in max_stories. The SG envelope is checked
+            # separately in `_evaluate`'s §6 block — the inset cancels
+            # most of the extra ground projection, so it doesn't
+            # tighten the plot fit.
+            has_staffel = bool(gene.has_staffel >= 0.5)
 
             buildings.append({
                 "x": x, "y": y,

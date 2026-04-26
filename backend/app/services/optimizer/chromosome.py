@@ -37,24 +37,22 @@ def decode_gene(
 ) -> dict:
     """Decode a gene into actual building parameters.
 
-    Phase 8.6 fix: when the SG flag is on we treat the chromosome's
-    `stories` value as the *total* story budget and reserve one for
-    the SG. The lower-storey count therefore becomes ``stories − 1``
-    and `has_staffel` only takes effect when the total budget is
-    ≥ 2 (a 1-storey building can't have an SG above zero floors).
-
-    Without this adjustment the §6 envelope grew by H_total (lower
-    + SG) while the buildable area stayed the same, so SG layouts
-    were systematically rejected by the §6 ⊂ plot constraint.
+    Phase 8.6.2 — Staffelgeschoss is a *bonus* floor on top of the
+    chromosome's full story count. BauNVO doesn't count an SG as a
+    Vollgeschoss when its footprint is less than 75 % of the floor
+    below it (and our 2 m symmetric setback keeps it well under
+    that threshold for typical Goldbeck dimensions). So SG always
+    adds one effective floor of NFA without consuming a slot in
+    `max_stories`. § 6 stays valid because the SG facade is inset
+    by `setback_m` while its height grows by one storey — at the
+    standard Goldbeck setback the inset cancels the extra ground
+    projection (Δd ≈ 1.22 m vs setback 2 m), so the SG envelope
+    sits *inside* the lower envelope and doesn't tighten the plot
+    fit.
     """
     min_x, min_y, max_x, max_y = bounds
-    raw_stories = max(1, min(max_stories, int(gene.stories * max_stories) + 1))
-    has_staffel = gene.has_staffel >= 0.5
-    if has_staffel and raw_stories >= 2:
-        stories = raw_stories - 1
-    else:
-        stories = raw_stories
-        has_staffel = False
+    stories = max(1, min(max_stories, int(gene.stories * max_stories) + 1))
+    has_staffel = bool(gene.has_staffel >= 0.5)
     return {
         "x": min_x + gene.x * (max_x - min_x),
         "y": min_y + gene.y * (max_y - min_y),
