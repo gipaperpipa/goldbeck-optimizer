@@ -567,10 +567,11 @@ class LayoutOptimizer:
             stories = max(1, int(gene.stories * request.regulations.max_stories) + 1)
             stories = min(stories, request.regulations.max_stories)
 
-            # Phase 8.5: SG decision — only meaningful for ≥3-storey
-            # buildings. The chromosome flag drives it; we clamp here so
-            # the §6 envelope check + downstream FP request agree.
-            has_staffel = bool(gene.has_staffel >= 0.5 and stories >= 3)
+            # Phase 8.5/8.6: SG decision driven purely by the chromosome.
+            # Allowed at any story count (Goldbeck builds 1+SG / 2+SG /
+            # 3+SG / 4+SG combinations) — the GA picks when it yields
+            # more Wohnfläche inside the §6 envelope.
+            has_staffel = bool(gene.has_staffel >= 0.5 and stories >= 1)
 
             buildings.append({
                 "x": x, "y": y,
@@ -634,16 +635,23 @@ class LayoutOptimizer:
             # Dimensions are already in meters (geometry engine works in meters)
             width_m = b["width"]
             depth_m = b["depth"]
+            has_staffel = bool(b.get("has_staffel"))
+            sg_setback = 2.0
+            # GFA: full-footprint floors + (if SG) one extra floor with
+            # the symmetric setback footprint. This matches what the
+            # FP generator and 3D viewer will actually build.
             gfa_sqm = poly.area * b["stories"]
+            if has_staffel:
+                sg_w = max(width_m - 2 * sg_setback, 1.0)
+                sg_d = max(depth_m - 2 * sg_setback, 1.0)
+                gfa_sqm += sg_w * sg_d
             nfa_sqm = gfa_sqm * 0.85
             unit_mix = self._generate_unit_mix(nfa_sqm, pref, regs)
 
-            has_staffel = bool(b.get("has_staffel"))
             # SG adds one extra storey at reduced footprint. We bake the
             # extra storey into total_height_m so downstream consumers
             # (thermal envelope, IFC exporter, viewer) see the real
             # building height.
-            sg_setback = 2.0
             extra_stories = 1 if has_staffel else 0
             building_footprints.append(BuildingFootprint(
                 id=f"bldg-{i+1}",

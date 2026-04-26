@@ -3,8 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import MapboxDraw from "@mapbox/mapbox-gl-draw";
+import MapboxGeocoder from "@mapbox/mapbox-gl-geocoder";
 import "mapbox-gl/dist/mapbox-gl.css";
 import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
+import "@mapbox/mapbox-gl-geocoder/dist/mapbox-gl-geocoder.css";
 import type { CoordinatePoint } from "@/types/api";
 
 interface MapContainerProps {
@@ -42,6 +44,21 @@ export function MapContainer({ onPolygonDrawn, center = [-104.9903, 39.7392] }: 
       defaultMode: "draw_polygon",
     });
 
+    // Geocoder search box — biased toward Germany so address lookups
+    // resolve to the actual parcel without needing the user to zoom
+    // around the globe first.
+    const geocoder = new MapboxGeocoder({
+      accessToken: token,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mapboxgl: mapboxgl as any,
+      marker: false,
+      placeholder: "Adresse oder Ort suchen…",
+      countries: "de,at,ch",
+      language: "de",
+      flyTo: { zoom: 18, speed: 1.6 },
+    });
+
+    map.addControl(geocoder, "top-left");
     map.addControl(draw, "top-right");
     map.addControl(new mapboxgl.NavigationControl(), "bottom-right");
 
@@ -103,7 +120,8 @@ export function MapContainer({ onPolygonDrawn, center = [-104.9903, 39.7392] }: 
         </div>
       )}
       <p className="text-xs text-neutral-500 mt-2">
-        Use the polygon tool (top-right) to draw your plot boundary on the map
+        Adresse links oben suchen, dann mit dem Polygon-Werkzeug (oben rechts)
+        die Grundstücksgrenze einzeichnen.
       </p>
     </div>
   );

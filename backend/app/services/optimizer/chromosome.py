@@ -10,12 +10,11 @@ class Gene:
     depth: float   # building depth (normalized)
     rotation: float  # rotation (normalized, maps to -22.5 to +22.5 deg)
     stories: float   # number of stories (normalized, maps to 1..max_stories)
-    # Phase 8.5: Staffelgeschoss flag. > 0.5 → SG enabled, but only when
-    # the decoded `stories` is at least 3 (a single-storey building can't
-    # have a setback top and a 2-storey SG provides almost no usable
-    # area). Letting the GA select between SG / no-SG lets the layout
-    # optimizer use SG to fit a taller building inside a tighter §6
-    # envelope.
+    # Phase 8.5/8.6: Staffelgeschoss flag. > 0.5 → SG enabled.
+    # Allowed at any story count ≥ 1 — Goldbeck routinely builds
+    # 1-storey + SG (Bungalow + Penthouse) and 2-storey + SG. The GA
+    # picks SG when it gives more Wohnfläche while still fitting the §6
+    # envelope inside the parcel.
     has_staffel: float = 0.0
 
 
@@ -39,7 +38,7 @@ def decode_gene(
     """Decode a gene into actual building parameters."""
     min_x, min_y, max_x, max_y = bounds
     stories = max(1, min(max_stories, int(gene.stories * max_stories) + 1))
-    has_staffel = bool(gene.has_staffel >= 0.5 and stories >= 3)
+    has_staffel = bool(gene.has_staffel >= 0.5 and stories >= 1)
     return {
         "x": min_x + gene.x * (max_x - min_x),
         "y": min_y + gene.y * (max_y - min_y),

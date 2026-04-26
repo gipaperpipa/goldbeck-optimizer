@@ -533,32 +533,65 @@ function SimpleBuildingFallback({
     "#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6",
     "#ec4899", "#06b6d4", "#f97316",
   ];
+  void showLabel;
   const color = BUILDING_COLORS[index % BUILDING_COLORS.length];
   const rotationRad = (building.rotation_deg * Math.PI) / 180;
   const floorHeight = building.floor_height_m || 2.9;
 
-  // Determine visible stories based on section box
-  const totalStories = building.stories || 1;
-  const visibleStories = sectionBoxY !== null && sectionBoxY !== undefined
+  // Phase 8.6 — render the SG step-back even before floor plans are
+  // generated. The layout-side decision (`building.has_staffelgeschoss`)
+  // and `staffelgeschoss_setback_m` together describe the stepped
+  // volume; we render two stacked boxes when SG is active so the user
+  // sees the real building shape directly from the layout output.
+  const hasSg = building.has_staffelgeschoss === true;
+  const sgSetback = building.staffelgeschoss_setback_m ?? 2.0;
+  const lowerStories = building.stories;
+  const sgStories = hasSg ? 1 : 0;
+  const totalStories = lowerStories + sgStories;
+  if (totalStories <= 0) return null;
+
+  // Section-box clipping — count from the ground up.
+  const visibleTotal = sectionBoxY !== null && sectionBoxY !== undefined
     ? Math.min(totalStories, Math.floor(sectionBoxY / floorHeight))
     : totalStories;
-  const clippedHeight = visibleStories * floorHeight;
+  if (visibleTotal <= 0) return null;
+  const visibleLower = Math.min(visibleTotal, lowerStories);
+  const visibleSg = Math.max(0, visibleTotal - lowerStories);
 
-  if (visibleStories <= 0) return null;
+  const lowerH = visibleLower * floorHeight;
+  const sgH = visibleSg * floorHeight;
+  const sgW = Math.max(building.width_m - 2 * sgSetback, 1.0);
+  const sgD = Math.max(building.depth_m - 2 * sgSetback, 1.0);
 
   return (
     <group
-      position={[building.position_x, clippedHeight / 2, -building.position_y]}
+      position={[building.position_x, 0, -building.position_y]}
       rotation={[0, rotationRad, 0]}
     >
-      <mesh castShadow receiveShadow>
-        <boxGeometry args={[building.width_m, clippedHeight, building.depth_m]} />
-        <meshStandardMaterial color={color} transparent opacity={0.75} roughness={0.7} metalness={0.1} />
-      </mesh>
-      <lineSegments>
-        <edgesGeometry args={[new THREE.BoxGeometry(building.width_m, clippedHeight, building.depth_m)]} />
-        <lineBasicMaterial color="#1e293b" linewidth={1} />
-      </lineSegments>
+      {visibleLower > 0 && (
+        <group position={[0, lowerH / 2, 0]}>
+          <mesh castShadow receiveShadow>
+            <boxGeometry args={[building.width_m, lowerH, building.depth_m]} />
+            <meshStandardMaterial color={color} transparent opacity={0.75} roughness={0.7} metalness={0.1} />
+          </mesh>
+          <lineSegments>
+            <edgesGeometry args={[new THREE.BoxGeometry(building.width_m, lowerH, building.depth_m)]} />
+            <lineBasicMaterial color="#1e293b" linewidth={1} />
+          </lineSegments>
+        </group>
+      )}
+      {visibleSg > 0 && sgH > 0 && (
+        <group position={[0, lowerH + sgH / 2, 0]}>
+          <mesh castShadow receiveShadow>
+            <boxGeometry args={[sgW, sgH, sgD]} />
+            <meshStandardMaterial color={color} transparent opacity={0.6} roughness={0.7} metalness={0.1} />
+          </mesh>
+          <lineSegments>
+            <edgesGeometry args={[new THREE.BoxGeometry(sgW, sgH, sgD)]} />
+            <lineBasicMaterial color="#1e293b" linewidth={1} />
+          </lineSegments>
+        </group>
+      )}
     </group>
   );
 }

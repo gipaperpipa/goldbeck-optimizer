@@ -9,7 +9,7 @@ import { SunLight } from "./sun-light";
 import { SectionBoxControls } from "./section-box";
 import { Button } from "@/components/ui/button";
 import { Download } from "lucide-react";
-import type { LayoutOption, PlotAnalysis, BuildingFloorPlans } from "@/types/api";
+import type { LayoutOption, PlotAnalysis, BuildingFloorPlans, BuildingFootprint } from "@/types/api";
 import { API_BASE } from "@/lib/api-client";
 import { estimateCost } from "@/lib/cost-estimator";
 import { estimateThermal } from "@/lib/thermal-envelope";
@@ -54,7 +54,7 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   const [sectionY, setSectionY] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  // Phase 8c: §6 Abstandsflächen overlay
+  // Phase 8c / 8.6: §6 Abstandsflächen overlay + breakdown panel
   const [showAbstand, setShowAbstand] = useState(false);
 
   const handleExportIfc = useCallback(async (buildingId: string) => {
@@ -183,6 +183,13 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
           ) : null
         )}
       </div>
+
+      {/* Phase 8.6 — §6 breakdown panel. Lists each building face with
+          the formula and depth so the user can see exactly how the
+          rendered envelope was computed. */}
+      {showAbstand && layout.buildings.length > 0 && (
+        <AbstandsflaechenBreakdownPanel buildings={layout.buildings} />
+      )}
 
       {/* Export status toast */}
       {exportStatus && (
@@ -335,62 +342,121 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
 
 const SLAB_COLOR = "#c4b5a3";
 
-// ── Phase 8c: §6 Abstandsflächen ground projection ───────────────────
+// ── Phase 8c / 8.6: §6 Abstandsflächen ground projection ─────────────
 //
 // One translucent amber slab per facade, depth = max(0.4·H, 3 m). Each
 // slab is built in the building's local frame (so it rotates with the
 // building) and lifted slightly off the ground (y = 0.02) so it draws
 // above the ground plane but below building walls.
+//
+// Phase 8.6 extension: when the building has a Staffelgeschoss the
+// SG facade sits inset by `staffelgeschoss_setback_m` and uses the
+// FULL building height — its §6 envelope is rendered as a second,
+// slightly more saturated layer so the user can see both the lower
+// and SG offsets.
 function AbstandsflaechenLayer3D({
   building,
   hCoeff = 0.4,
 }: {
-  building: { width_m: number; depth_m: number; total_height_m: number;
-    position_x: number; position_y: number; rotation_deg: number };
+  building: BuildingFootprint;
   hCoeff?: number;
 }) {
-  const depth = Math.max(hCoeff * building.total_height_m, 3.0);
-  const halfW = building.width_m / 2;
-  const halfD = building.depth_m / 2;
+  const lowerH = building.stories * (building.floor_height_m || 3.05);
+  const lowerDepth = Math.max(hCoeff * lowerH, 3.0);
   const rotationRad = (building.rotation_deg * Math.PI) / 180;
+  const hasSg = building.has_staffelgeschoss === true;
+  const sgSetback = building.staffelgeschoss_setback_m ?? 2.0;
+  const totalH = building.total_height_m;
+  const sgDepth = Math.max(hCoeff * totalH, 3.0);
+  const sgW = Math.max(building.width_m - 2 * sgSetback, 1.0);
+  const sgD = Math.max(building.depth_m - 2 * sgSetback, 1.0);
 
-  // Each rectangle is positioned in the building's local frame (origin
-  // at building centre, +x along width, +z along depth — note Three.js
-  // uses y-up so the plan's y axis maps to z). The mesh's local rotation
-  // lays it flat (face up).
-  const faces = [
-    // South facade (-z side)
-    { lx: 0, lz: -halfD - depth / 2, w: building.width_m + 2 * depth, d: depth },
-    // North facade (+z side)
-    { lx: 0, lz:  halfD + depth / 2, w: building.width_m + 2 * depth, d: depth },
-    // West facade (-x side)
-    { lx: -halfW - depth / 2, lz: 0, w: depth, d: building.depth_m },
-    // East facade (+x side)
-    { lx:  halfW + depth / 2, lz: 0, w: depth, d: building.depth_m },
-  ];
+  const lowerFaces = abstandsfaces(building.width_m, building.depth_m, lowerDepth);
+  const sgFaces = hasSg ? abstandsfaces(sgW, sgD, sgDepth) : [];
 
   return (
     <group
       position={[building.position_x, 0.02, -building.position_y]}
       rotation={[0, rotationRad, 0]}
     >
-      {faces.map((f, i) => (
-        <mesh
-          key={i}
-          position={[f.lx, 0, f.lz]}
-          rotation={[-Math.PI / 2, 0, 0]}
-        >
+      {lowerFaces.map((f, i) => (
+        <mesh key={`lo-${i}`} position={[f.lx, 0, f.lz]} rotation={[-Math.PI / 2, 0, 0]}>
           <planeGeometry args={[f.w, f.d]} />
-          <meshBasicMaterial
-            color="#f59e0b"
-            transparent
-            opacity={0.18}
-            depthWrite={false}
-            polygonOffset
-            polygonOffsetFactor={-1}
-          />
+          <meshBasicMaterial color="#f59e0b" transparent opacity={0.18}
+            depthWrite={false} polygonOffset polygonOffsetFactor={-1} />
+        </mesh>
+      ))}
+      {sgFaces.map((f, i) => (
+        <mesh key={`sg-${i}`} position={[f.lx, 0.04, f.lz]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[f.w, f.d]} />
+          <meshBasicMaterial color="#d97706" transparent opacity={0.22}
+            depthWrite={false} polygonOffset polygonOffsetFactor={-2} />
         </mesh>
       ))}
     </group>
+  );
+}
+
+// Compute the four facade rectangles in the building's local frame for
+// a given footprint width/depth and offset depth. Each rect is laid
+// flat on the ground (handled by caller's rotation).
+function abstandsfaces(width_m: number, depth_m: number, offset: number) {
+  const halfW = width_m / 2;
+  const halfD = depth_m / 2;
+  return [
+    { lx: 0, lz: -halfD - offset / 2, w: width_m + 2 * offset, d: offset },
+    { lx: 0, lz:  halfD + offset / 2, w: width_m + 2 * offset, d: offset },
+    { lx: -halfW - offset / 2, lz: 0, w: offset, d: depth_m },
+    { lx:  halfW + offset / 2, lz: 0, w: offset, d: depth_m },
+  ];
+}
+
+// Phase 8.6 — §6 calculation breakdown panel. Shows H, formula and
+// resulting offset for each building's lower and (if applicable) SG
+// envelopes. Uses the same hCoeff (0.4) the renderer uses so what the
+// user sees in 3D matches the numbers in the panel.
+function AbstandsflaechenBreakdownPanel({
+  buildings,
+  hCoeff = 0.4,
+}: {
+  buildings: BuildingFootprint[];
+  hCoeff?: number;
+}) {
+  return (
+    <div className="absolute top-3 right-3 z-10 mt-32 max-w-xs bg-white/95 border border-amber-200 rounded-md shadow-md p-3 text-xs leading-tight">
+      <div className="font-semibold text-amber-900 mb-1">§6 Abstandsflächen</div>
+      <div className="text-[10px] text-neutral-500 mb-2">
+        BauO NRW · d = max({hCoeff} · H, 3 m)
+      </div>
+      <div className="space-y-2 max-h-64 overflow-auto pr-1">
+        {buildings.map((b) => {
+          const lowerH = b.stories * (b.floor_height_m || 3.05);
+          const lowerD = Math.max(hCoeff * lowerH, 3);
+          const totalH = b.total_height_m;
+          const sgD = b.has_staffelgeschoss
+            ? Math.max(hCoeff * totalH, 3)
+            : null;
+          return (
+            <div key={b.id} className="border-t pt-2 first:border-0 first:pt-0">
+              <div className="font-medium text-neutral-800">{b.id}</div>
+              <div className="text-neutral-600">
+                Vollgeschosse · H = {lowerH.toFixed(2)} m →{" "}
+                <span className="font-mono">d = {lowerD.toFixed(2)} m</span>
+              </div>
+              {b.has_staffelgeschoss && sgD !== null && (
+                <div className="text-neutral-600">
+                  + Staffelgeschoss · H<sub>tot</sub> = {totalH.toFixed(2)} m
+                  · Setback {(b.staffelgeschoss_setback_m ?? 2).toFixed(1)} m →{" "}
+                  <span className="font-mono">d<sub>SG</sub> = {sgD.toFixed(2)} m</span>
+                </div>
+              )}
+              <div className="text-[10px] text-neutral-500 mt-0.5">
+                Footprint {b.width_m.toFixed(1)} × {b.depth_m.toFixed(1)} m
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }

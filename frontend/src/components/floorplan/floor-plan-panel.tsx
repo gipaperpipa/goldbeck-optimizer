@@ -67,7 +67,6 @@ export function FloorPlanPanel() {
   const [generations, setGenerations] = useState(50);
   const [populationSize, setPopulationSize] = useState(20);
   const [useAiGeneration, setUseAiGeneration] = useState(false);
-  const [enableStaffelgeschoss, setEnableStaffelgeschoss] = useState(false);
   const [weights, setWeights] = useState<FloorPlanWeights>({
     efficiency: 0.25,
     livability: 0.25,
@@ -149,7 +148,11 @@ export function FloorPlanPanel() {
     setSelectedApt(null);
     setSelectedFloorIndex(0);
     setSelectedVariantIndex(0);
-    generate(currentBuilding, storyHeight, generations, populationSize, weights, useAiGeneration, enableStaffelgeschoss);
+    // Phase 8.6: Staffelgeschoss is decided by the layout optimizer.
+    // The standalone FP panel inherits whatever the layout decided
+    // for this building (or false when generating outside a layout).
+    const enableSg = currentBuilding.has_staffelgeschoss ?? false;
+    generate(currentBuilding, storyHeight, generations, populationSize, weights, useAiGeneration, enableSg);
   };
 
   const handleVariantSelect = (index: number) => {
@@ -268,21 +271,14 @@ export function FloorPlanPanel() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <label className="flex items-center gap-2 px-3 py-1.5 rounded border border-sky-200 bg-sky-50 hover:bg-sky-100 transition-colors cursor-pointer" style={{ opacity: isLoading ? 0.5 : 1, pointerEvents: isLoading ? "none" : "auto" }}>
-              <input
-                type="checkbox"
-                checked={enableStaffelgeschoss}
-                onChange={(e) => setEnableStaffelgeschoss(e.target.checked)}
-                disabled={isLoading}
-                className="w-4 h-4 rounded"
-              />
-              <span className="text-xs font-medium text-sky-900">Staffelgeschoss</span>
-            </label>
-            {enableStaffelgeschoss && (
-              <span className="text-[10px] text-sky-700">Top floor setback (2m) — not counted as Vollgeschoss</span>
-            )}
-          </div>
+          {currentBuilding?.has_staffelgeschoss && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded border border-sky-200 bg-sky-50 text-xs text-sky-900">
+              <span className="font-medium">Staffelgeschoss</span>
+              <span className="text-[10px] text-sky-700">
+                aktiv · vom Layout-Optimizer gewählt (Setback {currentBuilding.staffelgeschoss_setback_m?.toFixed(1) ?? "2.0"} m)
+              </span>
+            </div>
+          )}
 
           <div className="flex items-center gap-4 text-xs text-neutral-500">
             <div className="flex items-center gap-1">
