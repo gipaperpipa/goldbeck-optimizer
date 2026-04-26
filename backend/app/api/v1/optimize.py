@@ -34,11 +34,23 @@ def _run_floor_plans_for_layout(layout, request: OptimizationRequest, job_id: st
             total_generations=total_buildings,
         )
 
+        # Phase 8.6.3 — contract reconciliation between layout and FP
+        # generators:
+        #   • Layout side: BuildingFootprint.stories = LOWER count
+        #     (full storeys); SG is a +1 bonus on top when
+        #     has_staffelgeschoss is true.
+        #   • FP generator side: FloorPlanRequest.stories = TOTAL
+        #     storey count, and `enable_staffelgeschoss` shifts the
+        #     last storey to a setback SG (so num_regular = stories−1
+        #     when SG is on).
+        # We translate by passing stories = lower + (1 if SG) so the
+        # FP generator emits the right floor count.
+        fp_total_stories = building.stories + (1 if building.has_staffelgeschoss else 0)
         fp_request = FloorPlanRequest(
             building_id=building.id,
             building_width_m=building.width_m,
             building_depth_m=building.depth_m,
-            stories=building.stories,
+            stories=fp_total_stories,
             rotation_deg=building.rotation_deg,
             unit_mix=building.unit_mix.model_dump() if building.unit_mix else None,
             construction_system="goldbeck",
@@ -47,9 +59,6 @@ def _run_floor_plans_for_layout(layout, request: OptimizationRequest, job_id: st
             generations=fps.generations,
             population_size=fps.population_size,
             weights=fps.weights,
-            # Phase 8.5: Staffelgeschoss is now decided by the layout
-            # optimizer (with §6 awareness); the FP generator just
-            # builds inside the envelope it was handed.
             enable_staffelgeschoss=building.has_staffelgeschoss,
             staffelgeschoss_setback_m=building.staffelgeschoss_setback_m,
         )
