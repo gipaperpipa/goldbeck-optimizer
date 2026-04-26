@@ -278,7 +278,6 @@ interface BuildingDetailedProps {
   floorPlans: BuildingFloorPlans | undefined;
   index: number;
   showLabel?: boolean;
-  sectionBoxY?: number | null; // Y-level to clip at (null = no clip)
 }
 
 export function BuildingDetailed({
@@ -286,8 +285,12 @@ export function BuildingDetailed({
   floorPlans,
   index,
   showLabel = true,
-  sectionBoxY = null,
 }: BuildingDetailedProps) {
+  // Phase 11a — section clipping is now applied globally to the
+  // WebGL renderer (`gl.clippingPlanes` set in Scene3D), so we no
+  // longer need to filter floors out at the React level. Every
+  // floor is always rendered; the renderer slices them at the box
+  // boundary.
   const rotationRad = (building.rotation_deg * Math.PI) / 180;
 
   const hasPlans = !!(floorPlans && floorPlans.floor_plans.length);
@@ -326,18 +329,12 @@ export function BuildingDetailed({
     return best;
   };
 
-  // Determine which floors to show based on section box
-  const visibleFloors = useMemo(() => {
-    if (sectionBoxY === null) return plans;
-    return plans.filter((fp) => {
-      const floorTop = (fp.floor_index + 1) * storyHeight;
-      return floorTop <= sectionBoxY;
-    });
-  }, [plans, sectionBoxY, storyHeight]);
+  // Render every floor — global section clipping handles cut-off.
+  const visibleFloors = plans;
 
   // If no floor plans, fall back to simple box
   if (!hasPlans) {
-    return <SimpleBuildingFallback building={building} index={index} showLabel={showLabel} sectionBoxY={sectionBoxY} />;
+    return <SimpleBuildingFallback building={building} index={index} showLabel={showLabel} />;
   }
 
   return (
@@ -476,8 +473,9 @@ export function BuildingDetailed({
 
       {/* Roof slab — sized to the topmost floor's footprint, not the building's
           overall extent. Otherwise a Staffelgeschoss gets an overhang the size
-          of the floors below it. */}
-      {sectionBoxY === null && (() => {
+          of the floors below it. Always rendered now; section clipping is
+          applied globally and slices the slab at the box boundary if needed. */}
+      {(() => {
         const topFloor = plans
           .slice()
           .sort((a, b) => b.floor_index - a.floor_index)[0];
@@ -517,17 +515,17 @@ export function BuildingDetailed({
 }
 
 // ─── Fallback: simple box when no floor plan data available ──────────
-// Renders per-floor boxes so section box clipping works for simple buildings too.
+// Renders the lower volume + SG step-back when applicable. Section
+// box clipping is applied globally on the renderer (Phase 11a), so we
+// don't filter floors here.
 function SimpleBuildingFallback({
   building,
   index,
   showLabel,
-  sectionBoxY,
 }: {
   building: BuildingFootprint;
   index: number;
   showLabel: boolean;
-  sectionBoxY?: number | null;
 }) {
   const BUILDING_COLORS = [
     "#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6",
@@ -546,20 +544,10 @@ function SimpleBuildingFallback({
   const hasSg = building.has_staffelgeschoss === true;
   const sgSetback = building.staffelgeschoss_setback_m ?? 2.0;
   const lowerStories = building.stories;
-  const sgStories = hasSg ? 1 : 0;
-  const totalStories = lowerStories + sgStories;
-  if (totalStories <= 0) return null;
+  if (lowerStories <= 0) return null;
 
-  // Section-box clipping — count from the ground up.
-  const visibleTotal = sectionBoxY !== null && sectionBoxY !== undefined
-    ? Math.min(totalStories, Math.floor(sectionBoxY / floorHeight))
-    : totalStories;
-  if (visibleTotal <= 0) return null;
-  const visibleLower = Math.min(visibleTotal, lowerStories);
-  const visibleSg = Math.max(0, visibleTotal - lowerStories);
-
-  const lowerH = visibleLower * floorHeight;
-  const sgH = visibleSg * floorHeight;
+  const lowerH = lowerStories * floorHeight;
+  const sgH = hasSg ? floorHeight : 0;
   const sgW = Math.max(building.width_m - 2 * sgSetback, 1.0);
   const sgD = Math.max(building.depth_m - 2 * sgSetback, 1.0);
 
@@ -568,19 +556,17 @@ function SimpleBuildingFallback({
       position={[building.position_x, 0, -building.position_y]}
       rotation={[0, rotationRad, 0]}
     >
-      {visibleLower > 0 && (
-        <group position={[0, lowerH / 2, 0]}>
-          <mesh castShadow receiveShadow>
-            <boxGeometry args={[building.width_m, lowerH, building.depth_m]} />
-            <meshStandardMaterial color={color} transparent opacity={0.75} roughness={0.7} metalness={0.1} />
-          </mesh>
-          <lineSegments>
-            <edgesGeometry args={[new THREE.BoxGeometry(building.width_m, lowerH, building.depth_m)]} />
-            <lineBasicMaterial color="#1e293b" linewidth={1} />
-          </lineSegments>
-        </group>
-      )}
-      {visibleSg > 0 && sgH > 0 && (
+      <group position={[0, lowerH / 2, 0]}>
+        <mesh castShadow receiveShadow>
+          <boxGeometry args={[building.width_m, lowerH, building.depth_m]} />
+          <meshStandardMaterial color={color} transparent opacity={0.75} roughness={0.7} metalness={0.1} />
+        </mesh>
+        <lineSegments>
+          <edgesGeometry args={[new THREE.BoxGeometry(building.width_m, lowerH, building.depth_m)]} />
+          <lineBasicMaterial color="#1e293b" linewidth={1} />
+        </lineSegments>
+      </group>
+      {hasSg && sgH > 0 && (
         <group position={[0, lowerH + sgH / 2, 0]}>
           <mesh castShadow receiveShadow>
             <boxGeometry args={[sgW, sgH, sgD]} />

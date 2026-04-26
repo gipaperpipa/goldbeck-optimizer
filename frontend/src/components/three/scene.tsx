@@ -1,7 +1,8 @@
 "use client";
 
-import { Suspense, useState, useCallback } from "react";
-import { Canvas } from "@react-three/fiber";
+import { Suspense, useEffect, useState, useCallback, useMemo } from "react";
+import { Canvas, useThree } from "@react-three/fiber";
+import * as THREE from "three";
 import { OrbitControls, Environment, Grid, Text } from "@react-three/drei";
 import { BuildingDetailed } from "./building-detailed";
 import { GroundPlane } from "./ground-plane";
@@ -14,6 +15,12 @@ import { API_BASE } from "@/lib/api-client";
 import { estimateCost } from "@/lib/cost-estimator";
 import { estimateThermal } from "@/lib/thermal-envelope";
 import { placeFurnitureForPlan, type FurnitureKind } from "@/lib/furniture-layouts";
+import {
+  defaultSectionBox,
+  normalizeSectionBox,
+  planesForSectionBox,
+  type SectionBox,
+} from "@/lib/section-clip";
 
 /** Aggregate furniture placements across every floor of a building into a
  *  flat `{kind: count}` dict for the IFC Pset_ADS_Furniture_DIN18011 pset.
@@ -51,7 +58,11 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   const latitude = plot?.centroid_geo?.lat ?? 50; // Default to Germany
   const defaultSunZ = latitude >= 0 ? 200 : -200; // Flip Z for southern hemisphere
   const [showLabels, setShowLabels] = useState(true);
-  const [sectionY, setSectionY] = useState<number | null>(null);
+  // Phase 11a — section *box* (six bounds) replaces the old single
+  // horizontal-cut sectionY. `null` means "no clipping, show
+  // everything". Toggling on initialises the box from the scene's
+  // tight bounds so the user can drag faces inward.
+  const [sectionBox, setSectionBox] = useState<SectionBox | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
   // Phase 8c / 8.6: §6 Abstandsflächen overlay + breakdown panel
@@ -125,6 +136,18 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
     }
   }, [layout, floorPlansMap]);
 
+  // Phase 11a — these hooks have to live above the early return so
+  // hooks order stays stable across renders. They're cheap when the
+  // layout is null (empty buildings list).
+  const sceneBounds = useMemo(
+    () => defaultSectionBox(layout?.buildings ?? []),
+    [layout?.buildings],
+  );
+  const clippingPlanes = useMemo(
+    () => (sectionBox ? planesForSectionBox(sectionBox) : []),
+    [sectionBox],
+  );
+
   if (!layout) {
     return (
       <div className="w-full h-[clamp(300px,60vh,800px)] bg-neutral-100 rounded-lg flex items-center justify-center">
@@ -138,8 +161,6 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   const plotDepth = plot?.depth_m || 200;
   const cameraDistance = Math.max(plotWidth, plotDepth) * 1.2;
 
-  // Determine max height and story info for section box
-  const maxHeight = Math.max(...layout.buildings.map((b) => b.total_height_m), 10);
   const firstBuilding = layout.buildings[0];
   const storyHeight = firstBuilding?.floor_height_m || 2.9;
   const maxStories = Math.max(...layout.buildings.map((b) => b.stories), 1);
@@ -205,16 +226,17 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
       {/* Section box controls — always shown when buildings exist */}
       <div className="absolute top-3 right-3 z-10">
         <SectionBoxControls
-          maxHeight={maxHeight}
+          bounds={sceneBounds}
           storyHeight={storyHeight}
           numStories={maxStories}
-          sectionY={sectionY}
-          onSectionYChange={setSectionY}
+          box={sectionBox}
+          onChange={(b) => setSectionBox(b ? normalizeSectionBox(b) : null)}
         />
       </div>
 
       <Canvas
         shadows
+        gl={{ localClippingEnabled: true }}
         camera={{
           position: [cameraDistance * 0.6, cameraDistance * 0.5, cameraDistance * 0.6],
           fov: 50,
@@ -265,6 +287,14 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
             <AbstandsflaechenLayer3D key={`abst-${b.id}`} building={b} />
           ))}
 
+          {/* Phase 11a — apply the section-box clipping planes to every
+              material in the scene. `localClippingEnabled` (set on the
+              renderer via Canvas's `gl` prop) lets each material's
+              clipping respond — but here we use the global path
+              (`renderer.clippingPlanes = planes`) so we don't have to
+              thread the planes into every <meshStandardMaterial>. */}
+          <SectionClipApplier planes={clippingPlanes} />
+
           {/* Buildings — detailed if floor plans exist, simple otherwise */}
           {layout.buildings.map((building, i) => (
             <BuildingDetailed
@@ -273,7 +303,6 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
               floorPlans={floorPlansMap?.[building.id]}
               index={i}
               showLabel={showLabels}
-              sectionBoxY={sectionY}
             />
           ))}
 
@@ -459,4 +488,25 @@ function AbstandsflaechenBreakdownPanel({
       </div>
     </div>
   );
+}
+
+// Phase 11a — install / uninstall the section-box clipping planes on
+// the WebGL renderer. We use `renderer.clippingPlanes` (global) rather
+// than per-material `clippingPlanes` so the planes apply to every
+// `meshStandardMaterial` / `meshBasicMaterial` in the scene without
+// having to thread them through every helper component. Empty array
+// turns clipping off cleanly.
+function SectionClipApplier({ planes }: { planes: THREE.Plane[] }) {
+  const { gl } = useThree();
+  useEffect(() => {
+    // The Three.js renderer's `clippingPlanes` is a runtime-mutable
+    // property — `Object.assign` keeps the React Compiler's
+    // immutability check off our backs while still setting the
+    // value the renderer reads each frame.
+    Object.assign(gl, { clippingPlanes: planes });
+    return () => {
+      Object.assign(gl, { clippingPlanes: [] });
+    };
+  }, [gl, planes]);
+  return null;
 }
