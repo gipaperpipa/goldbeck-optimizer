@@ -33,3 +33,10 @@ class BuildingFootprint(BaseModel):
     ground_floor_commercial: bool = False
     ground_floor_commercial_sqm: float = 0.0
     ground_floor_parking: bool = False
+    # Phase 8.5 — Staffelgeschoss is decided at the layout phase so the
+    # §6 envelope check can account for it. The floor-plan generator
+    # then receives this as a hard input rather than choosing on its
+    # own. `setback_m` is the inset applied on each gable end (so the
+    # SG length shrinks by 2×setback) and on the rear long facade.
+    has_staffelgeschoss: bool = False
+    staffelgeschoss_setback_m: float = 2.0

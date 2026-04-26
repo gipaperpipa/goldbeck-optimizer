@@ -279,6 +279,7 @@ class LayoutOptimizer:
                 depth=random.uniform(0.2, 0.8),
                 rotation=random.random(),
                 stories=random.random(),
+                has_staffel=random.random(),
             )
             genes.append(gene)
         return Chromosome(genes=genes)
@@ -347,6 +348,49 @@ class LayoutOptimizer:
             for j in range(i + 1, len(bldg_polys)):
                 if self.geometry.check_overlap(bldg_polys[i], bldg_polys[j]):
                     self._track_fail("overlap")
+                    return 0.0
+
+        # ── Phase 8.5: §6 Abstandsflächen ⊂ plot ──────────────────
+        # The buildable area already inflates inward by the planning-rule
+        # setbacks (front / rear / side from the BauNVO regulations), but
+        # those are separate from §6 (BauO NRW §6 = max(0.4·H, 3 m) per
+        # facade). Without this check the layout optimizer happily places
+        # a 4-storey block whose §6 ground projection extends 5 m onto
+        # the neighbour's parcel — a hard violation.
+        #
+        # When a chromosome flags has_staffel we additionally check the
+        # SG envelope: lower footprint inset symmetrically by
+        # `setback_m`, then inflated by max(0.4·H_total, 3 m) where
+        # H_total includes the SG storey. The SG often dominates §6
+        # because adding one storey to a 4-storey building bumps d from
+        # ~4.6 m to ~5.8 m and the setback (2 m) doesn't fully offset.
+        H_COEFF = 0.4
+        STORY_H = 3.05
+        SG_SETBACK_M = 2.0
+        for b in buildings:
+            h_lower = b["stories"] * STORY_H
+            d_lower = max(H_COEFF * h_lower, 3.0)
+            abst_lower = self.geometry.create_inflated_building(
+                b["x"], b["y"], b["width"], b["depth"], b["rotation"], d_lower,
+            )
+            penalty *= self._abstand_penalty(
+                abst_lower, plot_polygon, "abstand_lower_overflow",
+            )
+            if penalty == 0.0:
+                return 0.0
+
+            if b.get("has_staffel"):
+                sg_w = max(b["width"] - 2 * SG_SETBACK_M, 1.0)
+                sg_d = max(b["depth"] - 2 * SG_SETBACK_M, 1.0)
+                h_total = (b["stories"] + 1) * STORY_H
+                d_sg = max(H_COEFF * h_total, 3.0)
+                abst_sg = self.geometry.create_inflated_building(
+                    b["x"], b["y"], sg_w, sg_d, b["rotation"], d_sg,
+                )
+                penalty *= self._abstand_penalty(
+                    abst_sg, plot_polygon, "abstand_sg_overflow",
+                )
+                if penalty == 0.0:
                     return 0.0
 
         lot_cov = self.geometry.compute_lot_coverage(bldg_polys, plot_area)
@@ -446,6 +490,31 @@ class LayoutOptimizer:
 
         return shared
 
+    def _abstand_penalty(
+        self,
+        envelope: Polygon,
+        plot_polygon: Polygon,
+        fail_tag: str,
+    ) -> float:
+        """Multiplicative penalty for an Abstandsflächen envelope that
+        doesn't lie within the plot. Returns:
+          • 1.0  → fully contained, no penalty
+          • 0.0  → reject this chromosome entirely (overflow ≥ 30 % of
+                   the envelope area is unrecoverable)
+          • r²   → soft penalty in (0, 1) where r = 1 − overflow_ratio
+        """
+        if plot_polygon.contains(envelope):
+            return 1.0
+        try:
+            overflow = envelope.difference(plot_polygon).area
+        except Exception:
+            overflow = 0.0
+        ratio = max(0.0, 1.0 - overflow / max(envelope.area, 0.01))
+        if ratio < 0.7:
+            self._track_fail(fail_tag)
+            return 0.0
+        return ratio ** 2
+
     @staticmethod
     def _genotype_distance(a: Chromosome, b: Chromosome) -> float:
         """Euclidean distance in normalized gene space between two chromosomes."""
@@ -498,11 +567,17 @@ class LayoutOptimizer:
             stories = max(1, int(gene.stories * request.regulations.max_stories) + 1)
             stories = min(stories, request.regulations.max_stories)
 
+            # Phase 8.5: SG decision — only meaningful for ≥3-storey
+            # buildings. The chromosome flag drives it; we clamp here so
+            # the §6 envelope check + downstream FP request agree.
+            has_staffel = bool(gene.has_staffel >= 0.5 and stories >= 3)
+
             buildings.append({
                 "x": x, "y": y,
                 "width": width, "depth": depth,
                 "rotation": rotation, "stories": stories,
                 "footprint_area": width * depth,
+                "has_staffel": has_staffel,
             })
         return buildings
 
@@ -563,6 +638,13 @@ class LayoutOptimizer:
             nfa_sqm = gfa_sqm * 0.85
             unit_mix = self._generate_unit_mix(nfa_sqm, pref, regs)
 
+            has_staffel = bool(b.get("has_staffel"))
+            # SG adds one extra storey at reduced footprint. We bake the
+            # extra storey into total_height_m so downstream consumers
+            # (thermal envelope, IFC exporter, viewer) see the real
+            # building height.
+            sg_setback = 2.0
+            extra_stories = 1 if has_staffel else 0
             building_footprints.append(BuildingFootprint(
                 id=f"bldg-{i+1}",
                 position_x=b["x"],
@@ -572,12 +654,14 @@ class LayoutOptimizer:
                 rotation_deg=b["rotation"],
                 stories=b["stories"],
                 floor_height_m=3.05,
-                total_height_m=b["stories"] * 3.05,
+                total_height_m=(b["stories"] + extra_stories) * 3.05,
                 gross_floor_area_sqm=gfa_sqm,
                 net_floor_area_sqm=nfa_sqm,
                 efficiency_factor=0.85,
                 unit_mix=unit_mix,
                 ground_floor_parking=b["stories"] >= 3,
+                has_staffelgeschoss=has_staffel,
+                staffelgeschoss_setback_m=sg_setback,
             ))
 
         lot_cov = self.geometry.compute_lot_coverage(bldg_polys, plot_area)

@@ -35,6 +35,7 @@ def crossover(parent_a: Chromosome, parent_b: Chromosome) -> Chromosome:
                 depth=ga.depth if random.random() < 0.5 else gb.depth,
                 rotation=ga.rotation if random.random() < 0.5 else gb.rotation,
                 stories=ga.stories if random.random() < 0.5 else gb.stories,
+                has_staffel=ga.has_staffel if random.random() < 0.5 else gb.has_staffel,
             ))
         elif i < len(parent_a.genes):
             child_genes.append(_clone_gene(parent_a.genes[i]))
@@ -65,13 +66,16 @@ def mutate(
             depth=_mutate_val(gene.depth, mutation_rate, mutation_sigma),
             rotation=_mutate_val(gene.rotation, mutation_rate, mutation_sigma),
             stories=_mutate_val(gene.stories, mutation_rate, mutation_sigma),
+            has_staffel=_mutate_val(gene.has_staffel, mutation_rate, mutation_sigma),
         )
         new_genes.append(new_gene)
 
     # Occasional complete gene reset (exploration, not just perturbation)
     if random.random() < mutation_rate * 0.3:
         idx = random.randint(0, len(new_genes) - 1)
-        field = random.choice(["x", "y", "width", "depth", "rotation", "stories"])
+        field = random.choice(
+            ["x", "y", "width", "depth", "rotation", "stories", "has_staffel"]
+        )
         setattr(new_genes[idx], field, random.random())
 
     # Structural mutation: add or remove a building
@@ -86,6 +90,7 @@ def mutate(
                 depth=random.uniform(0.2, 0.8),
                 rotation=random.random(),
                 stories=random.random(),
+                has_staffel=random.random(),
             ))
 
     return Chromosome(genes=new_genes)
@@ -103,4 +108,5 @@ def _clone_gene(gene: Gene) -> Gene:
         x=gene.x, y=gene.y,
         width=gene.width, depth=gene.depth,
         rotation=gene.rotation, stories=gene.stories,
+        has_staffel=gene.has_staffel,
     )

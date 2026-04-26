@@ -280,6 +280,11 @@ export interface BuildingFootprint {
   ground_floor_commercial: boolean;
   ground_floor_commercial_sqm: number;
   ground_floor_parking: boolean;
+  /** Phase 8.5: Staffelgeschoss is decided at the layout phase so the
+   *  §6 envelope check can account for it. The floor-plan generator
+   *  receives this as a hard input. */
+  has_staffelgeschoss?: boolean;
+  staffelgeschoss_setback_m?: number;
 }
 
 export interface LayoutScores {

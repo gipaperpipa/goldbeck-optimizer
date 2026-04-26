@@ -47,6 +47,11 @@ def _run_floor_plans_for_layout(layout, request: OptimizationRequest, job_id: st
             generations=fps.generations,
             population_size=fps.population_size,
             weights=fps.weights,
+            # Phase 8.5: Staffelgeschoss is now decided by the layout
+            # optimizer (with §6 awareness); the FP generator just
+            # builds inside the envelope it was handed.
+            enable_staffelgeschoss=building.has_staffelgeschoss,
+            staffelgeschoss_setback_m=building.staffelgeschoss_setback_m,
         )
 
         try:

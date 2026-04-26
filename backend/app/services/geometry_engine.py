@@ -148,6 +148,31 @@ class GeometryEngine:
         bldg = translate(bldg, xoff=x, yoff=y)
         return bldg
 
+    def create_inflated_building(
+        self,
+        x: float,
+        y: float,
+        width: float,
+        depth: float,
+        rotation_deg: float,
+        inflation_m: float,
+    ) -> Polygon:
+        """Building footprint inflated symmetrically in its *local* axes.
+
+        Used to model §6 Abstandsflächen at the layout-fitness stage:
+        the building is grown by `inflation_m` perpendicular to each
+        facade (= max(0.4·H, 3 m) for residential), then rotated +
+        translated. The resulting rectangle is the ground-level
+        Abstandsfläche envelope; if it doesn't fit inside the plot
+        polygon the layout violates §6.
+        """
+        return self.create_building_polygon(
+            x, y,
+            width + 2 * inflation_m,
+            depth + 2 * inflation_m,
+            rotation_deg,
+        )
+
     def check_overlap(self, poly_a: Polygon, poly_b: Polygon) -> bool:
         return poly_a.intersects(poly_b) and poly_a.intersection(poly_b).area > 0.1
 
