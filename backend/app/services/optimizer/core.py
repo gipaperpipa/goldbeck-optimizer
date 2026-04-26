@@ -451,9 +451,16 @@ class LayoutOptimizer:
             open_space_pct=open_space,
             min_separation=min_sep if len(bldg_polys) > 1 else 100.0,
             total_units=self._estimate_units(buildings, request),
-            total_gfa=sum(b["footprint_area"] * b["stories"] for b in
-                         [{"footprint_area": p.area, "stories": bl["stories"]}
-                          for p, bl in zip(bldg_polys, buildings)]),
+            # Phase 8.6: include SG floor area in total GFA so fitness
+            # rewards SG layouts (the Staffelgeschoss is real Wohnfläche
+            # the developer monetises).
+            total_gfa=sum(
+                p.area * bl["stories"] + (
+                    max(bl["width"] - 4.0, 1.0) * max(bl["depth"] - 4.0, 1.0)
+                    if bl.get("has_staffel") else 0
+                )
+                for p, bl in zip(bldg_polys, buildings)
+            ),
             weights=request.weights,
             plot_area=plot_area,
         )
@@ -564,14 +571,21 @@ class LayoutOptimizer:
             width = min_dim + gene.width * (max_dim_w - min_dim)
             depth = min_dim + gene.depth * (max_dim_d - min_dim)
             rotation = gene.rotation * 45.0 - 22.5  # -22.5 to +22.5 degrees
-            stories = max(1, int(gene.stories * request.regulations.max_stories) + 1)
-            stories = min(stories, request.regulations.max_stories)
+            raw_stories = max(1, int(gene.stories * request.regulations.max_stories) + 1)
+            raw_stories = min(raw_stories, request.regulations.max_stories)
 
-            # Phase 8.5/8.6: SG decision driven purely by the chromosome.
-            # Allowed at any story count (Goldbeck builds 1+SG / 2+SG /
-            # 3+SG / 4+SG combinations) — the GA picks when it yields
-            # more Wohnfläche inside the §6 envelope.
-            has_staffel = bool(gene.has_staffel >= 0.5 and stories >= 1)
+            # Phase 8.6 fix: SG counts toward the total story budget.
+            # When SG is enabled we reserve one storey for it so the
+            # §6 envelope (which grows with TOTAL height) doesn't get
+            # systematically pushed past the plot edge. Without this
+            # adjustment SG layouts always lost the §6 ⊂ plot test.
+            has_staffel_raw = gene.has_staffel >= 0.5
+            if has_staffel_raw and raw_stories >= 2:
+                stories = raw_stories - 1
+                has_staffel = True
+            else:
+                stories = raw_stories
+                has_staffel = False
 
             buildings.append({
                 "x": x, "y": y,
@@ -590,10 +604,19 @@ class LayoutOptimizer:
             + request.regulations.min_unit_sizes.two_bed_sqm * request.unit_mix_preference.two_bed_pct
             + request.regulations.min_unit_sizes.three_bed_sqm * request.unit_mix_preference.three_bed_pct
         )
+        # Phase 8.6 fix: include the Staffelgeschoss floor in the
+        # estimated unit count so the GA actually sees the upside of
+        # picking SG. Without this, fitness only credited the lower
+        # stories' NFA, so SG was strictly worse than non-SG (it could
+        # only fail the §6 check, never gain reward).
+        SG_SETBACK_M = 2.0
         for b in buildings:
-            # footprint_area is already in sqm (geometry engine works in meters)
-            net_floor_area_sqm = b["footprint_area"] * b["stories"] * 0.85
-            total += int(net_floor_area_sqm / avg_unit_size)
+            nfa = b["footprint_area"] * b["stories"] * 0.85
+            if b.get("has_staffel"):
+                sg_w = max(b["width"] - 2 * SG_SETBACK_M, 1.0)
+                sg_d = max(b["depth"] - 2 * SG_SETBACK_M, 1.0)
+                nfa += sg_w * sg_d * 0.85
+            total += int(nfa / avg_unit_size)
         return total
 
     def _chromosome_to_layout(

@@ -35,10 +35,26 @@ def decode_gene(
     min_dim: float = 30.0,
     max_dim: float = 200.0,
 ) -> dict:
-    """Decode a gene into actual building parameters."""
+    """Decode a gene into actual building parameters.
+
+    Phase 8.6 fix: when the SG flag is on we treat the chromosome's
+    `stories` value as the *total* story budget and reserve one for
+    the SG. The lower-storey count therefore becomes ``stories − 1``
+    and `has_staffel` only takes effect when the total budget is
+    ≥ 2 (a 1-storey building can't have an SG above zero floors).
+
+    Without this adjustment the §6 envelope grew by H_total (lower
+    + SG) while the buildable area stayed the same, so SG layouts
+    were systematically rejected by the §6 ⊂ plot constraint.
+    """
     min_x, min_y, max_x, max_y = bounds
-    stories = max(1, min(max_stories, int(gene.stories * max_stories) + 1))
-    has_staffel = bool(gene.has_staffel >= 0.5 and stories >= 1)
+    raw_stories = max(1, min(max_stories, int(gene.stories * max_stories) + 1))
+    has_staffel = gene.has_staffel >= 0.5
+    if has_staffel and raw_stories >= 2:
+        stories = raw_stories - 1
+    else:
+        stories = raw_stories
+        has_staffel = False
     return {
         "x": min_x + gene.x * (max_x - min_x),
         "y": min_y + gene.y * (max_y - min_y),
