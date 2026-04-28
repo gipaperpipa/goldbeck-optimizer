@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState, useCallback, useMemo } from "react";
+import { Suspense, useEffect, useState, useMemo } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import { OrbitControls, Environment, Grid, Text } from "@react-three/drei";
@@ -11,33 +11,13 @@ import { SectionBoxControls } from "./section-box";
 import { Button } from "@/components/ui/button";
 import { Download } from "lucide-react";
 import type { LayoutOption, PlotAnalysis, BuildingFloorPlans, BuildingFootprint } from "@/types/api";
-import { API_BASE } from "@/lib/api-client";
-import { estimateCost } from "@/lib/cost-estimator";
-import { estimateThermal } from "@/lib/thermal-envelope";
-import { placeFurnitureForPlan, type FurnitureKind } from "@/lib/furniture-layouts";
 import {
   defaultSectionBox,
   normalizeSectionBox,
   planesForSectionBox,
   type SectionBox,
 } from "@/lib/section-clip";
-
-/** Aggregate furniture placements across every floor of a building into a
- *  flat `{kind: count}` dict for the IFC Pset_ADS_Furniture_DIN18011 pset.
- *  Only counts pieces that actually got placed (`fitted` rooms or partial
- *  fits still emit placements that landed successfully). */
-function aggregateFurnitureCounts(building: BuildingFloorPlans): Record<string, number> {
-  const counts: Partial<Record<FurnitureKind, number>> = {};
-  for (const floor of building.floor_plans) {
-    const perRoom = placeFurnitureForPlan(floor);
-    for (const result of perRoom.values()) {
-      for (const piece of result.placements) {
-        counts[piece.kind] = (counts[piece.kind] ?? 0) + 1;
-      }
-    }
-  }
-  return counts as Record<string, number>;
-}
+import { useIfcExport } from "@/hooks/use-ifc-export";
 
 /** Props for the 3D building scene (Three.js / R3F).
  * @property layout - The selected optimizer layout with building positions.
@@ -63,78 +43,15 @@ export function Scene3D({ layout, plot, sunPosition, floorPlansMap }: Scene3DPro
   // everything". Toggling on initialises the box from the scene's
   // tight bounds so the user can drag faces inward.
   const [sectionBox, setSectionBox] = useState<SectionBox | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const [exportStatus, setExportStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
   // Phase 8c / 8.6: §6 Abstandsflächen overlay + breakdown panel
   const [showAbstand, setShowAbstand] = useState(false);
 
-  const handleExportIfc = useCallback(async (buildingId: string) => {
-    if (!layout || !floorPlansMap?.[buildingId]) return;
-    const building = layout.buildings.find((b) => b.id === buildingId);
-    if (!building) return;
-
-    setExporting(true);
-    setExportStatus(null);
-    try {
-      const floorPlans = floorPlansMap[buildingId];
-
-      // Phase 4.6 — enrich the IFC with cost, thermal, and furniture psets.
-      // All three are best-effort: failures fall back to a minimal IFC so a
-      // broken estimator can never block the export.
-      let costMetadata: unknown = null;
-      let thermalMetadata: unknown = null;
-      let furnitureCounts: Record<string, number> | null = null;
-      try {
-        costMetadata = estimateCost({ building: floorPlans });
-      } catch (e) {
-        console.debug("cost metadata skipped:", e);
-      }
-      try {
-        thermalMetadata = estimateThermal({ building: floorPlans, standard: "goldbeck_standard" });
-      } catch (e) {
-        console.debug("thermal metadata skipped:", e);
-      }
-      try {
-        furnitureCounts = aggregateFurnitureCounts(floorPlans);
-      } catch (e) {
-        console.debug("furniture counts skipped:", e);
-      }
-
-      const response = await fetch(
-        `${API_BASE}/v1/export/ifc`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            building,
-            floor_plans: floorPlans,
-            cost_metadata: costMetadata,
-            thermal_metadata: thermalMetadata,
-            furniture_counts: furnitureCounts,
-          }),
-        }
-      );
-      if (!response.ok) {
-        const detail = await response.json().catch(() => ({ detail: response.statusText }));
-        throw new Error(detail.detail || `Export failed (${response.status})`);
-      }
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `building_${buildingId}.ifc`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setExportStatus({ type: "success", message: `IFC-Export erfolgreich: building_${buildingId}.ifc` });
-      setTimeout(() => setExportStatus(null), 4000);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Unbekannter Fehler";
-      setExportStatus({ type: "error", message: `IFC-Export fehlgeschlagen: ${msg}` });
-      setTimeout(() => setExportStatus(null), 6000);
-    } finally {
-      setExporting(false);
-    }
-  }, [layout, floorPlansMap]);
+  // Phase 14b — IFC export logic now lives in `useIfcExport` so the
+  // workspace TopBar and this scene share the same code path.
+  const ifc = useIfcExport({ layout, floorPlansMap });
+  const handleExportIfc = ifc.exportIfc;
+  const exporting = ifc.exporting;
+  const exportStatus = ifc.status;
 
   // Phase 11a — these hooks have to live above the early return so
   // hooks order stays stable across renders. They're cheap when the

@@ -26,6 +26,8 @@ import { OptimizationBar } from "@/components/workspace/optimization-bar";
 import { VariantsStrip } from "@/components/workspace/variants-strip";
 import { Icon } from "@/components/workspace/icon";
 import type { FloorPlanApartment } from "@/types/api";
+import { useIfcExport } from "@/hooks/use-ifc-export";
+import { API_BASE } from "@/lib/api-client";
 
 function floorLabelFor(idx: number, total: number, floorType?: string): string {
   if (floorType === "staffelgeschoss") return "SG · Staffelgeschoss";
@@ -51,6 +53,10 @@ export default function WorkspacePage() {
   const [activeTool, setActiveTool] = useState<ToolId>("cursor");
   const [selectedAptId, setSelectedAptId] = useState<string | null>(null);
   const [coords, setCoords] = useState<string>("X: —  Y: —");
+  const [actionToast, setActionToast] = useState<
+    | { type: "success" | "error" | "info"; message: string }
+    | null
+  >(null);
 
   // Fall back to the first available building.
   const buildings = useMemo(() => Object.values(floorPlans), [floorPlans]);
@@ -58,6 +64,55 @@ export default function WorkspacePage() {
     (selectedBuildingId && floorPlans[selectedBuildingId]) ||
     buildings[0] ||
     null;
+
+  // Phase 14b — IFC export + Rhino sync wired into the TopBar buttons.
+  const ifc = useIfcExport({
+    layout: selectedLayout,
+    floorPlansMap: floorPlans,
+  });
+
+  const handleExportIfc = async () => {
+    const id = currentBuildingPlans?.building_id ?? selectedLayout?.buildings?.[0]?.id;
+    if (!id) {
+      setActionToast({ type: "error", message: "Kein Gebäude zum Exportieren ausgewählt." });
+      setTimeout(() => setActionToast(null), 4000);
+      return;
+    }
+    await ifc.exportIfc(id);
+  };
+
+  const handleSendRhino = async () => {
+    if (!currentBuildingPlans) {
+      setActionToast({ type: "error", message: "Keine Geschosse zum Senden — erst Grundrisse generieren." });
+      setTimeout(() => setActionToast(null), 4000);
+      return;
+    }
+    setActionToast({ type: "info", message: "Sende an Rhino…" });
+    try {
+      const res = await fetch(`${API_BASE}/v1/rhino/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(currentBuildingPlans),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(detail.detail || `HTTP ${res.status}`);
+      }
+      const data: { client_count: number; message: string } = await res.json();
+      setActionToast({
+        type: data.client_count > 0 ? "success" : "info",
+        message:
+          data.client_count > 0
+            ? `An Rhino gesendet (${data.client_count} Verbindung${data.client_count === 1 ? "" : "en"}).`
+            : "Kein Grasshopper-Client verbunden — beim nächsten Connect wird automatisch synchronisiert.",
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unbekannter Fehler";
+      setActionToast({ type: "error", message: `Rhino-Sync fehlgeschlagen: ${msg}` });
+    } finally {
+      setTimeout(() => setActionToast(null), 5000);
+    }
+  };
 
   useEffect(() => {
     if (!selectedBuildingId && buildings[0]?.building_id) {
@@ -210,7 +265,32 @@ export default function WorkspacePage() {
         setMode={setMode}
         projectLabel={projectLabel}
         layoutLabel={layoutLabel}
+        onExportIfc={handleExportIfc}
+        onSendRhino={handleSendRhino}
       />
+
+      {/* Phase 14b — combined toast for IFC export + Rhino sync. The
+          IFC hook owns its own status; we surface ours from
+          `actionToast` (the Rhino path). When both fire we show
+          whichever is currently set. */}
+      {(ifc.status || actionToast) && (() => {
+        const t = ifc.status ?? actionToast!;
+        const tone =
+          t.type === "success"
+            ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+            : t.type === "error"
+              ? "bg-rose-50 border-rose-200 text-rose-900"
+              : "bg-sky-50 border-sky-200 text-sky-900";
+        return (
+          <div
+            className={`absolute z-50 left-1/2 -translate-x-1/2 mt-2 px-3 py-2 rounded-md border text-sm font-medium shadow ${tone}`}
+            style={{ top: 56 }}
+            role="status"
+          >
+            {t.message}
+          </div>
+        );
+      })()}
 
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
         <LeftToolbar activeTool={activeTool} setActiveTool={setActiveTool} />

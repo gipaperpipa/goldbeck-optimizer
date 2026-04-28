@@ -12,6 +12,7 @@ from app.api.v1 import (
     export,
     parcels,
     projects,
+    rhino,
 )
 
 api_router = APIRouter()
@@ -31,3 +32,4 @@ api_router.include_router(
     tags=["floorplan-overrides"],
 )
 api_router.include_router(export.router, prefix="/export", tags=["export"])
+api_router.include_router(rhino.router, prefix="/rhino", tags=["rhino"])
