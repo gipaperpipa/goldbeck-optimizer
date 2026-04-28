@@ -85,12 +85,29 @@ function ToolBtn({
 export function LeftToolbar({
   activeTool,
   setActiveTool,
+  onOpenSettings,
+  settingsActive,
 }: {
   activeTool: ToolId;
   setActiveTool: (t: ToolId) => void;
+  /** Called when the user clicks the Einstellungen button — wired by
+   *  the workspace page to toggle the Tweaks panel (Phase 14c). */
+  onOpenSettings?: () => void;
+  /** Visual state for the Settings button while the panel is open. */
+  settingsActive?: boolean;
 }) {
   const renderTool = (t: Tool) => {
-    const interactive = t.id !== "layers" && t.id !== "settings";
+    if (t.id === "settings") {
+      return (
+        <ToolBtn
+          key={t.id}
+          tool={t}
+          isActive={!!settingsActive}
+          onClick={() => onOpenSettings?.()}
+        />
+      );
+    }
+    const interactive = t.id !== "layers";
     return (
       <ToolBtn
         key={t.id}

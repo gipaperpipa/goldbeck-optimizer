@@ -25,6 +25,13 @@ import { StatusBar } from "@/components/workspace/status-bar";
 import { OptimizationBar } from "@/components/workspace/optimization-bar";
 import { VariantsStrip } from "@/components/workspace/variants-strip";
 import { Icon } from "@/components/workspace/icon";
+import {
+  TweaksPanel,
+  DEFAULT_TWEAKS,
+  paddingForDensity,
+  gridForLayout,
+  type WorkspaceTweaks,
+} from "@/components/workspace/tweaks-panel";
 import type { FloorPlanApartment } from "@/types/api";
 import { useIfcExport } from "@/hooks/use-ifc-export";
 import { useRhinoStatus } from "@/hooks/use-rhino-status";
@@ -58,6 +65,10 @@ export default function WorkspacePage() {
     | { type: "success" | "error" | "info"; message: string }
     | null
   >(null);
+  // Phase 14c — workspace tweaks (density / layout / accent / draw
+  // toggles). Local state, resets on reload.
+  const [tweaks, setTweaks] = useState<WorkspaceTweaks>(DEFAULT_TWEAKS);
+  const [tweaksOpen, setTweaksOpen] = useState(false);
 
   // Fall back to the first available building.
   const buildings = useMemo(() => Object.values(floorPlans), [floorPlans]);
@@ -172,6 +183,29 @@ export default function WorkspacePage() {
     return () => ro.disconnect();
   }, []);
 
+  // Phase 14c — apply the chosen accent hue to the OKLCH `--ws-accent`
+  // variables on the workspace root so every cyan-coloured element
+  // recolours together. We only touch the variables on the workspace
+  // root, never on `document.documentElement`, so other routes are
+  // unaffected.
+  const wsRootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = wsRootRef.current;
+    if (!el) return;
+    el.style.setProperty(
+      "--ws-accent",
+      `oklch(0.55 0.12 ${tweaks.accentHue})`,
+    );
+    el.style.setProperty(
+      "--ws-accent-bg",
+      `oklch(0.93 0.05 ${tweaks.accentHue})`,
+    );
+  }, [tweaks.accentHue]);
+
+  // Density/layout numeric resolutions used in JSX below.
+  const canvasPad = paddingForDensity(tweaks.density);
+  const layoutGrid = gridForLayout(tweaks.layout);
+
   const presentationMode = mode === "presentation";
 
   // Top variants — pull from optimizationResult.layouts (already sorted by rank).
@@ -256,6 +290,7 @@ export default function WorkspacePage() {
 
   return (
     <div
+      ref={wsRootRef}
       className="workspace-root"
       style={{
         height: "100vh",
@@ -297,7 +332,12 @@ export default function WorkspacePage() {
       })()}
 
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
-        <LeftToolbar activeTool={activeTool} setActiveTool={setActiveTool} />
+        <LeftToolbar
+          activeTool={activeTool}
+          setActiveTool={setActiveTool}
+          onOpenSettings={() => setTweaksOpen((v) => !v)}
+          settingsActive={tweaksOpen}
+        />
 
         <LeftSidebar
           projectName={projectName}
@@ -398,7 +438,8 @@ export default function WorkspacePage() {
             style={{
               flex: 1,
               display: "grid",
-              gridTemplateColumns: "1.45fr 1fr",
+              gridTemplateColumns: layoutGrid.columns,
+              gridTemplateRows: layoutGrid.rows,
               minHeight: 0,
               overflow: "hidden",
             }}
@@ -420,6 +461,7 @@ export default function WorkspacePage() {
                 borderRight: "1px solid var(--ws-line)",
                 minHeight: 0,
                 overflow: "hidden",
+                padding: canvasPad,
               }}
             >
               <div
@@ -496,7 +538,9 @@ export default function WorkspacePage() {
               )}
             </div>
 
-            {/* Right column: 3D + variants */}
+            {/* Right column: 3D + variants — hidden in `focus` layout
+                so the floor plan gets the full canvas. */}
+            {tweaks.layout !== "focus" && (
             <div
               style={{
                 display: "flex",
@@ -594,6 +638,7 @@ export default function WorkspacePage() {
                 </div>
               )}
             </div>
+            )}
           </div>
         </main>
 
@@ -612,6 +657,15 @@ export default function WorkspacePage() {
         }
         rhinoConnected={rhinoStatus.connected}
         bayInfo={bayInfo}
+      />
+
+      {/* Phase 14c — workspace tweaks popover, anchored above the
+          LeftToolbar's Einstellungen button. */}
+      <TweaksPanel
+        open={tweaksOpen}
+        state={tweaks}
+        onChange={setTweaks}
+        onClose={() => setTweaksOpen(false)}
       />
     </div>
   );
