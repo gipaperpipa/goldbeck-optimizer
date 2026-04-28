@@ -69,6 +69,19 @@ interface FloorPlanViewerProps {
   /** Building total height (metres). Phase 8b: drives the
    *  Abstandsflächen overlay depth (max(hCoeff·H, 3 m)). */
   buildingHeightM?: number;
+  /** External tool selection — wired by the workspace LeftToolbar
+   *  (Phase 14a). When set, the viewer maps the workspace tool id
+   *  onto its internal edit / measure / opening-add modes. The
+   *  viewer's own toolbar buttons remain the source of truth when no
+   *  external tool is supplied. */
+  externalTool?:
+    | "cursor"
+    | "move"
+    | "rect"
+    | "door"
+    | "window"
+    | "ruler"
+    | "zoom";
 }
 
 /**
@@ -331,6 +344,7 @@ export function FloorPlanViewer({
   buildingPosition,
   buildingDimensions,
   buildingHeightM,
+  externalTool,
 }: FloorPlanViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hoveredAptId, setHoveredAptId] = useState<string | null>(null);
@@ -598,6 +612,47 @@ export function FloorPlanViewer({
    *  wall places a NEW window/door instead of just deselecting. Toggled by
    *  the "+ Fenster" / "+ Tür" sub-toolbar buttons. Phase 3.6c add. */
   const [openingAddMode, setOpeningAddMode] = useState<"none" | "window" | "door">("none");
+
+  // Phase 14a — when the workspace LeftToolbar drives the active tool,
+  // map it onto the viewer's internal modes. The viewer's own
+  // Edit / Openings / Rooms / Measure buttons still work when no
+  // external tool is supplied.
+  useEffect(() => {
+    if (externalTool === undefined) return;
+    switch (externalTool) {
+      case "cursor":
+      case "zoom":
+        setEditMode("none");
+        setMeasureMode(false);
+        setOpeningAddMode("none");
+        break;
+      case "move":
+        setEditMode("wall");
+        setMeasureMode(false);
+        setOpeningAddMode("none");
+        break;
+      case "rect":
+        setEditMode("room");
+        setMeasureMode(false);
+        setOpeningAddMode("none");
+        break;
+      case "door":
+        setEditMode("opening");
+        setMeasureMode(false);
+        setOpeningAddMode("door");
+        break;
+      case "window":
+        setEditMode("opening");
+        setMeasureMode(false);
+        setOpeningAddMode("window");
+        break;
+      case "ruler":
+        setEditMode("none");
+        setOpeningAddMode("none");
+        setMeasureMode(true);
+        break;
+    }
+  }, [externalTool]);
 
   // ── Room edit state (Phase 3.6d) ─────────────────────────────────────────
   // When `roomEditor` is set, a popover is rendered at (screenX, screenY)

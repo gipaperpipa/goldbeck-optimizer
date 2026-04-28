@@ -27,6 +27,7 @@ import { VariantsStrip } from "@/components/workspace/variants-strip";
 import { Icon } from "@/components/workspace/icon";
 import type { FloorPlanApartment } from "@/types/api";
 import { useIfcExport } from "@/hooks/use-ifc-export";
+import { useRhinoStatus } from "@/hooks/use-rhino-status";
 import { API_BASE } from "@/lib/api-client";
 
 function floorLabelFor(idx: number, total: number, floorType?: string): string {
@@ -70,6 +71,9 @@ export default function WorkspacePage() {
     layout: selectedLayout,
     floorPlansMap: floorPlans,
   });
+  // Phase 14d — live Rhino/Grasshopper connection state for the
+  // status-bar dot. Polls /v1/rhino/status every 5 s.
+  const rhinoStatus = useRhinoStatus();
 
   const handleExportIfc = async () => {
     const id = currentBuildingPlans?.building_id ?? selectedLayout?.buildings?.[0]?.id;
@@ -245,7 +249,7 @@ export default function WorkspacePage() {
             Neues Projekt
           </Link>
         </div>
-        <StatusBar coords={coords} />
+        <StatusBar coords={coords} rhinoConnected={rhinoStatus.connected} />
       </div>
     );
   }
@@ -464,6 +468,7 @@ export default function WorkspacePage() {
                   buildingId={currentBuildingPlans.building_id}
                   floorIndex={selectedFloorIndex}
                   allFloors={currentBuildingPlans.floor_plans}
+                  externalTool={activeTool}
                   latitude={plotAnalysis?.centroid_geo?.lat}
                   longitude={plotAnalysis?.centroid_geo?.lng}
                   buildingRotationDeg={
@@ -605,7 +610,7 @@ export default function WorkspacePage() {
         fitness={
           optimizationResult?.best_fitness ?? selectedLayout?.scores?.overall
         }
-        rhinoConnected={false}
+        rhinoConnected={rhinoStatus.connected}
         bayInfo={bayInfo}
       />
     </div>
