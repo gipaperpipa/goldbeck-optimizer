@@ -592,17 +592,30 @@ class GoldbeckGenerator(ConstructionSystem):
     # Phase 2: Access Type Selection
     # ========================================================
     def _phase2_select_access(self, dims: dict, override: Optional[AccessType]) -> AccessType:
-        """Select access type based on building depth.
+        """Select access type based on building footprint.
 
-        Ganghaus (≥10m): internal corridor, apartments both sides
-        Laubengang (≥6.25m): external gallery, apartments full depth
-        Spaenner (<6.25m): direct staircase access, no corridor
+        Ganghaus (deep + long): internal corridor, apartments both sides
+        Laubengang (≥6.25m depth): external gallery, apartments full depth
+        Spaenner (<6.25m depth): direct staircase access, no corridor
+
+        Phase 14 fix — Ganghaus is wasteful for short buildings because
+        it duplicates the service strip (hallway + bathroom + shaft) on
+        both sides of the corridor. We now require BOTH a generous
+        depth (≥10 m) AND a long building (≥28 m) before picking
+        Ganghaus; otherwise Laubengang gives a single full-depth
+        apartment row served by an external gallery and one staircase.
+        Empirically Goldbeck Ganghaus pays off around 28–32 m of length
+        because that's where the second row of WE outweighs the second
+        service strip's overhead.
         """
         if override:
             return override
-        if dims["depth_m"] >= C.GANGHAUS_MIN_DEPTH:
+        depth = dims["depth_m"]
+        length = dims["length_m"]
+        GANGHAUS_MIN_LENGTH = 28.0
+        if depth >= C.GANGHAUS_MIN_DEPTH and length >= GANGHAUS_MIN_LENGTH:
             return AccessType.GANGHAUS
-        if dims["depth_m"] >= C.LAUBENGANG_MIN_DEPTH:
+        if depth >= C.LAUBENGANG_MIN_DEPTH:
             return AccessType.LAUBENGANG
         return AccessType.SPAENNER
 

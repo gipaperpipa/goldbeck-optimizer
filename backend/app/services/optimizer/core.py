@@ -1,7 +1,7 @@
 import uuid
 import random
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -366,7 +366,6 @@ class LayoutOptimizer:
         # ~4.6 m to ~5.8 m and the setback (2 m) doesn't fully offset.
         H_COEFF = 0.4
         STORY_H = 3.05
-        SG_SETBACK_M = 2.0
         for b in buildings:
             h_lower = b["stories"] * STORY_H
             d_lower = max(H_COEFF * h_lower, 3.0)
@@ -379,19 +378,13 @@ class LayoutOptimizer:
             if penalty == 0.0:
                 return 0.0
 
+            # Phase 14 — auto-grow the SG setback so the chromosome
+            # doesn't fail when the default 2 m envelope just barely
+            # overflows. `_fit_sg_setback` walks a 2/3/4/5 m ladder.
             if b.get("has_staffel"):
-                sg_w = max(b["width"] - 2 * SG_SETBACK_M, 1.0)
-                sg_d = max(b["depth"] - 2 * SG_SETBACK_M, 1.0)
-                h_total = (b["stories"] + 1) * STORY_H
-                d_sg = max(H_COEFF * h_total, 3.0)
-                abst_sg = self.geometry.create_inflated_building(
-                    b["x"], b["y"], sg_w, sg_d, b["rotation"], d_sg,
-                )
-                penalty *= self._abstand_penalty(
-                    abst_sg, plot_polygon, "abstand_sg_overflow",
-                )
-                if penalty == 0.0:
-                    return 0.0
+                fitted_has, fitted_setback = self._fit_sg_setback(b, plot_polygon)
+                b["has_staffel"] = fitted_has
+                b["sg_setback_m"] = fitted_setback
 
         lot_cov = self.geometry.compute_lot_coverage(bldg_polys, plot_area)
         far_data = [
@@ -496,6 +489,36 @@ class LayoutOptimizer:
             shared[i] = fitness_scores[i] / niche_count
 
         return shared
+
+    def _fit_sg_setback(
+        self,
+        b: dict,
+        plot_polygon: Polygon,
+    ) -> tuple[bool, float]:
+        """Phase 14 — pick the smallest setback (2 / 3 / 4 / 5 m) that
+        keeps the SG envelope inside the plot. Returns
+        ``(has_staffel, setback_m)``. When no setback in the ladder
+        fits, SG is disabled for this building (False, 2.0). Used by
+        both `_evaluate` (fitness) and `_chromosome_to_layout`
+        (final emit) so they agree on what the SG looks like.
+        """
+        if not b.get("has_staffel"):
+            return False, 2.0
+        H_COEFF = 0.4
+        STORY_H = 3.05
+        h_total = (b["stories"] + 1) * STORY_H
+        d_sg = max(H_COEFF * h_total, 3.0)
+        for trial in (2.0, 3.0, 4.0, 5.0):
+            sg_w = max(b["width"] - 2 * trial, 1.0)
+            sg_d = max(b["depth"] - 2 * trial, 1.0)
+            if sg_w < 4.0 or sg_d < 4.0:
+                break
+            abst_sg = self.geometry.create_inflated_building(
+                b["x"], b["y"], sg_w, sg_d, b["rotation"], d_sg,
+            )
+            if plot_polygon.contains(abst_sg):
+                return True, trial
+        return False, 2.0
 
     def _abstand_penalty(
         self,
@@ -664,8 +687,11 @@ class LayoutOptimizer:
             # Dimensions are already in meters (geometry engine works in meters)
             width_m = b["width"]
             depth_m = b["depth"]
-            has_staffel = bool(b.get("has_staffel"))
-            sg_setback = 2.0
+            # Re-fit the SG setback against the plot here so the value
+            # we persist on BuildingFootprint matches what the §6
+            # fitness saw. Without this, fitness might pick setback=3 m
+            # while the layout output would still claim 2 m.
+            has_staffel, sg_setback = self._fit_sg_setback(b, plot_polygon)
             # GFA: full-footprint floors + (if SG) one extra floor with
             # the symmetric setback footprint. This matches what the
             # FP generator and 3D viewer will actually build.

@@ -212,13 +212,29 @@ export function analyzeSite(input: SiteCoordinationInput): SiteCoordinationResul
   const hCoeff = input.hCoeff ?? DEFAULT_H_COEFF;
 
   // 1. Polygonize every building.
-  const buildings: BuildingPolygon[] = layout.buildings.map((b) => ({
-    id: b.id,
-    corners: buildingCorners(b),
-    height: b.total_height_m,
-    rotation: b.rotation_deg,
-    footprintSqm: b.width_m * b.depth_m,
-  }));
+  //
+  // Phase 14 fix — § 6 Abstandsfläche depth uses the height of the
+  // wall doing the projecting. For a Staffelgeschoss building the
+  // *lower* facade only reaches `stories × floor_height` (the SG sits
+  // inset behind a setback at higher elevation). Previously this used
+  // `total_height_m` which over-counted the SG's height against the
+  // lower facade and produced false §6 violations on the workspace
+  // permit dashboard while the layout-side optimizer was happy.
+  //
+  // The SG itself has its own §6 envelope; with the standard 2 m
+  // setback it sits inside the lower envelope, so we don't need to
+  // check it separately here.
+  const buildings: BuildingPolygon[] = layout.buildings.map((b) => {
+    const floorH = b.floor_height_m || 3.05;
+    const lowerHeight = b.stories * floorH;
+    return {
+      id: b.id,
+      corners: buildingCorners(b),
+      height: lowerHeight,
+      rotation: b.rotation_deg,
+      footprintSqm: b.width_m * b.depth_m,
+    };
+  });
 
   const totalFootprintSqm = buildings.reduce((s, b) => s + b.footprintSqm, 0);
   const grz = input.plotAreaSqm && input.plotAreaSqm > 0 ? totalFootprintSqm / input.plotAreaSqm : null;

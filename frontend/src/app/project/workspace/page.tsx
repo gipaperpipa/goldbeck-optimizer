@@ -533,7 +533,12 @@ export default function WorkspacePage() {
                         }
                       : undefined
                   }
-                  buildingHeightM={currentBuildingFootprint?.total_height_m}
+                  buildingHeightM={
+                    currentBuildingFootprint
+                      ? currentBuildingFootprint.stories *
+                        (currentBuildingFootprint.floor_height_m || 3.05)
+                      : undefined
+                  }
                 />
               )}
             </div>

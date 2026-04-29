@@ -501,7 +501,12 @@ export function FloorPlanPanel() {
                   ? { width: currentBuilding.width_m, depth: currentBuilding.depth_m }
                   : undefined
               }
-              buildingHeightM={currentBuilding?.total_height_m}
+              buildingHeightM={
+                currentBuilding
+                  ? currentBuilding.stories *
+                    (currentBuilding.floor_height_m || 3.05)
+                  : undefined
+              }
             />
           </div>
 
